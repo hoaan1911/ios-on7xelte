@@ -1,0 +1,253 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..da59f72 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -20,6 +20,9 @@
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++#if defined(A5XELTE)
++extern "C" void a5xelte_send_self_ipi(void);
++#endif
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -209,6 +212,12 @@ SweetCPU::initCPU(bool boot)
+ void
+ SweetCPU::signalCPU(IOCPU *target)
+ {
++#if defined(A5XELTE)
++	if (target != this) {
++		panic("a5xelte: secondary CPU signalling is not enabled");
++	}
++	a5xelte_send_self_ipi();
++#else
+ 	const ml_topology_info_t *topology = ml_get_topology_info();
+ 	unsigned int logical = target->getCPUNumber();
+ 	if (logical >= topology->num_cpus) {
+@@ -227,6 +236,7 @@ SweetCPU::signalCPU(IOCPU *target)
+ 	__builtin_arm_dsb(DSB_ISHST);
+ 	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
+ 	__builtin_arm_isb(ISB_SY);
++#endif
+ }
+ 
+ kern_return_t
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..193845f 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -25,12 +25,20 @@ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
++#if defined(A5XELTE)
++	IOLog("A5XELTE: starting device-tree platform expert\n");
++#else
+ 	IOLog("SWEET: starting device-tree platform expert\n");
++#endif
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
+ 	registerService();
++#if defined(A5XELTE)
++	IOLog("A5XELTE: platform expert registered\n");
++#else
+ 	IOLog("SWEET: platform expert registered\n");
++#endif
+ 	return true;
+ }
+ 
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..f81aa3d 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -34,17 +34,25 @@
+ 
+ const char * gIOKernelConfigTables =
+     "("
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+     "   {"
+     "     'IOClass'         = SweetPlatformExpert;"
+     "     'IOProviderClass' = IOPlatformExpertDevice;"
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++    "     'IONameMatch'     = 'samsung,a5xelte';"
++#else
+     "     'IONameMatch'     = 'xiaomi,sweet';"
++#endif
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
+     "     'IOClass'         = SweetCPU;"
+     "     'IOProviderClass' = IOPlatformDevice;"
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++    "     'IONameMatch'     = 'arm,cortex-a53';"
++#else
+     "     'IONameMatch'     = 'qcom,kryo470';"
++#endif
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
+@@ -62,6 +70,7 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOCoreSurfaceRoot;"
+     "   },"
++#if !defined(ARM64_BOARD_CONFIG_A5XELTE)
+     "   {"
+     "     'IOClass'         = AppleCLCD;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+@@ -82,6 +91,7 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++#endif
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..b751cb2 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1856,28 +1856,38 @@ sleh_irq(arm_saved_state_t *state)
+ #endif
+ 
+ 
+-#if defined(SWEET)
++#if defined(A5XELTE) || defined(SWEET)
+ 	/*
+-	 * sweet: TrustZone owns GIC Group 0, so the timer and IPIs that other
+-	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
++	 * The non-secure timer and IPIs arrive as Group 1 IRQs.
+ 	 */
+-	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
++	uint64_t iar;
++#if defined(A5XELTE)
++	extern uint32_t a5xelte_irq_ack(void);
++	extern void a5xelte_irq_eoi(uint32_t);
++	iar = a5xelte_irq_ack();
++	#define A5_IRQ_EOI(value) a5xelte_irq_eoi((uint32_t)(value))
++	const uint32_t timer_intid = A5XELTE_VTIMER_INTID;
++#else
++	iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
++	#define A5_IRQ_EOI(value) __builtin_arm_wsr64("ICC_EOIR1_EL1", (value))
++	const uint32_t timer_intid = sweet_vtimer_intid;
++#endif
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
+ 
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+ 	}
+-	if (intid == sweet_vtimer_intid) {
++	if (intid == timer_intid) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
+ 		INTERRUPT_MASKED_DEBUG_END();
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		A5_IRQ_EOI(iar);
+ 	} else if (intid < 16) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		A5_IRQ_EOI(iar);
+ 		__builtin_arm_isb(ISB_SY);
+ 		cpu_signal_handler();
+ 	} else {
+@@ -1888,8 +1898,9 @@ sleh_irq(arm_saved_state_t *state)
+ 			    cdp->interrupt_nub,
+ 			    intid);
+ 		}
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		A5_IRQ_EOI(iar);
+ 	}
++	#undef A5_IRQ_EOI
+ 	__builtin_arm_isb(ISB_SY);
+ #else
+ 	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..9b2e99f 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -223,8 +223,80 @@ pe_init_fiq()
+ #endif /* SWEET */
+ }
+ #else
++#if defined(A5XELTE)
++/* Exynos7580 GIC-400: distributor and CPU interface, both non-secure Group 1. */
++static vm_offset_t a5_gicd_base;
++static vm_offset_t a5_gicc_base;
++
++static uint32_t
++a5_gic_read32(vm_offset_t base, unsigned int offset)
++{
++	return *(volatile uint32_t *)(base + offset);
++}
++
++static void
++a5_gic_write32(vm_offset_t base, unsigned int offset, uint32_t value)
++{
++	*(volatile uint32_t *)(base + offset) = value;
++}
++
++uint32_t
++a5xelte_irq_ack(void)
++{
++	return a5_gic_read32(a5_gicc_base, 0x00c);
++}
++
++void
++a5xelte_irq_eoi(uint32_t iar)
++{
++	a5_gic_write32(a5_gicc_base, 0x010, iar);
++}
++
++void
++a5xelte_send_self_ipi(void)
++{
++	__builtin_arm_dsb(DSB_ISHST);
++	a5_gic_write32(a5_gicd_base, 0xf00, (2U << 24) | 1U);
++}
++
++void
++pe_init_fiq(void)
++{
++	DTEntry entry;
++	const void *reg;
++	unsigned int size;
++	if (SecureDTLookupEntry(NULL, "/arm-io/gic", &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, "reg", &reg, &size) != kSuccess ||
++	    size < 4 * sizeof(uint64_t)) {
++		panic("a5xelte: missing GICv2 reg in ADT");
++	}
++	const uint64_t *r = reg;
++	vm_offset_t soc = pe_arm_get_soc_base_phys();
++	a5_gicd_base = ml_io_map(soc + r[0], r[1]);
++	a5_gicc_base = ml_io_map(soc + r[2], r[3]);
++	if (!a5_gicd_base || !a5_gicc_base) {
++		panic("a5xelte: cannot map GICv2");
++	}
++	/* INTID 27 is the virtual timer PPI; SGI 1 is the local self signal. */
++	a5_gic_write32(a5_gicd_base, 0x080,
++	    a5_gic_read32(a5_gicd_base, 0x080) | (1U << 27) | (1U << 1));
++	for (unsigned int i = 0; i < 32; i += 4) {
++		a5_gic_write32(a5_gicd_base, 0x400 + i, 0xa0a0a0a0U);
++	}
++	a5_gic_write32(a5_gicd_base, 0x100, (1U << 27) | (1U << 1));
++	a5_gic_write32(a5_gicc_base, 0x004, 0xff); /* GICC_PMR */
++	a5_gic_write32(a5_gicc_base, 0x008, 0);    /* GICC_BPR */
++	a5_gic_write32(a5_gicc_base, 0x000,
++	    a5_gic_read32(a5_gicc_base, 0x000) | 1U);
++	a5_gic_write32(a5_gicd_base, 0x000,
++	    a5_gic_read32(a5_gicd_base, 0x000) | 1U);
++	__builtin_arm_dsb(DSB_SY);
++	__builtin_arm_isb(ISB_SY);
++}
++#else
+ void
+ pe_init_fiq()
+ {
+ }
++#endif /* A5XELTE */
+ #endif

@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Galaxy J7 Prime (SM-G610F) S-Boot loader for the XNU payload. Derived from the A5XELTE loader.
  * S-Boot runs this at 0x40080000 at EL1 with the MMU off and the device tree at x0 (measured with
- * probe/); the payload is the ramdisk. No storage accesses. On errors it flushes the log and halts
- * (hold power + volume down for 10 s to reboot).
+ * probe/). The SWEETXNU payload is embedded in the kernel image at offset 0x2000. No storage accesses.
+ * On errors it flushes the log and halts (hold power + volume down for 10 s to reboot).
  */
 .section .text.head, "ax"
 .global _start
@@ -45,6 +45,8 @@ zero_log:
     mov sp, x14
     mov x0, x19
     mov x1, x13
+    adr x2, _start
+    add x2, x2, #0x2000    /* tools/mkembeddedkernel.py places wrapper here */
     bl a5_prepare_xnu
     mov x13, #0x47040000
     add x13, x13, #0x1000

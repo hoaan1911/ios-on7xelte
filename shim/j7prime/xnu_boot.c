@@ -11,7 +11,13 @@
 #define RAM_END  0xa0000000UL
 #define PAGE_SIZE 4096UL
 #define BOOT_LINE_LENGTH 608
+#define EMBEDDED_MAGIC "J7XNPAY1"
+#define EMBEDDED_MAX_SIZE (64UL * 1024UL * 1024UL)
 
+struct embedded_header {
+    char magic[8];
+    uint64_t payload_size;
+};
 struct payload_seg {
     uint64_t vmaddr, vmsize, file_off, file_size;
 };
@@ -75,25 +81,40 @@ static int magic_ok(const char *value)
     return 1;
 }
 
+static int embedded_magic_ok(const char *value)
+{
+    for (unsigned i = 0; i < 8; ++i)
+        if (value[i] != EMBEDDED_MAGIC[i])
+            return 0;
+    return 1;
+}
+
 static uintptr_t align_page(uintptr_t value)
 {
     return (value + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 }
 
 /* Returns entry PA or zero. Status is kept in reserved RAM for TWRP. */
-uintptr_t a5_prepare_xnu(uintptr_t fdt, volatile uint64_t *log)
+uintptr_t a5_prepare_xnu(uintptr_t fdt, volatile uint64_t *log, uintptr_t embedded)
 {
-    uint64_t rd_start, rd_end;
+    (void)fdt; /* The payload no longer depends on S-Boot's initrd FDT properties. */
     log[10] = (uint64_t)-1;
-    if (!fdt_chosen_u64(fdt, "linux,initrd-start", &rd_start) ||
-        !fdt_chosen_u64(fdt, "linux,initrd-end", &rd_end) ||
-        rd_start < 0x40000000ULL || rd_end > RAM_END || rd_end <= rd_start)
+    if (!embedded || embedded > RAM_END - sizeof(struct embedded_header))
         return 0;
-    log[11] = rd_start;
-    log[12] = rd_end;
 
-    const struct payload *p = (const struct payload *)(uintptr_t)rd_start;
-    uint64_t length = rd_end - rd_start;
+    const struct embedded_header *eh = (const struct embedded_header *)embedded;
+    if (!embedded_magic_ok(eh->magic) || !eh->payload_size ||
+        eh->payload_size > EMBEDDED_MAX_SIZE ||
+        eh->payload_size > RAM_END - embedded - sizeof(*eh))
+        return 0;
+
+    uintptr_t payload_start = embedded + sizeof(*eh);
+    uintptr_t payload_end = payload_start + eh->payload_size;
+    const struct payload *p = (const struct payload *)payload_start;
+    uint64_t length = eh->payload_size;
+    log[11] = payload_start;
+    log[12] = payload_end;
+
     log[10] = (uint64_t)-2;
     if (length < sizeof(*p) || !magic_ok(p->magic) || p->version != 1 ||
         !p->nsegs || p->nsegs > 32 ||
@@ -119,7 +140,7 @@ uintptr_t a5_prepare_xnu(uintptr_t fdt, volatile uint64_t *log)
             s->vmsize > p->mem_size || s->vmaddr - p->virt_base > p->mem_size - s->vmsize)
             return 0;
         uintptr_t dst = p->phys_base + (s->vmaddr - p->virt_base);
-        copy_bytes(dst, rd_start + s->file_off, s->file_size);
+        copy_bytes(dst, payload_start + s->file_off, s->file_size);
         zero_bytes(dst + s->file_size, s->vmsize - s->file_size);
         clean_bytes(dst, dst + s->vmsize);
     }
@@ -128,7 +149,7 @@ uintptr_t a5_prepare_xnu(uintptr_t fdt, volatile uint64_t *log)
     uintptr_t ba_pa = align_page(adt_pa + p->adt_size);
     if (ba_pa + PAGE_SIZE > memory_end || ba_pa < adt_pa)
         return 0;
-    copy_bytes(adt_pa, rd_start + p->adt_off, p->adt_size);
+    copy_bytes(adt_pa, payload_start + p->adt_off, p->adt_size);
     zero_bytes(ba_pa, PAGE_SIZE);
     volatile struct boot_args *ba = (volatile struct boot_args *)ba_pa;
     ba->Revision = 2;

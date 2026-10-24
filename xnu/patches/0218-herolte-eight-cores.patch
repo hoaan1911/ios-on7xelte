@@ -1,0 +1,47 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 14eaf21..b59b661 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -81,9 +81,11 @@ SweetCPU::start(IOService *provider)
+ 		return false;
+ 	}
+ #if defined(HEROLTE)
+-	/* Logical 0..3 = MPIDR 0x100..0x103, the boot CPU's A53 cluster. */
+-	if (cpu->phys_id != A5XELTE_BOOT_MPIDR + cpu->cpu_id ||
+-	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++	/* Logical 0..3 = A53 MPIDR 0x100..0x103 (boot cluster), 4..7 = Mongoose
++	 * MPIDR 0x0..0x3, the order of the ADT /cpus nodes (mkadt_herolte.py). */
++	uint32_t expected_mpidr = cpu->cpu_id < 4 ? A5XELTE_BOOT_MPIDR + cpu->cpu_id :
++	    cpu->cpu_id - 4;
++	if (cpu->phys_id != expected_mpidr || topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic(CPU_PORT_NAME " CPU: unsupported topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
+@@ -105,7 +107,11 @@ SweetCPU::start(IOService *provider)
+ 		return false;
+ 	}
+ #if defined(A5XELTE)
++#if defined(HEROLTE)
++	cpuName = OSSymbol::withCStringNoCopy(cpu->cpu_id < 4 ? "Cortex-A53" : "Mongoose");
++#else
+ 	cpuName = OSSymbol::withCStringNoCopy("Cortex-A53");
++#endif
+ #else
+ 	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
+ #endif
+diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
+index 7a3ba54..8f9c8a2 100644
+--- a/pexpert/pexpert/arm64/A5XELTE.h
++++ b/pexpert/pexpert/arm64/A5XELTE.h
+@@ -13,8 +13,9 @@
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ /* Galaxy S7 SM-G930F: S-Boot leaves DECON_F scanning out this buffer. */
+ #define HEROLTE                       1
+-/* The four Cortex-A53 "Apollo" cores, MPIDR 0x100..0x103, via PSCI CPU_ON. */
+-#define SWEET_SMP_MAX_CPUS            4
++/* Logical 0..3: Cortex-A53 "Apollo" MPIDR 0x100..0x103 (boot cluster);
++ * 4..7: Mongoose MPIDR 0x0..0x3. All started with PSCI CPU_ON. */
++#define SWEET_SMP_MAX_CPUS            8
+ #define A5XELTE_FB_PA                 0xe2a00000
+ #define A5XELTE_FB_WIDTH              1440
+ #define A5XELTE_FB_HEIGHT             2560

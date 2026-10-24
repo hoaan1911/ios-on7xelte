@@ -1,0 +1,424 @@
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+index 8617e61..7dee125 100644
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -45,7 +45,7 @@ CFLAGS+= -include meta_features.h -DDRIVER_PRIVATE \
+ SFLAGS+= -include meta_features.h
+ 
+ # This provider is built into SWEET; other boards use their normal kext.
+-ifneq ($(filter $(CURRENT_MACHINE_CONFIG),SWEET A5XELTE),)
++ifneq ($(filter $(CURRENT_MACHINE_CONFIG),SWEET A5XELTE HEROLTE),)
+ SWEET_PTHREAD_ROOT = $(SRCROOT)/bsd/pthread/sweet_libpthread
+ SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
+ sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+diff --git a/config/MASTER.arm64.herolte b/config/MASTER.arm64.herolte
+new file mode 100644
+index 0000000..e5a1a8f
+--- /dev/null
++++ b/config/MASTER.arm64.herolte
+@@ -0,0 +1,117 @@
++#
++# herolte (SM-G930F, Exynos 8890): the a5xelte configuration, copied for the
++# HEROLTE machine config. a5xelte notes follow.
++# a5xelte (SM-A510F, Exynos7580): donor configuration plus the open-source
++# arm64 assembly and pmap (nos_arm_asm, nos_arm_pmap). Apple's own SoC configs
++# link those from the KDK's closed lib<SOC>.os.<CONFIG>.a instead, which is
++# arm64e and Apple-silicon specific. kperf/kpc stay (xnu does not build without
++# kperf); osfmk/arm64/kpc.c is a stub with no hardware counters.
++#
++#
++# Mach Operating System
++# Copyright (c) 1986 Carnegie-Mellon University
++# Copyright 2001-2018 Apple Inc.
++#
++# All rights reserved.  The CMU software License Agreement
++# specifies the terms and conditions for use and redistribution.
++#  
++######################################################################
++#
++#  Master Apple configuration file (see the master machine independent
++#  configuration file for a description of the file format).
++#
++######################################################################
++#  
++#  Standard Apple OS Configurations:
++#  -------- ----- -- ---------------
++#
++#  KERNEL_BASE =    [ arm64 config_pmap_ppl medium msgb_large config_requires_u32_munging config_delay_idle_sleep config_proc_udata_storage config_uexc config_darkboot nos_arm_asm nos_arm_pmap ]
++#  KERNEL_RELEASE = [ KERNEL_BASE ]
++#  KERNEL_DEV =     [ KERNEL_BASE development mach_assert config_xnupost proc_ref_debug config_proc_resource_limits ]
++#  KERNEL_DEBUG =   [ KERNEL_BASE debug mach_assert config_xnupost config_waitq_stats config_workloop_debug config_proc_resource_limits ]
++#  BSD_BASE =       [ mach_bsd sysv_sem sysv_msg sysv_shm config_netboot config_imageboot psynch config_proc_uuid_policy config_coredump pgo config_personas ]
++#  BSD_RELEASE =    [ BSD_BASE ]
++#  BSD_DEV =        [ BSD_BASE config_vnguard ]
++#  BSD_DEBUG =      [ BSD_BASE config_vnguard ]
++#  FILESYS_BASE =   [ devfs fdesc fifo mockfs sweet_hfs fs_compression config_protect config_mnt_rootsnap config_rosv_startup config_mount_vm config_mount_prebootrecovery config_basesystemroot config_fse quota namedstreams config_imgsrc_access config_triggers config_searchfs config_volfs config_appledouble nullfs bindfs config_mnt_suid config_firmlinks config_dataless_files config_union_mounts config_file_leases ]
++#  FILESYS_RELEASE= [ FILESYS_BASE ]
++#  FILESYS_DEV =    [ FILESYS_BASE config_iocount_trace ]
++#  FILESYS_DEBUG =  [ FILESYS_BASE config_iocount_trace ]
++#  NFS =            [ nfsserver ]
++#  SKYWALK_BASE =   [ skywalk config_nexus_user_pipe config_nexus_kernel_pipe config_nexus_monitor config_nexus_flowswitch config_nexus_netif ]
++#  SKYWALK_RELEASE = [ SKYWALK_BASE ]
++#  SKYWALK_DEV =    [ SKYWALK_BASE ]
++#  SKYWALK_DEBUG =  [ SKYWALK_BASE ]
++#  NETWORKING =     [ inet bpfilter dummynet traffic_mgt sendfile ah_all_crypto bond vlan gif stf ifnet_input_chk config_mbuf_jumbo if_bridge MULTIPATH if_fake remote_vif ]
++#  NETWORKING_RELEASE = [ NETWORKING ]
++#  NETWORKING_DEV = [ NETWORKING_RELEASE packet_mangler if_headless ]
++#  NETWORKING_DEBUG = [ NETWORKING_DEV ]
++#  VPN =            [ ipsec flow_divert necp content_filter ]
++#  PF =             [ pf pflog ]
++#  MULTIPATH =      [ multipath mptcp ]
++#if SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED
++#  HIBERNATION =    [ ]
++#else /*!(SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED)*/
++#  HIBERNATION =    [ ]
++#endif /*SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED*/
++#  IOKIT_BASE =     [ iokit iokitcpp no_kernel_hid config_sleep iokitstats HIBERNATION ]
++#  IOKIT_RELEASE =  [ IOKIT_BASE ]
++#  IOKIT_DEV =      [ IOKIT_BASE iotracking ]
++#  IOKIT_DEBUG =    [ IOKIT_BASE iotracking ]
++#  LIBKERN_BASE =   [ libkerncpp config_blocks config_kec_fips crypto_sha2 config_img4 ]
++#  LIBKERN_RELEASE =[ LIBKERN_BASE zlib ]
++#  LIBKERN_DEV =    [ LIBKERN_BASE zlib iotracking ]
++#  LIBKERN_DEBUG =  [ LIBKERN_BASE zlib iotracking ]
++#  PERF_DBG_BASE =  [ config_dtrace mach_kdp config_serial_kdp kdp_interactive_debugging config_kdp_coredump_encryption config_pervasive_energy PERFMON_BASE kperf kpc ]
++#  PERF_DBG_RELEASE=[ PERF_DBG_BASE ist_kdebug ]
++#  PERF_DBG_DEV =   [ PERF_DBG_BASE lock_stats zleaks alternate_debugger sched_hygiene_debug config_debug_syscall_rejection config_iotrace ]
++#  PERF_DBG_DEBUG = [ PERF_DBG_BASE lock_stats zleaks alternate_debugger sched_hygiene_debug config_debug_syscall_rejection config_iotrace ]
++#if SOC_IS_VIRTUALIZED
++#  PARAVIRT_BASE =  [ config_pv_ticket ]
++#else
++#  PARAVIRT_BASE =  [ ]
++#endif /*SOC_IS_VIRTUALIZED*/
++#  MACH_BASE =      [ mach config_ecc_logging vc_progress_white importance_inheritance config_atm config_coalitions config_iosched config_sysdiagnose config_telemetry config_mach_bridge_recv_time config_quiesce_counter config_arm_pfz config_user_notification phys_write_acct config_service_port_info config_voucher_deprecated PARAVIRT_BASE config_ledger_interval_max ]
++#  MACH_RELEASE =   [ MACH_BASE ]
++#  MACH_DEV =       [ MACH_BASE config_io_accounting importance_trace ]
++#  MACH_DEBUG =     [ MACH_BASE config_io_accounting importance_trace importance_debug ]
++#  SCHED_BASE =     [ config_sched_traditional config_sched_multiq config_sched_deferred_ast config_clutch config_sched_sfi config_sched_auto_join config_preadopt_tg ]
++#  SCHED_RELEASE =  [ SCHED_BASE ]
++#  SCHED_DEV =      [ SCHED_BASE ]
++#  SCHED_DEBUG =    [ SCHED_BASE config_sched_grrr config_sched_proto ]
++#  VM_BASE =        [ vm_pressure_events memorystatus config_code_decryption encrypted_swap config_deferred_reclaim ]
++#  VM_RELEASE =     [ VM_BASE ]
++#  VM_DEV =         [ VM_BASE dynamic_codesigning pgzalloc ]
++#  VM_DEBUG =       [ VM_BASE dynamic_codesigning pgzalloc ]
++#  VM_KASAN =       [ VM_BASE dynamic_codesigning config_kasan config_ubsan config_kcov config_ksancov kernel_tbi ]
++#  SECURITY =       [ config_macf config_audit kernel_integrity config_csr config_csr_from_dt config_setuid config_kas_info config_secure_bsd_root config_arcade config_supplemental_signatures second_static_trust_cache reslide_shared_cache ]
++#  BASE =           [ PF VPN SECURITY NFS ]
++#  RELEASE =        [ BASE KERNEL_RELEASE BSD_RELEASE FILESYS_RELEASE SKYWALK_RELEASE NETWORKING_RELEASE IOKIT_RELEASE LIBKERN_RELEASE    PERF_DBG_RELEASE MACH_RELEASE SCHED_RELEASE VM_RELEASE ]
++#  DEVELOPMENT =    [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_DEV     ]
++#  DEBUG =          [ BASE KERNEL_DEBUG   BSD_DEBUG   FILESYS_DEBUG   SKYWALK_DEBUG   NETWORKING_DEBUG   IOKIT_DEBUG   LIBKERN_DEBUG      PERF_DBG_DEBUG   MACH_DEBUG   SCHED_DEBUG   VM_DEBUG   ]
++#  KASAN =          [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_KASAN   ]
++#
++######################################################################
++#
++machine		"arm64"						# <arm64>
++
++makeoptions	OSFMK_MACHINE = "arm64"				# <mach>
++
++options		COUNT_SYSCALLS		# count bsd system calls 	# <countcalls>
++options     TRASH_VFP_ON_SAVE   # <debug,trash_vfp>
++options		ALTERNATE_DEBUGGER	# <alternate_debugger>
++
++options   CONFIG_VNODES=1024		# <xsmall>
++
++options   CONFIG_FREEZE_SUSPENDED_MIN=4		# <xsmall>
++
++options	  CONFIG_MACH_APPROXIMATE_TIME
++
++options   CONFIG_KERNEL_INTEGRITY		# <kernel_integrity>
++
++options CONFIG_MACF_LAZY_VNODE_LABELS   # Turn on labels, don't preallocate
++
++options CONFIG_HYPERVISOR_PUBLIC   # unrestricted entitlement for hypervisor
++
++options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
++options   CONFIG_KERNEL_TBI		# <kernel_tbi>
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7e2383c..b7eb773 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -48,6 +48,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
+@@ -70,7 +71,7 @@ enum {
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+-#define SWEET_FB_DOT_PITCH              424     /* 1080 pixels across 5.2 inches */
++#define SWEET_FB_DOT_PITCH              A5XELTE_FB_DOT_PITCH
+ #else
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ #endif
+@@ -174,10 +175,10 @@ AppleCLCD::start(IOService *provider)
+ 	/* The loader's DECON handoff scans out this physical XRGB8888 buffer.
+ 	 * It does not fill boot_args.Video, so PE_current_console is empty.
+ 	 * Keep the physical address out of the donor path. */
+-	fPhys = 0x67000000ULL;
+-	fWidth = 1080;
+-	fHeight = 1920;
+-	fRowBytes = 4320;
++	fPhys = A5XELTE_FB_PA;
++	fWidth = A5XELTE_FB_WIDTH;
++	fHeight = A5XELTE_FB_HEIGHT;
++	fRowBytes = A5XELTE_FB_STRIDE;
+ #else
+ 	fPhys = video.v_baseAddr;
+ 	fWidth = (uint32_t)video.v_width;
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 63a3c37..6bf49ce 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -772,8 +772,11 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	}
+ 
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#if !defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/* Exynos 7580 GPIO/I2C addresses; HEROLTE needs its own drivers. */
+ 	a5xelte_keys_init();
+ 	a5xelte_touch_probe();
++#endif
+ 	{
+ 	uint32_t emmcprobe = 0;
+ 	PE_parse_boot_argn("emmcprobe", &emmcprobe, sizeof(emmcprobe));
+diff --git a/libkern/conf/Makefile.template b/libkern/conf/Makefile.template
+index a66c50a..f91d537 100644
+--- a/libkern/conf/Makefile.template
++++ b/libkern/conf/Makefile.template
+@@ -19,7 +19,7 @@ include $(MakeInc_def)
+ CFLAGS+= -include meta_features.h -DLIBKERN_KERNEL_PRIVATE -DOSALLOCDEBUG=1
+ SFLAGS+= -include meta_features.h
+ 
+-ifneq ($(filter $(CURRENT_MACHINE_CONFIG),SWEET A5XELTE),)
++ifneq ($(filter $(CURRENT_MACHINE_CONFIG),SWEET A5XELTE HEROLTE),)
+ SWEET_AES_ROOT = $(SRCROOT)/libkern/crypto/sweet_bearssl
+ SWEET_AES_INC = -I$(SWEET_AES_ROOT)/inc -I$(SWEET_AES_ROOT)/src
+ sweet_aes.o_INCFLAGS = $(SWEET_AES_INC)
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 611ff12..6d0b107 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -29,7 +29,7 @@ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else ifneq ($(findstring _host,$(RC_ProjectName)),)
+ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else
+-SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET A5XELTE
++SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET A5XELTE HEROLTE
+ 
+ endif
+ 
+@@ -63,6 +63,8 @@ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+ MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
+ MACHINE_FLAGS_ARM64_A5XELTE = -DARM64_BOARD_CONFIG_A5XELTE            -mcpu=cortex-a53 -march=armv8-a+crypto
++# Galaxy S7 (Exynos 8890) boots on a Cortex-A53 and reuses the A5XELTE port.
++MACHINE_FLAGS_ARM64_HEROLTE = -DARM64_BOARD_CONFIG_A5XELTE -DARM64_BOARD_CONFIG_HEROLTE -mcpu=cortex-a53 -march=armv8-a+crypto
+ 
+ 
+ #
+@@ -262,7 +264,7 @@ ifeq ($(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG),)
+ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := $(shell echo $(CURRENT_ARCH_CONFIG) | tr A-Z a-z)
+ ifneq ($(filter arm64,$(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG)),)
+ # These generic ARMv8 targets do not use Apple's arm64e pointer authentication.
+-ifeq ($(filter $(CURRENT_MACHINE_CONFIG),SWEET A5XELTE),)
++ifeq ($(filter $(CURRENT_MACHINE_CONFIG),SWEET A5XELTE HEROLTE),)
+ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64e
+ endif
+ endif
+@@ -341,7 +343,7 @@ endif
+ # Exynos7580 uses 4 KiB pages: TTBR1 has a 39-bit range. The macOS
+ # ARM_LARGE_MEMORY link address at -2 TiB is outside that range. Keep this
+ # board inside the existing compact kernel VA layout instead.
+-ifeq ($(CURRENT_MACHINE_CONFIG),A5XELTE)
++ifneq ($(filter $(CURRENT_MACHINE_CONFIG),A5XELTE HEROLTE),)
+ LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY
+ ARM64_PLKSEG_ADDR  =0xfffffff004004000
+ ARM64_LINK_ADDR    =0xfffffff007004000
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index f7a54ac..5b7ddb0 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -515,15 +515,15 @@ LEXT(start_first_cpu)
+ 
+ #if defined(A5XELTE)
+ 	/* Earliest XNU-owned physical marker in preserved Samsung log RAM. */
+-	MOV64	x10, 0x469ff100
++	MOV64	x10, A5XELTE_MARKER_PA
+ 	MOV64	x11, 0x3145544c45554e58
+ 	str		x11, [x10]
+ 	dsb		sy
+ 	/* XNU-owned green entry block on the Exynos DECON scanout buffer. */
+-	MOV64	x10, 0x6705d0c0
++	MOV64	x10, (A5XELTE_FB_PA+88*A5XELTE_FB_STRIDE+960)
+ 	MOV64	x11, 0xff00ff00
+ 	mov		x12, #21
+-	mov		x15, #4320
++	mov		x15, #A5XELTE_FB_STRIDE
+ La5_entry_row:
+ 	mov		x14, x10
+ 	mov		x13, #36
+@@ -708,18 +708,18 @@ Lkernelcache_base_found:
+ 	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
+ 
+ #if defined(A5XELTE)
+-	/* Five 2 MiB blocks map the 1080x1920 scanout buffer VA=PA.
++	/* A5XELTE_FB_BLOCKS 2 MiB blocks map the scanout buffer VA=PA.
+ 	 * Its L1 index differs from isolated XNU RAM, so this uses one extra
+ 	 * bootstrap L2 page. Mark it write-combined for DECON DMA visibility. */
+-	MOV64	x0, 0x67000000
++	MOV64	x0, A5XELTE_FB_PA
+ 	mov		x4, x0
+-	mov		x5, #5
++	mov		x5, #A5XELTE_FB_BLOCKS
+ 	create_bootstrap_mapping x0, x4, x5, x1, x2, x6, x10, x11, x12, x13
+-	MOV64	x10, 0x67000000
++	MOV64	x10, A5XELTE_FB_PA
+ 	and		x11, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x11, x11, #(ARM_TT_L2_SHIFT)
+ 	add		x12, x2, x11, lsl #TTE_SHIFT
+-	mov		x13, #5
++	mov		x13, #A5XELTE_FB_BLOCKS
+ La5_fb_attr:
+ 	ldr		x11, [x12]
+ 	bic		x11, x11, #(ARM_TTE_BLOCK_ATTRINDXMASK)
+@@ -890,10 +890,10 @@ common_start:
+ 
+ #if defined(A5XELTE)
+ 	/* Blue block: the 4 KiB MMU is active and the framebuffer alias works. */
+-	MOV64	x10, 0x6707ecc0
++	MOV64	x10, (A5XELTE_FB_PA+120*A5XELTE_FB_STRIDE+960)
+ 	MOV64	x11, 0xff0000ff
+ 	mov		x12, #21
+-	mov		x15, #4320
++	mov		x15, #A5XELTE_FB_STRIDE
+ La5_mmu_row:
+ 	mov		x14, x10
+ 	mov		x13, #36
+@@ -934,10 +934,10 @@ La5_mmu_pixel:
+ 
+ #if defined(A5XELTE)
+ 	/* fp_enabled: write directly to the DECON scanout alias. */
+-	MOV64	x10, 0x670a08c0
++	MOV64	x10, (A5XELTE_FB_PA+152*A5XELTE_FB_STRIDE+960)
+ 	MOV64	x11, 0xff00ffff
+ 	mov	x12, #21
+-	mov	x15, #4320
++	mov	x15, #A5XELTE_FB_STRIDE
+ La5_fp_enabled_row:
+ 	mov	x14, x10
+ 	mov	x13, #36
+@@ -969,10 +969,10 @@ La5_fp_enabled_pixel:
+ 
+ #if defined(A5XELTE)
+ 	/* tunables_done: write directly to the DECON scanout alias. */
+-	MOV64	x10, 0x670c24c0
++	MOV64	x10, (A5XELTE_FB_PA+184*A5XELTE_FB_STRIDE+960)
+ 	MOV64	x11, 0xffff00ff
+ 	mov	x12, #21
+-	mov	x15, #4320
++	mov	x15, #A5XELTE_FB_STRIDE
+ La5_tunables_done_row:
+ 	mov	x14, x10
+ 	mov	x13, #36
+@@ -1016,10 +1016,10 @@ La5_tunables_done_pixel:
+ 
+ #if defined(A5XELTE)
+ 	/* arm_init_jump: write directly to the DECON scanout alias. */
+-	MOV64	x10, 0x670e40c0
++	MOV64	x10, (A5XELTE_FB_PA+216*A5XELTE_FB_STRIDE+960)
+ 	MOV64	x11, 0xffffff00
+ 	mov	x12, #21
+-	mov	x15, #4320
++	mov	x15, #A5XELTE_FB_STRIDE
+ La5_arm_init_jump_row:
+ 	mov	x14, x10
+ 	mov	x13, #36
+@@ -1101,8 +1101,8 @@ arm_init_tramp:
+ La5_draw_text:
+ 	adrp	x3, EXT(iso_font)@page
+ 	add	x3, x3, EXT(iso_font)@pageoff
+-	MOV64	x4, 0x67000000
+-	mov	x5, #4320
++	MOV64	x4, A5XELTE_FB_PA
++	mov	x5, #A5XELTE_FB_STRIDE
+ 	madd	x4, x2, x5, x4
+ 	add	x4, x4, x1, lsl #2
+ La5_text_next_char:
+@@ -1118,7 +1118,7 @@ La5_text_column:
+ 	lsl	w11, w11, w10
+ 	tst	w9, w11
+ 	b.eq	La5_text_skip_pixel
+-	mov	x13, #8640
++	mov	x13, #(2*A5XELTE_FB_STRIDE)
+ 	madd	x12, x8, x13, x4
+ 	add	x12, x12, x10, lsl #3
+ 	mov	w14, #-1
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index dcdbcf6..d6bd6a4 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -12,12 +12,12 @@
+ #include <kern/misc_protos.h>
+ 
+ /* The bootstrap TTBR0 maps DECON scanout VA=PA until arm_vm_init. */
+-#define A5_FB ((volatile uint32_t *)(uintptr_t)0x67000000)
+-#define A5_STRIDE 1080u
+-#define A5_SCALE 2u
++#define A5_FB ((volatile uint32_t *)(uintptr_t)A5XELTE_FB_PA)
++#define A5_STRIDE (A5XELTE_FB_STRIDE / 4u)
++#define A5_SCALE ((unsigned int)A5XELTE_FB_TEXT_SCALE)
+ #define A5_ROW_HEIGHT (16u * A5_SCALE)
+ #define A5_COL_WIDTH (8u * A5_SCALE)
+-#define A5_COLS (1080u / A5_COL_WIDTH)
++#define A5_COLS (A5XELTE_FB_WIDTH / A5_COL_WIDTH)
+ extern unsigned char iso_font[256 * 16];
+ static unsigned int a5_row = 4, a5_col, a5_active = 1, a5_panicking;
+ 
+@@ -44,7 +44,7 @@ sweet_early_putc(char c)
+ 	}
+ 	if (c == '\n' || a5_col >= A5_COLS) {
+ 		a5_col = 0;
+-		a5_row = (a5_row + 1) % (1920u / A5_ROW_HEIGHT);
++		a5_row = (a5_row + 1) % (A5XELTE_FB_HEIGHT / A5_ROW_HEIGHT);
+ 		a5_clear_row();
+ 		if (c == '\n') {
+ 			return;
+diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
+index dd22be9..a3b4772 100644
+--- a/pexpert/pexpert/arm64/A5XELTE.h
++++ b/pexpert/pexpert/arm64/A5XELTE.h
+@@ -10,6 +10,29 @@
+ #define SWEET                         1
+ #define SWEET_SMP_MAX_CPUS            1
+ 
++/* Firmware scanout buffer and the earliest XNU marker (physical). */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++/* Galaxy S7 SM-G930F: S-Boot leaves DECON_F scanning out this buffer. */
++#define HEROLTE                       1
++#define A5XELTE_FB_PA                 0xe2a00000
++#define A5XELTE_FB_WIDTH              1440
++#define A5XELTE_FB_HEIGHT             2560
++#define A5XELTE_FB_STRIDE             5760
++#define A5XELTE_FB_BLOCKS             8     /* 2 MiB VA=PA bootstrap blocks */
++#define A5XELTE_FB_TEXT_SCALE         3
++#define A5XELTE_FB_DOT_PITCH          577   /* 1440 pixels across 5.1 inches */
++#define A5XELTE_MARKER_PA             0x8ffff100
++#else
++#define A5XELTE_FB_PA                 0x67000000
++#define A5XELTE_FB_WIDTH              1080
++#define A5XELTE_FB_HEIGHT             1920
++#define A5XELTE_FB_STRIDE             4320
++#define A5XELTE_FB_BLOCKS             5
++#define A5XELTE_FB_TEXT_SCALE         2
++#define A5XELTE_FB_DOT_PITCH          424   /* 1080 pixels across 5.2 inches */
++#define A5XELTE_MARKER_PA             0x469ff100
++#endif
++
+ #define ARM_ARCH_TIMER
+ #define __ARM_ARCH__                  8
+ #define __ARM_VMSA__                  8

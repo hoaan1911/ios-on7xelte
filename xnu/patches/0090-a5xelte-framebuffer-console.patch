@@ -1,0 +1,134 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 17955fb..dcdbcf6 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -8,11 +8,109 @@
+ #include <arm64/sweet_early.h>
+ 
+ #if defined(SWEET) && defined(A5XELTE)
+-void sweet_early_putc(char c) { (void)c; }
+-void sweet_early_mark(unsigned int stage, const char *label) { (void)stage; (void)label; }
+-void sweet_early_panic(const char *fmt, va_list *args) { (void)fmt; (void)args; }
++#include <stdint.h>
++#include <kern/misc_protos.h>
++
++/* The bootstrap TTBR0 maps DECON scanout VA=PA until arm_vm_init. */
++#define A5_FB ((volatile uint32_t *)(uintptr_t)0x67000000)
++#define A5_STRIDE 1080u
++#define A5_SCALE 2u
++#define A5_ROW_HEIGHT (16u * A5_SCALE)
++#define A5_COL_WIDTH (8u * A5_SCALE)
++#define A5_COLS (1080u / A5_COL_WIDTH)
++extern unsigned char iso_font[256 * 16];
++static unsigned int a5_row = 4, a5_col, a5_active = 1, a5_panicking;
++
++static void
++a5_clear_row(void)
++{
++	for (unsigned int y = 0; y < A5_ROW_HEIGHT; y++) {
++		volatile uint32_t *line = A5_FB + (a5_row * A5_ROW_HEIGHT + y) * A5_STRIDE;
++		for (unsigned int x = 0; x < A5_STRIDE; x++) {
++			line[x] = 0xff000000u;
++		}
++	}
++}
++
++void
++sweet_early_putc(char c)
++{
++	if (!a5_active) {
++		return;
++	}
++	if (c == '\r') {
++		a5_col = 0;
++		return;
++	}
++	if (c == '\n' || a5_col >= A5_COLS) {
++		a5_col = 0;
++		a5_row = (a5_row + 1) % (1920u / A5_ROW_HEIGHT);
++		a5_clear_row();
++		if (c == '\n') {
++			return;
++		}
++	}
++	const unsigned char *glyph = iso_font + (unsigned char)c * 16;
++	for (unsigned int gy = 0; gy < 16; gy++) {
++		for (unsigned int sy = 0; sy < A5_SCALE; sy++) {
++			volatile uint32_t *line = A5_FB +
++			    (a5_row * A5_ROW_HEIGHT + gy * A5_SCALE + sy) * A5_STRIDE +
++			    a5_col * A5_COL_WIDTH;
++			for (unsigned int gx = 0; gx < 8; gx++) {
++				uint32_t pixel = (glyph[gy] & (1u << gx)) ? 0xffffffffu : 0xff000000u;
++				for (unsigned int sx = 0; sx < A5_SCALE; sx++) {
++					line[gx * A5_SCALE + sx] = pixel;
++				}
++			}
++		}
++	}
++	a5_col++;
++}
++
++static void
++a5_string(const char *s)
++{
++	while (*s) {
++		sweet_early_putc(*s++);
++	}
++}
++
++void
++sweet_early_mark(unsigned int stage, const char *label)
++{
++	if (!a5_active || stage > 7) {
++		return;
++	}
++	a5_string("A5 XNU STAGE ");
++	sweet_early_putc((char)('0' + stage));
++	a5_string(": ");
++	a5_string(label);
++	sweet_early_putc('\n');
++	__asm__ volatile("dsb sy" ::: "memory");
++	/* arm_vm_init replaces TTBR0; low physical aliases then cease to exist. */
++	if (stage == 7) {
++		a5_active = 0;
++	}
++}
++
++void
++sweet_early_panic(const char *fmt, va_list *args)
++{
++	if (!a5_active || a5_panicking) {
++		return;
++	}
++	a5_panicking = 1;
++	a5_string("A5 XNU PANIC: ");
++	va_list copy;
++	va_copy(copy, *args);
++	_doprnt(fmt, &copy, sweet_early_putc, 16);
++	va_end(copy);
++	sweet_early_putc('\n');
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ void sweet_early_relocate(uint64_t base) { (void)base; }
+-void sweet_early_disable(void) {}
++void sweet_early_disable(void) { a5_active = 0; }
+ #elif defined(SWEET)
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 19f27cd..ed7dccd 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -818,7 +818,11 @@ fbcon_probe(void)
+ 	uint32_t const *val;
+ 	unsigned int size;
+ 
++	#if defined(A5XELTE)
++	if (SecureDTFindEntry("name", "a5xelte-fbcon", &entry) != kSuccess ||
++#else
+ 	if (SecureDTFindEntry("name", "sweet-fbcon", &entry) != kSuccess ||
++#endif
+ 	    SecureDTGetProperty(entry, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
+ 		return;
+ 	}

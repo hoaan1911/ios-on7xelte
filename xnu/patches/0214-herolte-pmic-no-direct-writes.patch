@@ -1,0 +1,99 @@
+diff --git a/bsd/dev/herolte_touch.c b/bsd/dev/herolte_touch.c
+index 94d4299..59da7c9 100644
+--- a/bsd/dev/herolte_touch.c
++++ b/bsd/dev/herolte_touch.c
+@@ -109,6 +109,16 @@ ht_msleep(unsigned ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * Wait for the persistent log (flushed every 10 s, herolte_ufs.c) before a
++ * risky step, so a hang still leaves the step in the log.
++ */
++static void
++ht_checkpoint(void)
++{
++	ht_msleep(11000);
++}
++
+ /* Batcher program: register offsets as opcodes, 4 per word; 0xff ends it. */
+ static void
+ pm_batch(uint32_t value, uint32_t reg)
+@@ -139,36 +149,23 @@ pm_dump(const char *what)
+ }
+ 
+ /*
+- * exynos5_i2c_probe() for a batcher bus: clear pending interrupts, SW
+- * reset, then exynos5_i2c_init(): master, trailing count, the HS master
+- * code (bus 15: MASTER_ID = (15 & 7) + 8) and CONF HS | AUTO.
++ * No direct HSI2C register writes on this bus: Linux's probe reset runs
++ * before the APM firmware uses the controller, but S-Boot leaves the APM
++ * running, and resetting the controller under it hung the phone (0213).
++ * Only batcher programs, which hold the AP/APM semaphore, configure it.
++ *
++ * Batcher recovery as 0212 (which did not hang): reset the batcher only
++ * when stuck in CONFIG..CLEAN_INTR, then release the AP semaphore.
+  */
+ static void
+-pm_bus_init(void)
+-{
+-	ht_wr(ht_pm, HSI2C_INT_STAT, ht_rd(ht_pm, HSI2C_INT_STAT));
+-	ht_wr(ht_pm, HSI2C_CTL, ht_rd(ht_pm, HSI2C_CTL) | (1u << 31));
+-	ht_wr(ht_pm, HSI2C_CTL, ht_rd(ht_pm, HSI2C_CTL) & ~(1u << 31));
+-	ht_wr(ht_pm, HSI2C_CTL, 1u << 3);
+-	ht_wr(ht_pm, HSI2C_TRAILING, 0xfu);
+-	ht_wr(ht_pm, HSI2C_ADDR, 0x0fu << 24);
+-	ht_wr(ht_pm, HSI2C_CONF, ht_rd(ht_pm, HSI2C_CONF) | (1u << 29) | (1u << 31));
+-}
+-
+-/* Linux recover_batcher()/reset_batcher() for a stuck program. */
+-static void
+ pm_batcher_recover(uint32_t state)
+ {
+ 	if (state >= (1u << 6) && state <= (1u << 13)) {
+ 		ht_wr(ht_pm, PM_BAT_CON, 1u << 31);
+ 		ht_wr(ht_pm, PM_BAT_CON, 0);
+-		if (ht_rd(ht_pm, PM_BAT_STATE) & 1u) {
+-			ht_wr(ht_pm, PM_BAT_STATE, 1u);
+-		}
+-		pm_bus_init();
+-		ht_wr(ht_pm, PM_BAT_CON, 0);
+ 		ht_wr(ht_pm, PM_SMRELEASE, 1u);
+ 	}
++	ht_wr(ht_pm, PM_BAT_STATE, ht_rd(ht_pm, PM_BAT_STATE) | 1u);
+ 	ht_wr(ht_pm, PM_BAT_CON, 0);
+ }
+ 
+@@ -271,11 +268,11 @@ pm_touch_power_on(void)
+ 	uint8_t id = 0, l32 = 0, l33 = 0, c32 = 0, c33 = 0;
+ 
+ 	pm_dump("as found");
+-	pm_bus_init();
+-	pm_dump("after init");
+ 	/* Try the read forms in order; keep the first that works. */
+ 	bool read_ok = false;
+ 	for (pm_read_form = 0; pm_read_form < 3; pm_read_form++) {
++		printf("HEROLTE PMIC: trying read form %s in 11 s\n", pm_form_name[pm_read_form]);
++		ht_checkpoint();
+ 		read_ok = pm_read(0x00, &id);
+ 		printf("HEROLTE PMIC: read form %s: %s id=%#x\n", pm_form_name[pm_read_form],
+ 		    read_ok ? "ok" : "failed", id);
+@@ -292,6 +289,8 @@ pm_touch_power_on(void)
+ 		printf("HEROLTE PMIC: unexpected LDO32/33 voltage, leaving them off\n");
+ 		return false;
+ 	}
++	printf("HEROLTE PMIC: enabling LDO32/LDO33 in 11 s\n");
++	ht_checkpoint();
+ 	if (!(l32 & S2MPS16_ENABLE) && !pm_write(S2MPS16_L32CTRL, l32 | S2MPS16_ENABLE)) {
+ 		printf("HEROLTE PMIC: LDO32 enable failed\n");
+ 		return false;
+@@ -474,7 +473,8 @@ ht_thread(__unused void *arg, __unused wait_result_t wr)
+ 	uint8_t b[8] = {0};
+ 	unsigned lines = 0;
+ 
+-	ht_msleep(200);
++	/* After the persistent log thread is flushing (it starts with the root). */
++	ht_msleep(45000);
+ 	printf("HEROLTE TOUCH: GPF1 con=%#x pud=%#x dat=%#x; GPA1 con=%#x dat=%#x\n",
+ 	    ht_rd(ht_pins, 0), ht_rd(ht_pins, 8), ht_rd(ht_pins, 4),
+ 	    ht_rd(ht_alive, 0x20), ht_rd(ht_alive, 0x24));

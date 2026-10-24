@@ -1,0 +1,299 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index a5df730..7b93c3f 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -6,9 +6,10 @@
+  * (exynos-snapshot reads CMU_G3D only when 0x105C4064 and 0x105C6104 say
+  * powered), vdd_g3d = S2MPS16 BUCK6, regulator-always-on.
+  *
+- * Nothing is written. CMU_G3D and the GPU are read only when the domain
+- * status low nibble is 0xf: a powered-off block can hang the bus. Boot-arg
+- * herogpu=0 skips the probe.
++ * The probe writes nothing. CMU_G3D and the GPU are read only when the
++ * domain status low nibble is 0xf: a powered-off block can hang the bus.
++ * Boot-arg herogpu=0 skips everything, 1 (default) probes, 2 also dumps the
++ * PMIC, 3 also powers one core and runs one WRITE_VALUE job (see below).
+  */
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ #include <sys/param.h>
+@@ -123,9 +124,195 @@ hg_probe(vm_offset_t pmu, const char *when)
+ 	    hg_rd(gpu, GPU_STATUS), hg_rd(gpu, GPU_IRQ_RAWSTAT));
+ }
+ 
++/*
++ * Stage 2 (herogpu>=2): S2MPS16 registers, read through the APM like the
++ * touch supplies, to find vdd_g3d (BUCK6). Nothing is written.
++ */
++extern bool herolte_apm_pmic_read(uint8_t reg, uint8_t *value);
++
++static void
++hg_pmic_dump(void)
++{
++	for (unsigned base = 0; base < 0x80; base += 16) {
++		uint8_t v[16];
++		for (unsigned i = 0; i < 16; i++) {
++			if (!herolte_apm_pmic_read((uint8_t)(base + i), &v[i])) {
++				printf("HEROLTE GPU: PMIC read %#x failed (APM not started?)\n", base + i);
++				return;
++			}
++		}
++		printf("HEROLTE GPU: S2MPS16 %02x: %02x %02x %02x %02x %02x %02x %02x %02x "
++		    "%02x %02x %02x %02x %02x %02x %02x %02x\n", base, v[0], v[1], v[2], v[3],
++		    v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
++	}
++}
++
++/*
++ * Stage 3 (herogpu=3): power L2, ONE shader core and the tiler, then run
++ * the A5's WRITE_VALUE job (A5XELTEGPU.cpp, which completed on the T720)
++ * on JS1 in AS0, in a private 64 KiB block of the first DRAM bank outside
++ * XNU's RAM, mapped uncached (no cache maintenance): page tables at +0,
++ * +0x1000, +0x2000, +0x3000; job and output in the data pages. Voltage
++ * and clock are left as S-Boot set them, so only one core is powered.
++ * Every poll is bounded; the cores are powered off again at the end.
++ */
++#define HG_TEST_PA      0x8ffe0000u     /* below the SMP trampoline 0x8fffe000 */
++#define HG_TEST_BYTES   0x10000u
++#define HG_TEST_VA      0x02000000ull
++#define HG_DATA_OFF     0x4000u
++#define HG_OUT_OFF      0x100u
++
++#define SHADER_PWRON_LO 0x180
++#define TILER_PWRON_LO  0x190
++#define L2_PWRON_LO     0x1a0
++#define SHADER_PWROFF_LO 0x1c0
++#define TILER_PWROFF_LO 0x1d0
++#define L2_PWROFF_LO    0x1e0
++#define JOB_IRQ_RAWSTAT 0x1000
++#define JOB_IRQ_CLEAR   0x1004
++#define JS1             0x1880
++#define MMU_IRQ_RAWSTAT 0x2000
++#define MMU_IRQ_CLEAR   0x2004
++#define AS0             0x2400
++
++static void
++hg_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static bool
++hg_power(vm_offset_t gpu, uint32_t on, uint32_t ready, uint32_t mask, const char *name)
++{
++	hg_wr(gpu, on, mask);
++	uint32_t r = 0;
++	for (unsigned us = 0; us < 20000; us += 10) {
++		r = hg_rd(gpu, ready);
++		if ((r & mask) == mask) {
++			break;
++		}
++		delay(10);
++	}
++	printf("HEROLTE GPU: power %s mask=%#x ready=%#x\n", name, mask, r);
++	return (r & mask) == mask;
++}
++
++static void
++hg_write_value_job(vm_offset_t pmu)
++{
++	static vm_offset_t gpu, mem;
++	if (!hg_powered(pmu)) {
++		printf("HEROLTE GPU: job: domain off\n");
++		return;
++	}
++	if (!gpu) {
++		gpu = ml_io_map(HG_GPU_PA, 0x5000);
++	}
++	if (!mem) {
++		mem = ml_io_map(HG_TEST_PA, HG_TEST_BYTES);
++	}
++	if (!gpu || !mem) {
++		printf("HEROLTE GPU: job: mapping failed\n");
++		return;
++	}
++	uint32_t shaders = hg_rd(gpu, SHADER_PRESENT_LO);
++	uint32_t pending = hg_rd(gpu, JS1 + 0x60);
++	uint32_t as0 = hg_rd(gpu, AS0 + 0x28);
++	if (!(shaders & 1) || pending || (as0 & 1) || hg_rd(gpu, AS0)) {
++		printf("HEROLTE GPU: job: not idle shader=%#x js1=%#x as0=%#x\n", shaders, pending, as0);
++		return;
++	}
++	if (!hg_power(gpu, L2_PWRON_LO, L2_READY_LO, hg_rd(gpu, L2_PRESENT_LO), "L2") ||
++	    !hg_power(gpu, SHADER_PWRON_LO, SHADER_READY_LO, 1, "shader core 0") ||
++	    !hg_power(gpu, TILER_PWRON_LO, TILER_READY_LO, hg_rd(gpu, TILER_PRESENT_LO), "tiler")) {
++		printf("HEROLTE GPU: job: cores did not come up; not submitted\n");
++		goto off;
++	}
++
++	/* Page tables and job, as A5XELTEGPU.cpp a5g3d_try_write_value(). */
++	volatile uint64_t *q = (volatile uint64_t *)mem;
++	for (unsigned i = 0; i < HG_TEST_BYTES / 8; i++) {
++		q[i] = 0;
++	}
++	volatile uint64_t *l0 = (volatile uint64_t *)mem;
++	volatile uint64_t *l1 = (volatile uint64_t *)(mem + 0x1000);
++	volatile uint64_t *l2t = (volatile uint64_t *)(mem + 0x2000);
++	volatile uint64_t *l3 = (volatile uint64_t *)(mem + 0x3000);
++	l0[0] = (HG_TEST_PA + 0x1000) | 3;
++	l1[0] = (HG_TEST_PA + 0x2000) | 3;
++	l2t[(HG_TEST_VA >> 21) & 0x1ff] = (HG_TEST_PA + 0x3000) | 3;
++	for (unsigned i = 0; i < 4; i++) {
++		l3[i] = (HG_TEST_PA + HG_DATA_OFF + i * 0x1000) | 0x2c1;
++	}
++	/* 48-byte Midgard job header: exception, first task, fault pointer,
++	 * type/size (64-bit descriptor, WRITE_VALUE=2), index 1, then the
++	 * WRITE_VALUE payload: output VA and value type 3 (zero 64 bits). */
++	volatile uint8_t *job = (volatile uint8_t *)(mem + HG_DATA_OFF);
++	job[16] = 1 | (2 << 1);
++	*(volatile uint16_t *)(job + 18) = 1;
++	*(volatile uint64_t *)(job + 32) = HG_TEST_VA + HG_OUT_OFF;
++	*(volatile uint64_t *)(job + 40) = 3;
++	volatile uint64_t *output = (volatile uint64_t *)(mem + HG_DATA_OFF + HG_OUT_OFF);
++	*output = 0xa5a5a5a55a5a5a5aull;
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	hg_wr(gpu, MMU_IRQ_CLEAR, 0x00010001);
++	hg_wr(gpu, JOB_IRQ_CLEAR, 0x00020002);
++	uint64_t transtab = HG_TEST_PA | 0x7;
++	hg_wr(gpu, AS0 + 0x00, (uint32_t)transtab);
++	hg_wr(gpu, AS0 + 0x04, (uint32_t)(transtab >> 32));
++	hg_wr(gpu, AS0 + 0x08, 0x888d88);
++	hg_wr(gpu, AS0 + 0x0c, 0);
++	hg_wr(gpu, AS0 + 0x18, 1);      /* AS_COMMAND_UPDATE */
++	for (unsigned i = 0; i < 10000 && (hg_rd(gpu, AS0 + 0x28) & 1); i++) {
++		delay(10);
++	}
++	if (hg_rd(gpu, AS0 + 0x28) & 1) {
++		printf("HEROLTE GPU: job: MMU update timeout\n");
++		goto off;
++	}
++	hg_wr(gpu, JS1 + 0x40, (uint32_t)HG_TEST_VA);   /* HEAD_NEXT */
++	hg_wr(gpu, JS1 + 0x44, 0);
++	hg_wr(gpu, JS1 + 0x50, 1);                      /* AFFINITY_NEXT: core 0 */
++	hg_wr(gpu, JS1 + 0x54, 0);
++	hg_wr(gpu, JS1 + 0x58, (8 << 16) | (3 << 8) | (3 << 12));
++	hg_wr(gpu, JS1 + 0x60, 1);                      /* COMMAND_NEXT = START */
++
++	uint32_t jirq = 0, mirq = 0, girq = 0;
++	for (unsigned i = 0; i < 20000; i++) {
++		jirq = hg_rd(gpu, JOB_IRQ_RAWSTAT);
++		mirq = hg_rd(gpu, MMU_IRQ_RAWSTAT);
++		girq = hg_rd(gpu, GPU_IRQ_RAWSTAT);
++		if ((jirq & (1u << 1)) || (jirq & (1u << 17)) || mirq || (girq & 0x81)) {
++			break;
++		}
++		delay(10);
++	}
++	bool done = (jirq & (1u << 1)) && !(jirq & (1u << 17)) && !mirq && !(girq & 0x81) &&
++	    *output == 0;
++	printf("HEROLTE GPU: WRITE_VALUE job irq=%#x mmu=%#x gpu=%#x js1_status=%#x "
++	    "as_fault=%#x exception=%#x output=%#llx -> %s\n", jirq, mirq, girq,
++	    hg_rd(gpu, JS1 + 0x24), hg_rd(gpu, AS0 + 0x1c), *(volatile uint32_t *)job,
++	    *output, done ? "THE MALI-T880 RAN A JOB" : "failed or timed out");
++	if (jirq) {
++		hg_wr(gpu, JOB_IRQ_CLEAR, jirq);
++	}
++	if (mirq) {
++		hg_wr(gpu, MMU_IRQ_CLEAR, mirq);
++	}
++off:
++	hg_wr(gpu, TILER_PWROFF_LO, hg_rd(gpu, TILER_READY_LO));
++	hg_wr(gpu, SHADER_PWROFF_LO, hg_rd(gpu, SHADER_READY_LO));
++	hg_wr(gpu, L2_PWROFF_LO, hg_rd(gpu, L2_READY_LO));
++	printf("HEROLTE GPU: cores powered off\n");
++}
++
+ static void
+-hg_thread(__unused void *arg, __unused wait_result_t wr)
++hg_thread(void *arg, __unused wait_result_t wr)
+ {
++	int mode = (int)(uintptr_t)arg;
+ 	vm_offset_t pmu = ml_io_map(HG_PMU_PA, 0x8000);
+ 	if (!pmu) {
+ 		printf("HEROLTE GPU: PMU mapping failed\n");
+@@ -136,6 +323,12 @@ hg_thread(__unused void *arg, __unused wait_result_t wr)
+ 	hg_probe(pmu, "5s");
+ 	hg_msleep(55000);
+ 	hg_probe(pmu, "60s");
++	if (mode >= 2) {
++		hg_pmic_dump();
++	}
++	if (mode >= 3) {
++		hg_write_value_job(pmu);
++	}
+ }
+ 
+ void
+@@ -149,7 +342,7 @@ herolte_gpu_probe(void)
+ 		printf("HEROLTE GPU: probe disabled\n");
+ 		return;
+ 	}
+-	if (kernel_thread_start(hg_thread, NULL, &thread) == KERN_SUCCESS) {
++	if (kernel_thread_start(hg_thread, (void *)(uintptr_t)enabled, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+ }
+diff --git a/bsd/dev/herolte_touch.c b/bsd/dev/herolte_touch.c
+index 390d960..9ff610a 100644
+--- a/bsd/dev/herolte_touch.c
++++ b/bsd/dev/herolte_touch.c
+@@ -460,6 +460,19 @@ apm_pmic_read(uint8_t reg, uint8_t *value)
+ 	return true;
+ }
+ 
++/*
++ * Read-only S2MPS16 access for other drivers (herolte_gpu.c), only once
++ * the touch thread has started the APM; the mailbox is polled, so callers
++ * must not overlap with the touch power-on at boot.
++ */
++static bool apm_ready;
++bool herolte_apm_pmic_read(uint8_t reg, uint8_t *value);
++bool
++herolte_apm_pmic_read(uint8_t reg, uint8_t *value)
++{
++	return apm_ready && apm_pmic_read(reg, value);
++}
++
+ static bool
+ apm_pmic_write(uint8_t reg, uint8_t value)
+ {
+@@ -504,6 +517,7 @@ apm_touch_power_on(void)
+ 		return false;
+ 	}
+ 	printf("HEROLTE APM: LDO32=%#x LDO33=%#x (on = bits 7:6 set)\n", c32, c33);
++	apm_ready = true;
+ 	return (c32 & S2MPS16_ENABLE) && (c33 & S2MPS16_ENABLE);
+ }
+ 
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 00568d3..d2462d8 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -29,6 +29,7 @@
+ #include <stdlib.h>
+ #include <mach_assert.h>
+ #include <mach_ldebug.h>
++#include <kern/backtrace.h>
+ 
+ #include <mach/shared_region.h>
+ #include <mach/vm_param.h>
+@@ -5597,6 +5598,17 @@ pmap_enter_pte(pmap_t pmap, pt_entry_t *pte_p, pt_entry_t *old_pte, pt_entry_t n
+ 		 * As a result we require the exclusive pmap lock.
+ 		 */
+ 		pmap_assert_locked(pmap, PMAP_LOCK_EXCLUSIVE);
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		/* RAM in the second bank (>= 1.5 GiB) sometimes hits the unaligned
++		 * PTE panic in write_pte_fast: name the VA and the callers. */
++		if (((uintptr_t)pte_p) & 0x1f) {
++			uintptr_t bt[8] = { 0 };
++			(void)backtrace(bt, 8, NULL, NULL);
++			panic("HEROLTE: unaligned pmap_enter va=%#llx pte_p=%p pte=%#llx kernel=%d "
++			    "bt %#lx %#lx %#lx %#lx %#lx %#lx %#lx", (uint64_t)v, pte_p, (uint64_t)new_pte,
++			    pmap == kernel_pmap, bt[1], bt[2], bt[3], bt[4], bt[5], bt[6], bt[7]);
++		}
++#endif
+ 		*old_pte = *pte_p;
+ 		if (*old_pte == new_pte) {
+ 			/* Another thread completed this operation. Nothing to do here. */

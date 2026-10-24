@@ -1,0 +1,128 @@
+diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
+index ffd011a..9ad7fd6 100644
+--- a/bsd/dev/a5xelte_emmc.c
++++ b/bsd/dev/a5xelte_emmc.c
+@@ -637,6 +637,16 @@ a5xelte_log_append(const char *c, int size)
+ 	}
+ }
+ 
++/* The console ring for other storage drivers (HEROLTE writes it to UFS). */
++void a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total);
++void
++a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total)
++{
++	*ring = emmc_log_ring;
++	*size = A5_LOG_SIZE;
++	*total = os_atomic_load(&emmc_log_total, relaxed);
++}
++
+ struct a5_log_header {
+ 	char magic[8];
+ 	uint32_t version, size;
+diff --git a/bsd/dev/herolte_ufs.c b/bsd/dev/herolte_ufs.c
+index 2bbe492..1da85fa 100644
+--- a/bsd/dev/herolte_ufs.c
++++ b/bsd/dev/herolte_ufs.c
+@@ -613,6 +613,94 @@ static const struct cdevsw herolte_ufs_cdevsw = {
+ 	.d_type       = D_DISK,
+ };
+ 
++/*
++ * Persistent console log ("herolog"): the console ring (a5xelte_emmc.c) is
++ * copied every 10 s to the last 4 MiB + 4 KiB of the root partition, beyond
++ * the HFSX volume, and the device cache is flushed. Block 0 of that area:
++ *   "HEROLOG1" | u32 version 1 | u32 ring size | u64 total bytes | u64 seq
++ * ring offset of byte n = n % ring size. Read it from TWRP with
++ * tools/herolte-log-pull.py. Needs ufsrw=1; boot-arg herolog=0 disables it.
++ */
++extern void a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++
++struct herolte_log_header {
++	char magic[8];
++	uint32_t version, size;
++	uint64_t total, seq;
++};
++
++static int herolte_log_chan;
++
++static void
++herolte_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	const char *ring;
++	uint32_t rsize;
++	uint64_t total, flushed = 0, seq = 0;
++	a5xelte_log_snapshot(&ring, &rsize, &total);
++	uint64_t first = su.first_block + su.nblocks - (1 + rsize / UFS_BLOCK);
++	uint8_t *bounce = (uint8_t *)(su.dma + DMA_BOUNCE);
++	printf("HEROLTE LOG: %u KiB ring at partition block %llu\n",
++	    rsize >> 10, first - su.first_block);
++	for (;;) {
++		(void)tsleep(&herolte_log_chan, PZERO, "herolog", hz * 10);
++		a5xelte_log_snapshot(&ring, &rsize, &total);
++		if (total == flushed) {
++			continue;
++		}
++		uint64_t pos = total - flushed >= rsize ? total - rsize : flushed;
++		uint64_t left = total - pos;
++		int error = 0;
++		lck_mtx_lock(&herolte_ufs_lock);
++		while (left && !error) {
++			uint32_t blk = (uint32_t)((pos % rsize) / UFS_BLOCK);
++			uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++			uint32_t n = (uint32_t)MIN((uint64_t)(BOUNCE_SIZE / UFS_BLOCK),
++			    MIN((uint64_t)(rsize / UFS_BLOCK - blk), (left + skip + UFS_BLOCK - 1) / UFS_BLOCK));
++			memcpy(bounce, ring + (size_t)blk * UFS_BLOCK, (size_t)n * UFS_BLOCK);
++			error = ufs_write_blocks(first + 1 + blk, n);
++			uint64_t adv = (uint64_t)n * UFS_BLOCK - skip;
++			pos += adv;
++			left -= MIN(adv, left);
++		}
++		if (!error) {
++			struct herolte_log_header h = {
++				.magic = { 'H', 'E', 'R', 'O', 'L', 'O', 'G', '1' },
++				.version = 1, .size = rsize, .total = total, .seq = ++seq,
++			};
++			bzero(bounce, UFS_BLOCK);
++			memcpy(bounce, &h, sizeof(h));
++			error = ufs_write_blocks(first, 1);
++		}
++		if (!error) {
++			error = ufs_sync_cache();
++		}
++		lck_mtx_unlock(&herolte_ufs_lock);
++		if (error) {
++			printf("HEROLTE LOG: write failed (%d), stopping\n", error);
++			return;
++		}
++		flushed = total;
++	}
++}
++
++static void
++herolte_log_start(void)
++{
++	uint32_t on = 1;
++	thread_t thread;
++	PE_parse_boot_argn("herolog", &on, sizeof(on));
++	if (!on || !su.writable || su.nblocks < 2 * (1 + (4u << 20) / UFS_BLOCK)) {
++		return;
++	}
++	if (kernel_thread_start(herolte_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ static int
+ herolte_ufs_init(void)
+ {
+@@ -687,6 +775,7 @@ herolte_ufs_init(void)
+ 	printf("HEROLTE UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	herolte_log_start();
+ 	return 0;
+ }
+ 

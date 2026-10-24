@@ -1,0 +1,18 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 42362c5..195967c 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -358,6 +358,13 @@ arm_init(
+ 	BootArgs = args = &const_boot_args;
+ 
+ 	cpu_data_init(&BootCpuData);
++#if defined(A5XELTE)
++	/* Samsung firmware can leave CNTVCT_EL0 at an arbitrary epoch.  XNU
++	 * reserves its top bit for processor-idle accounting, so start the
++	 * boot CPU's Mach time at one tick without changing the hardware timer. */
++	rtclock_base_abstime = 1 - ml_get_hwclock();
++	BootCpuData.cpu_base_timebase = rtclock_base_abstime;
++#endif
+ #if defined(HAS_APPLE_PAC)
+ 	/* bootstrap cpu process dependent key for kernel has been loaded by start.s */
+ 	BootCpuData.rop_key = ml_default_rop_pid();

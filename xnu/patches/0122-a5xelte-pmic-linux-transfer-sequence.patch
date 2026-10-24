@@ -1,0 +1,94 @@
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index 41ae356..e561da9 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -20,7 +20,6 @@ void a5xelte_touch_probe(void);
+ static vm_offset_t a5_touch_bus;
+ static vm_offset_t a5_touch_alive;
+ static int a5_touch_sleep;
+-static bool a5_pmic_tenbit;
+ 
+ static uint16_t
+ a5touch_le16(const uint8_t *bytes)
+@@ -44,20 +43,19 @@ a5touch_write(vm_offset_t base, uint32_t offset, uint32_t value)
+ 	__asm__ volatile("dsb osh" ::: "memory");
+ }
+ 
+-/* Exynos7580 MIF HSI2C3 AUTO mode; 100 MHz source, conservative 100 kHz FS. */
++/* Exynos7580 MIF HSI2C3 AUTO mode, matching Linux's 400 kHz timing. */
+ static void
+-a5pmic_bus_init(vm_offset_t hsi, bool tenbit)
++a5pmic_bus_init(vm_offset_t hsi)
+ {
+-	a5_pmic_tenbit = tenbit;
+-	a5touch_write(hsi, 0x00, 0x80000008u);
+-	a5touch_write(hsi, 0x00, 0x00000008u);
+-	a5touch_write(hsi, 0x40, 0x80000000u | (tenbit ? 0x40000000u : 0));
+-	a5touch_write(hsi, 0x60, 0x7b7b7b00u);
+-	a5touch_write(hsi, 0x64, 0x3d007b7bu);
+-	a5touch_write(hsi, 0x68, 0x000300f6u);
+-	a5touch_write(hsi, 0x6c, 0x3du);
++	a5touch_write(hsi, 0x00, 0x80000009u);
++	a5touch_write(hsi, 0x00, 0x00000009u);
++	a5touch_write(hsi, 0x48, 0); /* Linux disables the hardware timeout. */
++	a5touch_write(hsi, 0x60, 0x78787800u);
++	a5touch_write(hsi, 0x64, 0x3c007878u);
++	a5touch_write(hsi, 0x68, 0x000000f0u);
++	a5touch_write(hsi, 0x6c, 0x3cu);
+ 	a5touch_write(hsi, 0x08, 0xfu);
+-	a5touch_write(hsi, 0x48, 0);
++	a5touch_write(hsi, 0x40, 0x80000000u);
+ 	a5touch_write(hsi, 0x20, 0); /* Poll without an unregistered XNU IRQ. */
+ }
+ 
+@@ -72,20 +70,18 @@ a5pmic_message(vm_offset_t hsi, bool receive, uint8_t *bytes,
+ 		return false;
+ 	}
+ 	a5touch_write(hsi, 0x24, a5touch_read(hsi, 0x24));
+-	a5touch_write(hsi, 0x04, 0x00080083u);
+-	ctl = 8u | (receive ? 0x40u : 0x80u) |
+-	    (a5_pmic_tenbit ? 0x40000000u : 0);
+-	a5touch_write(hsi, 0x00, ctl);
++	a5touch_write(hsi, 0x04, 3u | (count << (receive ? 4 : 16)));
++	ctl = 9u | (receive ? 0x40u : 0x80u);
+ 	a5touch_write(hsi, 0x70, 0x66u << 10);
++	a5touch_write(hsi, 0x00, ctl);
+ 	cfg = count | (receive ? 0x10000u : 0) | (stop ? 0x20000u : 0);
+-	a5touch_write(hsi, 0x44, cfg);
+ 	a5touch_write(hsi, 0x44, cfg | 0x80000000u);
+ 	for (unsigned us = 0; us < 50000; us++) {
+ 		uint32_t fifo = a5touch_read(hsi, 0x30);
+ 		uint32_t status = a5touch_read(hsi, 0x50);
+ 		if (status & 0x1eu) {
+-			printf("A5XELTE TOUCH: PMIC HSI2C error tenbit=%d rx=%d sent=%u/%u status=%#x irq=%#x fifo=%#x\n",
+-			    a5_pmic_tenbit, receive, done, count, status,
++			printf("A5XELTE TOUCH: PMIC HSI2C error rx=%d sent=%u/%u status=%#x irq=%#x fifo=%#x\n",
++			    receive, done, count, status,
+ 			    a5touch_read(hsi, 0x24), fifo);
+ 			return false;
+ 		}
+@@ -97,6 +93,8 @@ a5pmic_message(vm_offset_t hsi, bool receive, uint8_t *bytes,
+ 			a5touch_write(hsi, 0x34, bytes[done++]);
+ 		}
+ 		if (done == count && (status & 1u)) {
++			printf("A5XELTE TOUCH: PMIC HSI2C complete rx=%d status=%#x irq=%#x\n",
++			    receive, status, a5touch_read(hsi, 0x24));
+ 			return true;
+ 		}
+ 		delay(1);
+@@ -140,14 +138,7 @@ a5touch_power_on(vm_offset_t mifpins)
+ 	a5touch_write(mifpins, 8, (old_pud & ~0xfu) | 0xfu);
+ 	a5touch_write(mifpins, 0, (old_con & ~0xffu) | 0x22u);
+ 	delay(100);
+-	a5pmic_bus_init(hsi, false);
+-	if (!a5pmic_read(hsi, 0x00, &id)) {
+-		/* Samsung's recovery registers this PMIC as i2c-3/3-a066.
+-		 * Try the controller's 10-bit mode only after the normal address NACK.
+-		 * Identity and voltage readback still gate every PMIC write. */
+-		printf("A5XELTE TOUCH: retry PMIC identity with 10-bit address\n");
+-		a5pmic_bus_init(hsi, true);
+-	}
++	a5pmic_bus_init(hsi);
+ 	if (!a5pmic_read(hsi, 0x00, &id) ||
+ 	    !a5pmic_read(hsi, 0x4e, &ldo)) {
+ 		printf("A5XELTE TOUCH: PMIC identity/control read failed\n");

@@ -1,0 +1,235 @@
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+index 021f378..84e55e8 100644
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -14,6 +14,7 @@
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <pexpert/pexpert.h>
+ #include <vm/memory_types.h>
+ #include <arm/memory_types.h>
+@@ -34,7 +35,161 @@ a5g3d_read32(vm_offset_t base, vm_offset_t offset)
+ }
+ 
+ static void
+-a5g3d_probe_existing_power(IOService *service)
++a5g3d_write32(vm_offset_t base, vm_offset_t offset, uint32_t value)
++{
++    *reinterpret_cast<volatile uint32_t *>(base + offset) = value;
++}
++
++/* Panfrost's Mali-LPAE format uses four 4-KiB levels even for a low IOVA.
++ * Keep the test's descriptor and two output pixels in a single mapped page.
++ * No identity mapping or access to the display buffer is provided to Mali.
++ */
++static const uint64_t kA5G3DTestVA = 0x02000000ULL;
++static const uint32_t kA5G3DTestBytes = 0x10000;
++static const uint32_t kA5G3DDataOffset = 0x4000;
++static const uint32_t kA5G3DOutputOffset = 0x100;
++
++struct A5G3DWriteValueJob {
++    uint32_t exceptionStatus;
++    uint32_t firstIncompleteTask;
++    uint64_t faultPointer;
++    uint8_t typeAndSize;      /* 64-bit descriptor: 1 | (WRITE_VALUE=2)<<1 */
++    uint8_t flags;
++    uint16_t index;
++    uint16_t dependency1;
++    uint16_t dependency2;
++    uint64_t next;
++    uint64_t outputVA;
++    uint64_t valueType;        /* Midgard WRITE_VALUE zeroes 64 bits for 3 */
++} __attribute__((packed));
++static_assert(sizeof(A5G3DWriteValueJob) == 48, "Mali job descriptor size");
++
++static bool
++a5g3d_try_write_value(IOService *service, vm_offset_t gpu,
++    IOBufferMemoryDescriptor *&storage)
++{
++    /* Linux Panfrost's JS1 is the vertex/tiler queue, including WRITE_VALUE.
++     * Never disturb a running job or an active address space.
++     */
++    const uint32_t shader = a5g3d_read32(gpu, 0x140);
++    const uint32_t l2 = a5g3d_read32(gpu, 0x160);
++    const uint32_t addressSpaces = a5g3d_read32(gpu, 0x018);
++    const uint32_t jobSlots = a5g3d_read32(gpu, 0x01c);
++    const uint32_t pending = a5g3d_read32(gpu, 0x1880 + 0x60);
++    const uint32_t as0Status = a5g3d_read32(gpu, 0x2400 + 0x28);
++    const uint32_t as0Transtab = a5g3d_read32(gpu, 0x2400);
++    IOLog("A5XELTE G3D: job gate shader=%08x l2=%08x as=%08x js=%08x pending=%08x as0=%08x ttbr=%08x\n",
++        shader, l2, addressSpaces, jobSlots, pending, as0Status, as0Transtab);
++    if (!shader || !l2 || !(addressSpaces & 1) || !(jobSlots & 2) ||
++        pending || (as0Status & 1) || as0Transtab) {
++        service->setProperty("A5G3DJobResult", "not-ready");
++        return false;
++    }
++
++    storage = IOBufferMemoryDescriptor::withOptions(
++        kIODirectionInOut | kIOMemoryPhysicallyContiguous,
++        kA5G3DTestBytes, kA5G3DTestBytes);
++    if (!storage || !storage->getBytesNoCopy()) {
++        service->setProperty("A5G3DJobResult", "allocation-failed");
++        return false;
++    }
++    IOByteCount segmentLength = 0;
++    const uint64_t physical = storage->getPhysicalSegment(0, &segmentLength,
++        kIOMemoryMapperNone);
++    if (!physical || segmentLength < kA5G3DTestBytes ||
++        (physical & 0xfff) != 0) {
++        service->setProperty("A5G3DJobResult", "physical-segment-invalid");
++        return false;
++    }
++    uint8_t *bytes = static_cast<uint8_t *>(storage->getBytesNoCopy());
++    bzero(bytes, kA5G3DTestBytes);
++    uint64_t *l0 = reinterpret_cast<uint64_t *>(bytes);
++    uint64_t *l1 = reinterpret_cast<uint64_t *>(bytes + 0x1000);
++    uint64_t *l2table = reinterpret_cast<uint64_t *>(bytes + 0x2000);
++    uint64_t *l3 = reinterpret_cast<uint64_t *>(bytes + 0x3000);
++    l0[0] = (physical + 0x1000) | 3;
++    l1[0] = (physical + 0x2000) | 3;
++    l2table[(kA5G3DTestVA >> 21) & 0x1ff] = (physical + 0x3000) | 3;
++    for (unsigned i = 0; i < 4; ++i) {
++        /* Mali-LPAE: read/write, outer-shareable, implementation-defined
++         * noncached attribute, level-3 leaf type 1 (Linux io-pgtable-arm).
++         */
++        l3[i] = (physical + kA5G3DDataOffset + i * 0x1000) | 0x2c1;
++    }
++    A5G3DWriteValueJob *job = reinterpret_cast<A5G3DWriteValueJob *>(
++        bytes + kA5G3DDataOffset);
++    job->typeAndSize = 1 | (2 << 1);
++    job->index = 1;
++    job->outputVA = kA5G3DTestVA + kA5G3DOutputOffset;
++    job->valueType = 3;
++    uint64_t *output = reinterpret_cast<uint64_t *>(
++        bytes + kA5G3DDataOffset + kA5G3DOutputOffset);
++    *output = 0xa5a5a5a55a5a5a5aULL;
++    if (storage->performOperation(kIOMemoryIncoherentIOStore, 0,
++        kA5G3DTestBytes) != kIOReturnSuccess) {
++        service->setProperty("A5G3DJobResult", "cache-store-failed");
++        return false;
++    }
++    __sync_synchronize();
++
++    /* Program the otherwise unused AS0 with only the private 16-KiB test
++     * region, then submit exactly one WRITE_VALUE job to JS1. Poll with a
++     * finite deadline. The allocation stays owned by the service on timeout.
++     */
++    a5g3d_write32(gpu, 0x2004, 0x00010001);
++    a5g3d_write32(gpu, 0x1004, 0x00020002);
++    const uint64_t transtab = physical | 0x7;
++    a5g3d_write32(gpu, 0x2400, static_cast<uint32_t>(transtab));
++    a5g3d_write32(gpu, 0x2404, static_cast<uint32_t>(transtab >> 32));
++    a5g3d_write32(gpu, 0x2408, 0x888d88);
++    a5g3d_write32(gpu, 0x240c, 0);
++    a5g3d_write32(gpu, 0x2418, 1); /* AS_COMMAND_UPDATE */
++    for (unsigned i = 0; i < 10000 && (a5g3d_read32(gpu, 0x2428) & 1); ++i)
++        IODelay(10);
++    if (a5g3d_read32(gpu, 0x2428) & 1) {
++        service->setProperty("A5G3DJobResult", "mmu-update-timeout");
++        return false;
++    }
++    a5g3d_write32(gpu, 0x18c0, static_cast<uint32_t>(kA5G3DTestVA));
++    a5g3d_write32(gpu, 0x18c4, 0);
++    a5g3d_write32(gpu, 0x18d0, shader);
++    a5g3d_write32(gpu, 0x18d4, 0);
++    a5g3d_write32(gpu, 0x18d8, (8 << 16) | (3 << 8) | (3 << 12));
++    __sync_synchronize();
++    a5g3d_write32(gpu, 0x18e0, 1); /* JS_COMMAND_NEXT(1) = START */
++
++    uint32_t jobIRQ = 0, mmuIRQ = 0, gpuIRQ = 0;
++    for (unsigned i = 0; i < 20000; ++i) {
++        jobIRQ = a5g3d_read32(gpu, 0x1000);
++        mmuIRQ = a5g3d_read32(gpu, 0x2000);
++        gpuIRQ = a5g3d_read32(gpu, 0x20);
++        if ((jobIRQ & (1u << 1)) || (jobIRQ & (1u << 17)) ||
++            mmuIRQ || (gpuIRQ & 0x81))
++            break;
++        IODelay(10);
++    }
++    if (storage->performOperation(kIOMemoryIncoherentIOFlush,
++        kA5G3DDataOffset + kA5G3DOutputOffset,
++        sizeof(*output)) != kIOReturnSuccess) {
++        service->setProperty("A5G3DJobResult", "cache-flush-failed");
++        return false;
++    }
++    IOLog("A5XELTE G3D: write-value job irq=%08x mmu=%08x gpu=%08x js=%08x asfault=%08x output=%016llx\n",
++        jobIRQ, mmuIRQ, gpuIRQ, a5g3d_read32(gpu, 0x18a4),
++        a5g3d_read32(gpu, 0x241c), *output);
++    const bool complete = (jobIRQ & (1u << 1)) && !mmuIRQ &&
++        !(jobIRQ & (1u << 17)) && !(gpuIRQ & 0x81) && *output == 0;
++    service->setProperty("A5G3DJobResult", complete ? "zero-written" : "failed-or-timeout");
++    if (jobIRQ)
++        a5g3d_write32(gpu, 0x1004, jobIRQ);
++    if (mmuIRQ)
++        a5g3d_write32(gpu, 0x2004, mmuIRQ);
++    return complete;
++}
++
++static void
++a5g3d_probe_existing_power(IOService *service, bool runJob,
++    IOBufferMemoryDescriptor *&storage)
+ {
+     vm_offset_t pmu = ml_io_map_unmappable(0x10464000, 0x1000, VM_WIMG_IO);
+     if (!pmu) {
+@@ -71,7 +226,8 @@ a5g3d_probe_existing_power(IOService *service)
+         return;
+     }
+ 
+-    vm_offset_t gpu = ml_io_map_unmappable(0x11400000, 0x1000, VM_WIMG_IO);
++    const vm_size_t gpuSize = runJob ? 0x3000 : 0x1000;
++    vm_offset_t gpu = ml_io_map_unmappable(0x11400000, gpuSize, VM_WIMG_IO);
+     if (!gpu) {
+         service->setProperty("A5G3DProbeResult", "gpu-map-failed");
+         ml_io_unmap(cmu, 0x1000);
+@@ -84,9 +240,11 @@ a5g3d_probe_existing_power(IOService *service)
+     service->setProperty("A5G3DGPUId", static_cast<uint64_t>(id), 32);
+     service->setProperty("A5G3DProduct", static_cast<uint64_t>(product), 32);
+     service->setProperty("A5G3DProbeResult", product == 0x720 ? "mali-t720" : "unexpected-id");
+-    IOLog("A5XELTE G3D: passive GPU_ID=%08x product=%04x (expected 0720); no GPU jobs\n",
+-        id, product);
+-    ml_io_unmap(gpu, 0x1000);
++    IOLog("A5XELTE G3D: passive GPU_ID=%08x product=%04x (expected 0720); %s\n",
++        id, product, runJob ? "offscreen test requested" : "no GPU jobs");
++    if (runJob && product == 0x720)
++        a5g3d_try_write_value(service, gpu, storage);
++    ml_io_unmap(gpu, gpuSize);
+     ml_io_unmap(cmu, 0x1000);
+     ml_io_unmap(pmu, 0x1000);
+ }
+@@ -94,6 +252,9 @@ a5g3d_probe_existing_power(IOService *service)
+ class A5XELTEGPU : public IOService {
+     OSDeclareDefaultStructors(A5XELTEGPU);
+ 
++    /* Keep GPU-visible pages alive until reboot, including on a job timeout. */
++    IOBufferMemoryDescriptor *fTestMemory = nullptr;
++
+ public:
+     bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ };
+@@ -105,7 +266,7 @@ A5XELTEGPU::start(IOService *provider)
+ {
+     int enabled = 0;
+     if (!PE_parse_boot_argn("a5gpu", &enabled, sizeof(enabled)) ||
+-        (enabled != 1 && enabled != 2)) {
++        (enabled != 1 && enabled != 2 && enabled != 3)) {
+         return false; /* a5gpu=0, the safe default */
+     }
+     if (!IOService::start(provider)) {
+@@ -125,11 +286,12 @@ A5XELTEGPU::start(IOService *provider)
+     setProperty("A5G3DJobSPI", 282ULL, 32);
+     setProperty("A5G3DMMUSPI", 283ULL, 32);
+     setProperty("A5G3DGpuSPI", 281ULL, 32);
+-    setProperty("A5G3DDriverStage", enabled == 2 ? "passive-id-probe" : "resources-only");
++    setProperty("A5G3DDriverStage", enabled == 3 ? "offscreen-write-value" :
++        (enabled == 2 ? "passive-id-probe" : "resources-only"));
+     registerService();
+     IOLog("A5XELTE G3D: resource service registered; GPU power unchanged; CPU display active\n");
+-    if (enabled == 2) {
+-        a5g3d_probe_existing_power(this);
++    if (enabled >= 2) {
++        a5g3d_probe_existing_power(this, enabled == 3, fTestMemory);
+     }
+     return true;
+ }

@@ -1,0 +1,212 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index da59f72..6996772 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -1,7 +1,7 @@
+ /*
+- * A55 SMP bring-up for sweet using XNU's legacy IOCPU interface and PSCI.
+- * The architected timer and SGI1 already enter through pe_fiq/sleh_irq.
+- * CPU_OFF, suspend and the A76 cores still require separate platform work.
++ * Shared IOCPU bring-up from the SWEET donor. A5XELTE currently selects
++ * only its Cortex-A53 boot CPU and uses its own GICv2 self-IPI path.
++ * Donor secondary-CPU PSCI and suspend paths are not enabled on A5XELTE.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -22,6 +22,9 @@ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ #if defined(A5XELTE)
+ extern "C" void a5xelte_send_self_ipi(void);
++#define CPU_PORT_NAME "A5XELTE"
++#else
++#define CPU_PORT_NAME "SWEET"
+ #endif
+ 
+ class SweetCPU;
+@@ -76,16 +79,28 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
++#if defined(A5XELTE)
++	/* Only CPU0 is described and tested for the Exynos7580 port. */
++	if (cpu->phys_id != 0 || topology->num_cpus != 1) {
++		panic(CPU_PORT_NAME " CPU: unsupported topology cpu=%u mpidr=0x%x count=%u",
++		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
++	}
++#else
++	/* SWEET MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76. */
+ 	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+-		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
++		panic(CPU_PORT_NAME " CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
++#endif
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
++#if defined(A5XELTE)
++	cpuName = OSSymbol::withCStringNoCopy("Cortex-A53");
++#else
+ 	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
++#endif
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+@@ -104,10 +119,10 @@ SweetCPU::start(IOService *provider)
+ 	perfmon_interrupt_handler_func pmi_handler = NULL;
+ 	kern_return_t result = ml_processor_register(&info, &machProcessor, &ipi_handler, &pmi_handler);
+ 	if (result != KERN_SUCCESS) {
+-		panic("SWEET CPU: ml_processor_register failed: %d", result);
++		panic(CPU_PORT_NAME " CPU: ml_processor_register failed: %d", result);
+ 	}
+ 	if (pmi_handler != NULL) {
+-		panic("SWEET CPU: PMI routing is not implemented");
++		panic(CPU_PORT_NAME " CPU: PMI routing is not implemented");
+ 	}
+ 
+ 	registerService();
+@@ -117,7 +132,7 @@ SweetCPU::start(IOService *provider)
+ 		thread_t thread;
+ 		result = kernel_thread_start(&SweetCPU::startAll, NULL, &thread);
+ 		if (result != KERN_SUCCESS) {
+-			panic("SWEET CPU: cannot create startup thread: %d", result);
++			panic(CPU_PORT_NAME " CPU: cannot create startup thread: %d", result);
+ 		}
+ 		thread_deallocate(thread);
+ 	}
+@@ -131,7 +146,7 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	const ml_topology_info_t *topology = ml_get_topology_info();
+ 	uint32_t requested = 1;
+ 	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
+-	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
++	IOLog(CPU_PORT_NAME " CPU: requested=%u selected=%u (limit=%u)\n",
+ 	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
+ 
+ 	uint64_t deadline;
+@@ -140,35 +155,35 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		if (mach_absolute_time() > deadline) {
+ 			for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 				if (__atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE) == NULL) {
+-					IOLog("SWEET CPU: cpu=%u NOT registered (IOKit matching timeout)\n", i);
++					IOLog(CPU_PORT_NAME " CPU: cpu=%u NOT registered (IOKit matching timeout)\n", i);
+ 				}
+ 			}
+-			panic("SWEET CPU: CPU registration timeout");
++			panic(CPU_PORT_NAME " CPU: CPU registration timeout");
+ 		}
+ 		IOSleep(1);
+ 	}
+-	/* The supplied ADT has cpu0 as the boot CPU and ascending A55 nodes. */
++	/* Both current ADTs describe CPU0 as the boot CPU. */
+ 	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
+-		panic("SWEET CPU: expected boot MPIDR 0 and logical CPU 0");
++		panic(CPU_PORT_NAME " CPU: expected boot MPIDR 0 and logical CPU 0");
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
+ 		if (kr != KERN_SUCCESS) {
+-			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
++			panic(CPU_PORT_NAME " CPU: cpu=%u processor_start failed: %d", i, kr);
+ 		}
+ 		/* processor_start() is asynchronous for secondaries in this XNU. */
+ 		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !sweet_cpu_signal_is_enabled(i)) {
+ 			if (mach_absolute_time() > deadline) {
+-				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
++				IOLog(CPU_PORT_NAME " CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+ 				    i, topology->cpus[i].phys_id);
+-				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
++				panic(CPU_PORT_NAME " CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
+ 			}
+ 			IOSleep(1);
+ 		}
+-		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
++		IOLog(CPU_PORT_NAME " CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+ 		    i, topology->cpus[i].phys_id);
+ 	}
+ 	/* Publish exactly once, after every selected CPU has completed initCPU(). */
+@@ -176,7 +191,7 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	__atomic_load_n(&sweet_cpus[topology->boot_cpu->cpu_id], __ATOMIC_ACQUIRE)->cpusRunning();
+ 	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+-	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
++	IOLog(CPU_PORT_NAME " CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
+ 	thread_terminate(current_thread());
+ }
+@@ -192,7 +207,7 @@ void
+ SweetCPU::initCPU(bool boot)
+ {
+ 	if (!boot) {
+-		panic("SWEET CPU: cpu=%u resume is not implemented", getCPUNumber());
++		panic(CPU_PORT_NAME " CPU: cpu=%u resume is not implemented", getCPUNumber());
+ 	}
+ 	assert(cpu_number() == (int)getCPUNumber());
+ 
+@@ -203,7 +218,7 @@ SweetCPU::initCPU(bool boot)
+ 	 * Waiting here with DAIF.I set would deadlock every secondary. */
+ 	signalCPU(this);
+ 	setCPUState(kIOCPUStateRunning);
+-	kprintf("SWEET CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u\n",
++	kprintf(CPU_PORT_NAME " CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u\n",
+ 	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
+ 	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
+ 	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
+@@ -221,13 +236,13 @@ SweetCPU::signalCPU(IOCPU *target)
+ 	const ml_topology_info_t *topology = ml_get_topology_info();
+ 	unsigned int logical = target->getCPUNumber();
+ 	if (logical >= topology->num_cpus) {
+-		panic("SWEET CPU: invalid SGI target %u", logical);
++		panic(CPU_PORT_NAME " CPU: invalid SGI target %u", logical);
+ 	}
+ 	/* Use the TARGET affinity, including Aff1, never the sender's MPIDR. */
+ 	uint64_t mpidr = topology->cpus[logical].phys_id;
+ 	unsigned int aff0 = mpidr & 0xff;
+ 	if (aff0 >= 16) {
+-		panic("SWEET CPU: SGI target requires unsupported range selector");
++		panic(CPU_PORT_NAME " CPU: SGI target requires unsupported range selector");
+ 	}
+ 	uint64_t sgi = (((mpidr >> 32) & 0xff) << 48) |
+ 	    (((mpidr >> 16) & 0xff) << 32) |
+@@ -246,17 +261,17 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 	/* cpu_start() passes NULL,NULL: x20/x21 are set by LowResetVectorBase. */
+ 	if (start_paddr != 0 || arg_paddr != 0 || cpu->phys_id == 0 ||
+ 	    __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) != 0) {
+-		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
++		panic(CPU_PORT_NAME " CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
+ 	vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
+-	IOLog("SWEET CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
++	IOLog(CPU_PORT_NAME " CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
+ 	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
+ 	__builtin_arm_dsb(DSB_SY);
+ 	int32_t rc = sweet_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
+-	IOLog("SWEET CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);
++	IOLog(CPU_PORT_NAME " CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);
+ 	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
+ 	if (rc != 0) {
+-		panic("SWEET CPU: cpu=%u NOT alive: PSCI CPU_ON rc=%d", getCPUNumber(), rc);
++		panic(CPU_PORT_NAME " CPU: cpu=%u NOT alive: PSCI CPU_ON rc=%d", getCPUNumber(), rc);
+ 	}
+ 	return KERN_SUCCESS;
+ }
+@@ -264,13 +279,13 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ void
+ SweetCPU::quiesceCPU(void)
+ {
+-	panic("SWEET CPU: CPU quiesce is not implemented");
++	panic(CPU_PORT_NAME " CPU: CPU quiesce is not implemented");
+ }
+ 
+ void
+ SweetCPU::haltCPU(void)
+ {
+-	panic("SWEET CPU: CPU halt/suspend is not implemented");
++	panic(CPU_PORT_NAME " CPU: CPU halt/suspend is not implemented");
+ }
+ 
+ const OSSymbol *

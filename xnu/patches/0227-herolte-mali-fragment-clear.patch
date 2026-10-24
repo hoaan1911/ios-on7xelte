@@ -1,0 +1,406 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 7b93c3f..1395e32 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -9,7 +9,7 @@
+  * The probe writes nothing. CMU_G3D and the GPU are read only when the
+  * domain status low nibble is 0xf: a powered-off block can hang the bus.
+  * Boot-arg herogpu=0 skips everything, 1 (default) probes, 2 also dumps the
+- * PMIC, 3 also powers one core and runs one WRITE_VALUE job (see below).
++ * PMIC, 3-5 also run GPU jobs on one core (see the stage comment below).
+  */
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ #include <sys/param.h>
+@@ -148,19 +148,42 @@ hg_pmic_dump(void)
+ }
+ 
+ /*
+- * Stage 3 (herogpu=3): power L2, ONE shader core and the tiler, then run
+- * the A5's WRITE_VALUE job (A5XELTEGPU.cpp, which completed on the T720)
+- * on JS1 in AS0, in a private 64 KiB block of the first DRAM bank outside
+- * XNU's RAM, mapped uncached (no cache maintenance): page tables at +0,
+- * +0x1000, +0x2000, +0x3000; job and output in the data pages. Voltage
+- * and clock are left as S-Boot set them, so only one core is powered.
+- * Every poll is bounded; the cores are powered off again at the end.
++ * Stages 3-5: GPU jobs in a private 64 KiB block of the first DRAM bank,
++ * outside XNU's RAM, mapped uncached on the CPU side (no cache
++ * maintenance): Mali-LPAE page tables at +0x0000..+0x3fff, job and data
++ * pages at +0x4000.. mapped at GPU VA 0x02000000. Only L2, shader core 0
++ * and the tiler are powered (voltage and clock as S-Boot left them), all
++ * polls are bounded, and the cores are powered off at the end.
++ *
++ *   herogpu=3  WRITE_VALUE on JS1 (A5XELTEGPU.cpp; done on the phone, 0226)
++ *   herogpu=4  + fragment clear of a private 16x16 RGBA8 target on JS0
++ *   herogpu=5  + fragment clear of a 128x128 green square in the middle of
++ *              the panel scanout buffer (0xe2a00000, stride 5760)
++ *
++ * The fragment job is the A5's (0131-0133): Mesa Panfrost Midgard v4
++ * single-target framebuffer descriptor and the empty polygon list with
++ * hierarchical tiling disabled, in its own page. Mesa uses the multi-target
++ * descriptor from v5 (T760..T880) on; whether the T880 still takes the
++ * single-target one is what herogpu=4 finds out.
+  */
+ #define HG_TEST_PA      0x8ffe0000u     /* below the SMP trampoline 0x8fffe000 */
+ #define HG_TEST_BYTES   0x10000u
+ #define HG_TEST_VA      0x02000000ull
+-#define HG_DATA_OFF     0x4000u
++#define HG_DATA_OFF     0x4000u         /* GPU VA HG_TEST_VA: 12 data pages */
+ #define HG_OUT_OFF      0x100u
++#define HG_FBD_OFF      0x100u
++#define HG_POLY_OFF     0x1000u
++#define HG_PIX_OFF      0x2000u
++#define HG_RED          0xff0000ffu
++#define HG_GREEN        0xff00ff00u
++
++/* Panel scanout (mkadt_herolte.py FB_BASE) and the square to clear. */
++#define HG_FB_PA        0xe2a00000ull
++#define HG_FB_STRIDE    5760u
++#define HG_SQ_X         656u            /* (1440 - 128) / 2, 16-pixel aligned */
++#define HG_SQ_Y         1216u           /* (2560 - 128) / 2 */
++#define HG_SQ_SIZE      128u
++#define HG_SQ_L3        64u             /* l3 index of the first panel page */
+ 
+ #define SHADER_PWRON_LO 0x180
+ #define TILER_PWRON_LO  0x190
+@@ -168,13 +191,17 @@ hg_pmic_dump(void)
+ #define SHADER_PWROFF_LO 0x1c0
+ #define TILER_PWROFF_LO 0x1d0
+ #define L2_PWROFF_LO    0x1e0
++#define GPU_FAULTSTATUS 0x03c
++#define GPU_FAULTADDR_LO 0x040
+ #define JOB_IRQ_RAWSTAT 0x1000
+ #define JOB_IRQ_CLEAR   0x1004
+-#define JS1             0x1880
++#define JS_BASE(n)      (0x1800u + (n) * 0x80u)
+ #define MMU_IRQ_RAWSTAT 0x2000
+ #define MMU_IRQ_CLEAR   0x2004
+ #define AS0             0x2400
+ 
++static vm_offset_t hg_gpu, hg_mem;
++
+ static void
+ hg_wr(vm_offset_t base, uint32_t off, uint32_t v)
+ {
+@@ -184,12 +211,12 @@ hg_wr(vm_offset_t base, uint32_t off, uint32_t v)
+ }
+ 
+ static bool
+-hg_power(vm_offset_t gpu, uint32_t on, uint32_t ready, uint32_t mask, const char *name)
++hg_power(uint32_t on, uint32_t ready, uint32_t mask, const char *name)
+ {
+-	hg_wr(gpu, on, mask);
++	hg_wr(hg_gpu, on, mask);
+ 	uint32_t r = 0;
+ 	for (unsigned us = 0; us < 20000; us += 10) {
+-		r = hg_rd(gpu, ready);
++		r = hg_rd(hg_gpu, ready);
+ 		if ((r & mask) == mask) {
+ 			break;
+ 		}
+@@ -199,114 +226,214 @@ hg_power(vm_offset_t gpu, uint32_t on, uint32_t ready, uint32_t mask, const char
+ 	return (r & mask) == mask;
+ }
+ 
++static bool
++hg_cores_on(void)
++{
++	return hg_power(L2_PWRON_LO, L2_READY_LO, hg_rd(hg_gpu, L2_PRESENT_LO), "L2") &&
++	       hg_power(SHADER_PWRON_LO, SHADER_READY_LO, 1, "shader core 0") &&
++	       hg_power(TILER_PWRON_LO, TILER_READY_LO, hg_rd(hg_gpu, TILER_PRESENT_LO), "tiler");
++}
++
+ static void
+-hg_write_value_job(vm_offset_t pmu)
++hg_cores_off(void)
+ {
+-	static vm_offset_t gpu, mem;
+-	if (!hg_powered(pmu)) {
+-		printf("HEROLTE GPU: job: domain off\n");
+-		return;
+-	}
+-	if (!gpu) {
+-		gpu = ml_io_map(HG_GPU_PA, 0x5000);
+-	}
+-	if (!mem) {
+-		mem = ml_io_map(HG_TEST_PA, HG_TEST_BYTES);
+-	}
+-	if (!gpu || !mem) {
+-		printf("HEROLTE GPU: job: mapping failed\n");
+-		return;
+-	}
+-	uint32_t shaders = hg_rd(gpu, SHADER_PRESENT_LO);
+-	uint32_t pending = hg_rd(gpu, JS1 + 0x60);
+-	uint32_t as0 = hg_rd(gpu, AS0 + 0x28);
+-	if (!(shaders & 1) || pending || (as0 & 1) || hg_rd(gpu, AS0)) {
+-		printf("HEROLTE GPU: job: not idle shader=%#x js1=%#x as0=%#x\n", shaders, pending, as0);
+-		return;
+-	}
+-	if (!hg_power(gpu, L2_PWRON_LO, L2_READY_LO, hg_rd(gpu, L2_PRESENT_LO), "L2") ||
+-	    !hg_power(gpu, SHADER_PWRON_LO, SHADER_READY_LO, 1, "shader core 0") ||
+-	    !hg_power(gpu, TILER_PWRON_LO, TILER_READY_LO, hg_rd(gpu, TILER_PRESENT_LO), "tiler")) {
+-		printf("HEROLTE GPU: job: cores did not come up; not submitted\n");
+-		goto off;
+-	}
++	hg_wr(hg_gpu, TILER_PWROFF_LO, hg_rd(hg_gpu, TILER_READY_LO));
++	hg_wr(hg_gpu, SHADER_PWROFF_LO, hg_rd(hg_gpu, SHADER_READY_LO));
++	hg_wr(hg_gpu, L2_PWROFF_LO, hg_rd(hg_gpu, L2_READY_LO));
++	printf("HEROLTE GPU: cores powered off\n");
++}
+ 
+-	/* Page tables and job, as A5XELTEGPU.cpp a5g3d_try_write_value(). */
+-	volatile uint64_t *q = (volatile uint64_t *)mem;
+-	for (unsigned i = 0; i < HG_TEST_BYTES / 8; i++) {
++static void
++hg_zero(vm_offset_t va, size_t bytes)
++{
++	volatile uint64_t *q = (volatile uint64_t *)va;
++	for (size_t i = 0; i < bytes / 8; i++) {
+ 		q[i] = 0;
+ 	}
+-	volatile uint64_t *l0 = (volatile uint64_t *)mem;
+-	volatile uint64_t *l1 = (volatile uint64_t *)(mem + 0x1000);
+-	volatile uint64_t *l2t = (volatile uint64_t *)(mem + 0x2000);
+-	volatile uint64_t *l3 = (volatile uint64_t *)(mem + 0x3000);
++}
++
++/* Fresh page tables: 12 data pages, plus the square's panel rows if asked. */
++static void
++hg_tables(bool panel)
++{
++	hg_zero(hg_mem, HG_TEST_BYTES);
++	volatile uint64_t *l0 = (volatile uint64_t *)hg_mem;
++	volatile uint64_t *l1 = (volatile uint64_t *)(hg_mem + 0x1000);
++	volatile uint64_t *l2t = (volatile uint64_t *)(hg_mem + 0x2000);
++	volatile uint64_t *l3 = (volatile uint64_t *)(hg_mem + 0x3000);
+ 	l0[0] = (HG_TEST_PA + 0x1000) | 3;
+ 	l1[0] = (HG_TEST_PA + 0x2000) | 3;
+ 	l2t[(HG_TEST_VA >> 21) & 0x1ff] = (HG_TEST_PA + 0x3000) | 3;
+-	for (unsigned i = 0; i < 4; i++) {
++	for (unsigned i = 0; i < (HG_TEST_BYTES - HG_DATA_OFF) / 0x1000; i++) {
++		/* Mali-LPAE leaf: read/write, outer shareable, noncached. */
+ 		l3[i] = (HG_TEST_PA + HG_DATA_OFF + i * 0x1000) | 0x2c1;
+ 	}
+-	/* 48-byte Midgard job header: exception, first task, fault pointer,
+-	 * type/size (64-bit descriptor, WRITE_VALUE=2), index 1, then the
+-	 * WRITE_VALUE payload: output VA and value type 3 (zero 64 bits). */
+-	volatile uint8_t *job = (volatile uint8_t *)(mem + HG_DATA_OFF);
+-	job[16] = 1 | (2 << 1);
+-	*(volatile uint16_t *)(job + 18) = 1;
+-	*(volatile uint64_t *)(job + 32) = HG_TEST_VA + HG_OUT_OFF;
+-	*(volatile uint64_t *)(job + 40) = 3;
+-	volatile uint64_t *output = (volatile uint64_t *)(mem + HG_DATA_OFF + HG_OUT_OFF);
+-	*output = 0xa5a5a5a55a5a5a5aull;
++	if (panel) {
++		uint64_t first = (HG_FB_PA + (uint64_t)HG_SQ_Y * HG_FB_STRIDE + HG_SQ_X * 4) & ~0xfffull;
++		uint64_t last = HG_FB_PA + (uint64_t)(HG_SQ_Y + HG_SQ_SIZE - 1) * HG_FB_STRIDE +
++		    (HG_SQ_X + HG_SQ_SIZE) * 4;
++		for (uint64_t pa = first, i = 0; pa < last; pa += 0x1000, i++) {
++			l3[HG_SQ_L3 + i] = pa | 0x2c1;
++		}
++	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
++}
+ 
+-	hg_wr(gpu, MMU_IRQ_CLEAR, 0x00010001);
+-	hg_wr(gpu, JOB_IRQ_CLEAR, 0x00020002);
++/* Program AS0, start the job at HG_TEST_VA on slot js, wait (bounded). */
++static bool
++hg_run(unsigned js, const char *what)
++{
++	uint32_t slot = JS_BASE(js);
++	if (hg_rd(hg_gpu, slot + 0x60) || hg_rd(hg_gpu, slot + 0x24) & 0xff) {
++		printf("HEROLTE GPU: %s: slot %u busy\n", what, js);
++	}
++	hg_wr(hg_gpu, MMU_IRQ_CLEAR, 0xffffffffu);
++	hg_wr(hg_gpu, JOB_IRQ_CLEAR, 0xffffffffu);
+ 	uint64_t transtab = HG_TEST_PA | 0x7;
+-	hg_wr(gpu, AS0 + 0x00, (uint32_t)transtab);
+-	hg_wr(gpu, AS0 + 0x04, (uint32_t)(transtab >> 32));
+-	hg_wr(gpu, AS0 + 0x08, 0x888d88);
+-	hg_wr(gpu, AS0 + 0x0c, 0);
+-	hg_wr(gpu, AS0 + 0x18, 1);      /* AS_COMMAND_UPDATE */
+-	for (unsigned i = 0; i < 10000 && (hg_rd(gpu, AS0 + 0x28) & 1); i++) {
++	hg_wr(hg_gpu, AS0 + 0x00, (uint32_t)transtab);
++	hg_wr(hg_gpu, AS0 + 0x04, (uint32_t)(transtab >> 32));
++	hg_wr(hg_gpu, AS0 + 0x08, 0x888d88);
++	hg_wr(hg_gpu, AS0 + 0x0c, 0);
++	hg_wr(hg_gpu, AS0 + 0x18, 1);           /* AS_COMMAND_UPDATE */
++	for (unsigned i = 0; i < 10000 && (hg_rd(hg_gpu, AS0 + 0x28) & 1); i++) {
+ 		delay(10);
+ 	}
+-	if (hg_rd(gpu, AS0 + 0x28) & 1) {
+-		printf("HEROLTE GPU: job: MMU update timeout\n");
+-		goto off;
++	if (hg_rd(hg_gpu, AS0 + 0x28) & 1) {
++		printf("HEROLTE GPU: %s: MMU update timeout\n", what);
++		return false;
+ 	}
+-	hg_wr(gpu, JS1 + 0x40, (uint32_t)HG_TEST_VA);   /* HEAD_NEXT */
+-	hg_wr(gpu, JS1 + 0x44, 0);
+-	hg_wr(gpu, JS1 + 0x50, 1);                      /* AFFINITY_NEXT: core 0 */
+-	hg_wr(gpu, JS1 + 0x54, 0);
+-	hg_wr(gpu, JS1 + 0x58, (8 << 16) | (3 << 8) | (3 << 12));
+-	hg_wr(gpu, JS1 + 0x60, 1);                      /* COMMAND_NEXT = START */
++	hg_wr(hg_gpu, slot + 0x40, (uint32_t)HG_TEST_VA);       /* HEAD_NEXT */
++	hg_wr(hg_gpu, slot + 0x44, 0);
++	hg_wr(hg_gpu, slot + 0x50, 1);                          /* AFFINITY: core 0 */
++	hg_wr(hg_gpu, slot + 0x54, 0);
++	hg_wr(hg_gpu, slot + 0x58, (8 << 16) | (3 << 8) | (3 << 12));
++	hg_wr(hg_gpu, slot + 0x60, 1);                          /* START */
+ 
+ 	uint32_t jirq = 0, mirq = 0, girq = 0;
+ 	for (unsigned i = 0; i < 20000; i++) {
+-		jirq = hg_rd(gpu, JOB_IRQ_RAWSTAT);
+-		mirq = hg_rd(gpu, MMU_IRQ_RAWSTAT);
+-		girq = hg_rd(gpu, GPU_IRQ_RAWSTAT);
+-		if ((jirq & (1u << 1)) || (jirq & (1u << 17)) || mirq || (girq & 0x81)) {
++		jirq = hg_rd(hg_gpu, JOB_IRQ_RAWSTAT);
++		mirq = hg_rd(hg_gpu, MMU_IRQ_RAWSTAT);
++		girq = hg_rd(hg_gpu, GPU_IRQ_RAWSTAT);
++		if ((jirq & ((1u << js) | (1u << (js + 16)))) || mirq || (girq & 0x81)) {
+ 			break;
+ 		}
+ 		delay(10);
+ 	}
+-	bool done = (jirq & (1u << 1)) && !(jirq & (1u << 17)) && !mirq && !(girq & 0x81) &&
+-	    *output == 0;
+-	printf("HEROLTE GPU: WRITE_VALUE job irq=%#x mmu=%#x gpu=%#x js1_status=%#x "
+-	    "as_fault=%#x exception=%#x output=%#llx -> %s\n", jirq, mirq, girq,
+-	    hg_rd(gpu, JS1 + 0x24), hg_rd(gpu, AS0 + 0x1c), *(volatile uint32_t *)job,
+-	    *output, done ? "THE MALI-T880 RAN A JOB" : "failed or timed out");
+-	if (jirq) {
+-		hg_wr(gpu, JOB_IRQ_CLEAR, jirq);
++	volatile uint32_t *hdr = (volatile uint32_t *)(hg_mem + HG_DATA_OFF);
++	bool ok = (jirq & (1u << js)) && !(jirq & (1u << (js + 16))) && !mirq && !(girq & 0x81);
++	printf("HEROLTE GPU: %s: irq=%#x mmu=%#x gpu=%#x js_status=%#x as_fault=%#x "
++	    "exception=%#x fault=%#x:%#x gpu_fault=%#x@%#x\n", what, jirq, mirq, girq,
++	    hg_rd(hg_gpu, slot + 0x24), hg_rd(hg_gpu, AS0 + 0x1c), hdr[0], hdr[3], hdr[2],
++	    hg_rd(hg_gpu, GPU_FAULTSTATUS), hg_rd(hg_gpu, GPU_FAULTADDR_LO));
++	hg_wr(hg_gpu, JOB_IRQ_CLEAR, 0xffffffffu);
++	hg_wr(hg_gpu, MMU_IRQ_CLEAR, 0xffffffffu);
++	return ok;
++}
++
++static bool
++hg_job_write_value(void)
++{
++	hg_tables(false);
++	volatile uint8_t *job = (volatile uint8_t *)(hg_mem + HG_DATA_OFF);
++	job[16] = 1 | (2 << 1);                         /* 64-bit, WRITE_VALUE */
++	*(volatile uint16_t *)(job + 18) = 1;           /* index */
++	*(volatile uint64_t *)(job + 32) = HG_TEST_VA + HG_OUT_OFF;
++	*(volatile uint64_t *)(job + 40) = 3;           /* zero 64 bits */
++	volatile uint64_t *output = (volatile uint64_t *)(hg_mem + HG_DATA_OFF + HG_OUT_OFF);
++	*output = 0xa5a5a5a55a5a5a5aull;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	bool ok = hg_run(1, "WRITE_VALUE") && *output == 0;
++	printf("HEROLTE GPU: WRITE_VALUE output=%#llx -> %s\n", *output,
++	    ok ? "THE MALI-T880 RAN A JOB" : "failed or timed out");
++	return ok;
++}
++
++/* The A5's fragment clear: target pixels VA, size, row stride, color. */
++static bool
++hg_job_fragment(uint64_t pixels_va, uint32_t size, uint32_t stride, uint32_t color,
++    bool panel)
++{
++	hg_tables(panel);
++	uint64_t fb_va = HG_TEST_VA + HG_FBD_OFF;
++	uint64_t poly_va = HG_TEST_VA + HG_POLY_OFF;
++	volatile uint32_t *hdr = (volatile uint32_t *)(hg_mem + HG_DATA_OFF);
++	hdr[4] = 0x00010013;            /* 64-bit | FRAGMENT(9) << 1 | index 1 << 16 */
++	*(volatile uint64_t *)(hdr + 10) = fb_va;       /* payload at +40 */
++	volatile uint32_t *fb = (volatile uint32_t *)(hg_mem + HG_DATA_OFF + HG_FBD_OFF);
++	fb[1] = 31;                     /* LOCAL_STORAGE: no workgroup memory */
++	fb[8] = 0xb84da201;             /* RGBA8, identity swizzle, linear, clear/write */
++	fb[9] = 0x00141000;             /* tie-break 2, default ZS D24S8 */
++	fb[11] = ((size - 1) << 16) | (size - 1);       /* max pixel x, y */
++	*(volatile uint64_t *)(fb + 20) = pixels_va;    /* RT base at +80 */
++	fb[22] = stride;
++	for (unsigned i = 0; i < 4; i++) {
++		fb[32 + i] = color;     /* clear color at +128 */
++	}
++	fb[48] = 516;                   /* polygon list: 512-byte header + 4 */
++	fb[49] = 4095;                  /* hierarchical tiling disabled */
++	*(volatile uint64_t *)(fb + 50) = poly_va;
++	*(volatile uint64_t *)(fb + 52) = poly_va + 512;
++	*(volatile uint64_t *)(fb + 54) = poly_va;
++	*(volatile uint64_t *)(fb + 56) = poly_va;
++	volatile uint32_t *poly = (volatile uint32_t *)(hg_mem + HG_DATA_OFF + HG_POLY_OFF);
++	poly[128] = 0xa0000000;         /* empty-list body */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return hg_run(0, panel ? "FRAGMENT panel square" : "FRAGMENT private 16x16");
++}
++
++static void
++hg_jobs(vm_offset_t pmu, int mode)
++{
++	if (!hg_powered(pmu)) {
++		printf("HEROLTE GPU: jobs: domain off\n");
++		return;
++	}
++	if (!hg_gpu) {
++		hg_gpu = ml_io_map(HG_GPU_PA, 0x5000);
+ 	}
+-	if (mirq) {
+-		hg_wr(gpu, MMU_IRQ_CLEAR, mirq);
++	if (!hg_mem) {
++		hg_mem = ml_io_map(HG_TEST_PA, HG_TEST_BYTES);
+ 	}
+-off:
+-	hg_wr(gpu, TILER_PWROFF_LO, hg_rd(gpu, TILER_READY_LO));
+-	hg_wr(gpu, SHADER_PWROFF_LO, hg_rd(gpu, SHADER_READY_LO));
+-	hg_wr(gpu, L2_PWROFF_LO, hg_rd(gpu, L2_READY_LO));
+-	printf("HEROLTE GPU: cores powered off\n");
++	if (!hg_gpu || !hg_mem) {
++		printf("HEROLTE GPU: jobs: mapping failed\n");
++		return;
++	}
++	uint32_t as0 = hg_rd(hg_gpu, AS0 + 0x28);
++	if (!(hg_rd(hg_gpu, SHADER_PRESENT_LO) & 1) || (as0 & 1)) {
++		printf("HEROLTE GPU: jobs: not idle (as0=%#x)\n", as0);
++		return;
++	}
++	if (!hg_cores_on()) {
++		printf("HEROLTE GPU: jobs: cores did not come up; nothing submitted\n");
++		hg_cores_off();
++		return;
++	}
++	if (!hg_job_write_value() || mode < 4) {
++		hg_cores_off();
++		return;
++	}
++
++	/* Private 16x16 red clear: count the pixels. */
++	volatile uint32_t *pix = (volatile uint32_t *)(hg_mem + HG_DATA_OFF + HG_PIX_OFF);
++	bool ok = hg_job_fragment(HG_TEST_VA + HG_PIX_OFF, 16, 64, HG_RED, false);
++	unsigned red = 0;
++	for (unsigned i = 0; i < 256; i++) {
++		red += pix[i] == HG_RED;
++	}
++	printf("HEROLTE GPU: FRAGMENT private: first=%#x last=%#x red=%u/256 -> %s\n",
++	    pix[0], pix[255], red, ok && red == 256 ? "THE MALI-T880 RENDERED PIXELS" : "failed");
++	if (!ok || red != 256 || mode < 5) {
++		hg_cores_off();
++		return;
++	}
++
++	/* 128x128 green square in the middle of the panel. */
++	uint64_t px = HG_FB_PA + (uint64_t)HG_SQ_Y * HG_FB_STRIDE + HG_SQ_X * 4;
++	uint64_t va = HG_TEST_VA + (uint64_t)HG_SQ_L3 * 0x1000 + (px & 0xfff);
++	ok = hg_job_fragment(va, HG_SQ_SIZE, HG_FB_STRIDE, HG_GREEN, true);
++	printf("HEROLTE GPU: FRAGMENT panel square at %u,%u pa=%#llx -> %s\n", HG_SQ_X, HG_SQ_Y,
++	    px, ok ? "done: look for a green square in the middle of the screen" : "failed");
++	hg_cores_off();
+ }
+ 
+ static void
+@@ -327,7 +454,7 @@ hg_thread(void *arg, __unused wait_result_t wr)
+ 		hg_pmic_dump();
+ 	}
+ 	if (mode >= 3) {
+-		hg_write_value_job(pmu);
++		hg_jobs(pmu, mode);
+ 	}
+ }
+ 

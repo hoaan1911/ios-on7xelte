@@ -1,0 +1,85 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 1395e32..3883ca2 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -348,7 +348,18 @@ hg_job_write_value(void)
+ 	return ok;
+ }
+ 
+-/* The A5's fragment clear: target pixels VA, size, row stride, color. */
++/*
++ * Fragment clear of a size x size RGBA8 target. 0227 sent the A5's
++ * single-target descriptor: the T880 answered DATA_INVALID_FAULT (0x58) with
++ * the fault pointer on it. Mesa's Midgard v5 layout (genxml/v5.xml), used
++ * from the T760 on, is the multi-target one: Framebuffer = Local Storage
++ * (+0, 32 B), Parameters (+32, 24 B), Tiler Context (+56, 40 B), Tiler
++ * Weights (+96, 32 B), then one 64-byte Render Target (+128). The fragment
++ * payload carries the bounds in 16x16 tiles and the framebuffer pointer
++ * tagged with Type = 1 (MFBD), render target count - 1 = 0. RT values are
++ * the A5 descriptor's (0xb84da201): RGBA8, swizzle 0x688, linear, dither,
++ * clean pixel write.
++ */
+ static bool
+ hg_job_fragment(uint64_t pixels_va, uint32_t size, uint32_t stride, uint32_t color,
+     bool panel)
+@@ -356,25 +367,46 @@ hg_job_fragment(uint64_t pixels_va, uint32_t size, uint32_t stride, uint32_t col
+ 	hg_tables(panel);
+ 	uint64_t fb_va = HG_TEST_VA + HG_FBD_OFF;
+ 	uint64_t poly_va = HG_TEST_VA + HG_POLY_OFF;
++	uint32_t tiles = (size + 15) / 16;
+ 	volatile uint32_t *hdr = (volatile uint32_t *)(hg_mem + HG_DATA_OFF);
+ 	hdr[4] = 0x00010013;            /* 64-bit | FRAGMENT(9) << 1 | index 1 << 16 */
+-	*(volatile uint64_t *)(hdr + 10) = fb_va;       /* payload at +40 */
++	hdr[8] = 0;                     /* bound min tile x, y */
++	hdr[9] = ((tiles - 1) << 16) | (tiles - 1);     /* bound max tile x, y */
++	*(volatile uint64_t *)(hdr + 10) = fb_va | 1;   /* MFBD, 1 render target */
++
+ 	volatile uint32_t *fb = (volatile uint32_t *)(hg_mem + HG_DATA_OFF + HG_FBD_OFF);
+-	fb[1] = 31;                     /* LOCAL_STORAGE: no workgroup memory */
+-	fb[8] = 0xb84da201;             /* RGBA8, identity swizzle, linear, clear/write */
+-	fb[9] = 0x00141000;             /* tie-break 2, default ZS D24S8 */
+-	fb[11] = ((size - 1) << 16) | (size - 1);       /* max pixel x, y */
+-	*(volatile uint64_t *)(fb + 20) = pixels_va;    /* RT base at +80 */
+-	fb[22] = stride;
++	fb[1] = 31;                     /* Local Storage: no workgroup memory */
++	/* Parameters at +32 (word 8). */
++	fb[8] = ((size - 1) << 16) | (size - 1);        /* width - 1, height - 1 */
++	fb[9] = 0;                                      /* bound min x, y (pixels) */
++	fb[10] = ((size - 1) << 16) | (size - 1);       /* bound max x, y */
++	fb[11] = (2u << 6) |            /* tie-break MINUS_180_IN_0_OUT, as the A5 */
++	    (8u << 9) |                 /* effective tile size log2(16 * 16) */
++	    (1u << 24);                 /* color buffer allocation 1 KiB (shr 10) */
++	fb[12] = 0;
++	fb[13] = 0;                     /* Z clear 0.0 */
++	/* Tiler Context at +56 (word 14): empty list, no hierarchy (A5 values). */
++	fb[14] = 516;                   /* polygon list size: 512-byte header + 4 */
++	fb[15] = 4095;
++	*(volatile uint64_t *)(fb + 16) = poly_va;              /* polygon list */
++	*(volatile uint64_t *)(fb + 18) = poly_va + 512;        /* body */
++	*(volatile uint64_t *)(fb + 20) = poly_va;              /* heap start */
++	*(volatile uint64_t *)(fb + 22) = poly_va;              /* heap end */
++	/* Render Target at +128 (word 32). */
++	volatile uint32_t *rt = fb + 32;
++	rt[0] = 1u << 26;               /* internal format R8G8B8A8 */
++	rt[1] = 1u |                    /* write enable */
++	    (19u << 3) |                /* writeback format R8G8B8A8 */
++	    (2u << 10) |                /* block format linear */
++	    (1u << 15) |                /* dithering, as the A5 */
++	    (0x688u << 16) |            /* identity swizzle */
++	    (1u << 31);                 /* clean pixel write */
++	*(volatile uint64_t *)(rt + 8) = pixels_va;     /* RGB base */
++	rt[10] = stride;                                /* row stride */
++	rt[11] = 0;                                     /* surface stride */
+ 	for (unsigned i = 0; i < 4; i++) {
+-		fb[32 + i] = color;     /* clear color at +128 */
++		rt[12 + i] = color;     /* clear color */
+ 	}
+-	fb[48] = 516;                   /* polygon list: 512-byte header + 4 */
+-	fb[49] = 4095;                  /* hierarchical tiling disabled */
+-	*(volatile uint64_t *)(fb + 50) = poly_va;
+-	*(volatile uint64_t *)(fb + 52) = poly_va + 512;
+-	*(volatile uint64_t *)(fb + 54) = poly_va;
+-	*(volatile uint64_t *)(fb + 56) = poly_va;
+ 	volatile uint32_t *poly = (volatile uint32_t *)(hg_mem + HG_DATA_OFF + HG_POLY_OFF);
+ 	poly[128] = 0xa0000000;         /* empty-list body */
+ 	__asm__ volatile ("dsb sy" ::: "memory");

@@ -1,0 +1,157 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e18602c..82c2f7b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -112,6 +112,7 @@ public:
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	bool          fScaled;                  /* sweetfb_scale: logical = 2/3 panel, x1.5 */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -138,6 +139,8 @@ public:
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	uint64_t present(const uint8_t *rec);
++	uint64_t scaledCopy(uintptr_t src, uint32_t srcRowBytes, int32_t dx, int32_t dy,
++	    int32_t w, int32_t h);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -203,17 +206,29 @@ AppleCLCD::start(IOService *provider)
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
++	/* Experimental: the CPU renderer (no GPU) draws 960x1706, 2.25x fewer
++	 * pixels than the panel, and present() scales it x1.5 (nearest). */
++	int scale = 0;
++	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
++	if (scale) {
++		fScaled = true;
++		fLogicalW = fWidth * 2 / 3;
++		fLogicalH = fHeight * 2 / 3;
++	}
+ #elif !defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+ #endif
+-	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+-	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	fOffX = fScaled ? 0 : (int32_t)(fLogicalW - fWidth) / 2;
++	fOffY = fScaled ? 0 : (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+-	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
++	/* The default surface must have the presented size (a mismatch left
++	 * every swap layer empty); scaled, it is the panel's top-left part. */
++	fSurface = sweet_surface_create_physical(fPhys, fScaled ? fLogicalW : fWidth,
++	    fScaled ? fLogicalH : fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+@@ -424,6 +439,53 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
++/*
++ * sweetfb_scale: the logical rect (dx,dy,w,h) at src goes to panel pixels
++ * x1.5, nearest neighbour (two source pixels become three). A panel row
++ * whose source row equals the previous one is copied from it. Called only
++ * from present(), which the vsync timer serializes.
++ */
++uint64_t
++AppleCLCD::scaledCopy(uintptr_t src, uint32_t srcRowBytes, int32_t dx, int32_t dy,
++    int32_t w, int32_t h)
++{
++	static uint16_t column[2048];
++	int32_t px0 = dx * 3 / 2, px1 = (dx + w) * 3 / 2;
++	int32_t py0 = dy * 3 / 2, py1 = (dy + h) * 3 / 2;
++	if (px1 > (int32_t)fWidth) {
++		px1 = (int32_t)fWidth;
++	}
++	if (py1 > (int32_t)fHeight) {
++		py1 = (int32_t)fHeight;
++	}
++	int32_t pw = px1 - px0;
++	if (pw <= 0 || py1 <= py0 || pw > (int32_t)(sizeof(column) / sizeof(column[0]))) {
++		return 0;
++	}
++	for (int32_t x = 0; x < pw; x++) {
++		int32_t c = (px0 + x) * 2 / 3 - dx;
++		column[x] = (uint16_t)(c < 0 ? 0 : (c >= w ? w - 1 : c));
++	}
++	int32_t previous = -1;
++	uint32_t *prevRow = NULL;
++	for (int32_t py = py0; py < py1; py++) {
++		int32_t r = py * 2 / 3 - dy;
++		r = r < 0 ? 0 : (r >= h ? h - 1 : r);
++		uint32_t *out = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes + (uint64_t)px0 * 4);
++		if (r == previous && prevRow != NULL) {
++			memcpy(out, prevRow, (size_t)pw * 4);
++		} else {
++			const uint32_t *in = (const uint32_t *)(src + (uint64_t)r * srcRowBytes);
++			for (int32_t x = 0; x < pw; x++) {
++				out[x] = in[column[x]];
++			}
++			previous = r;
++		}
++		prevRow = out;
++	}
++	return (uint64_t)pw * (uint64_t)(py1 - py0) * 4;
++}
++
+ uint64_t
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -499,11 +561,14 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (h > (int32_t)s->height - sy) {
+ 			h = (int32_t)s->height - sy;
+ 		}
+-		if (w > (int32_t)fWidth - dx) {
+-			w = (int32_t)fWidth - dx;
++		/* Scaled, dx/dy/w/h stay logical: clip to the logical display. */
++		int32_t limitW = (int32_t)(fScaled ? fLogicalW : fWidth);
++		int32_t limitH = (int32_t)(fScaled ? fLogicalH : fHeight);
++		if (w > limitW - dx) {
++			w = limitW - dx;
+ 		}
+-		if (h > (int32_t)fHeight - dy) {
+-			h = (int32_t)fHeight - dy;
++		if (h > limitH - dy) {
++			h = limitH - dy;
+ 		}
+ 		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+@@ -511,7 +576,10 @@ AppleCLCD::present(const uint8_t *rec)
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
+-		if (src != 0 && bpe == 4) {
++		if (src != 0 && bpe == 4 && fScaled) {
++			copied += scaledCopy(src + s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4,
++			    s->bytesPerRow, dx, dy, w, h);
++		} else if (src != 0 && bpe == 4) {
+ 			copied += (uint64_t)w * (uint64_t)h * 4;
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 456e6fb..60c2ffa 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -440,6 +440,13 @@ SweetHIDTouch::start(IOService *provider)
+ 	fPanelH = 2560;
+ 	fLogicalW = native ? 1440 : 1125;
+ 	fLogicalH = native ? 2560 : 2436;
++	/* sweetfb_scale: the display is scaled onto the whole panel, so panel
++	 * coordinates normalize over the panel (SweetFramebuffer.cpp). */
++	int scale = 0;
++	if (PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale)) && scale) {
++		fLogicalW = 1440;
++		fLogicalH = 2560;
++	}
+ #elif defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	fPanelW = fLogicalW = 1080;
+ 	fPanelH = fLogicalH = 1920;

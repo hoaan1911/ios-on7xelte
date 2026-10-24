@@ -1,0 +1,455 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index a125913..e6210d3 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/a5xelte_emmc.c			standard
+ bsd/dev/herolte_ufs.c			standard
+ bsd/dev/herolte_touch.c			standard
++bsd/dev/herolte_battery.c		standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/sweet_sample.c			standard
+diff --git a/bsd/dev/a5xelte_keys.c b/bsd/dev/a5xelte_keys.c
+index cec8c13..9576d7d 100644
+--- a/bsd/dev/a5xelte_keys.c
++++ b/bsd/dev/a5xelte_keys.c
+@@ -16,6 +16,7 @@
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++#include <mach/mach_time.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+@@ -35,6 +36,9 @@ extern void sweet_hid_key(int key, int down);
+ #define A5_GPA2_PUD 0x48u
+ 
+ static vm_offset_t a5_alive;
++/* Last Power press (mach_absolute_time); SweetFramebuffer.cpp reads it. */
++extern uint64_t a5xelte_power_pressed_at;
++uint64_t a5xelte_power_pressed_at;
+ static int a5_keys_sleep;
+ static bool a5_keys_started;
+ 
+@@ -98,6 +102,9 @@ a5_keys_thread(void *arg, wait_result_t result)
+ 					int down = !(sample & bit);
+ 					printf("A5XELTE KEYS: key=%u down=%d gpio=%#x\n",
+ 					    key, down, sample);
++					if (key == 0 && down) {
++						a5xelte_power_pressed_at = mach_absolute_time();
++					}
+ 					sweet_hid_key((int)key, down);
+ 				}
+ 			}
+diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
+new file mode 100644
+index 0000000..329a2c1
+--- /dev/null
++++ b/bsd/dev/herolte_battery.c
+@@ -0,0 +1,212 @@
++/*
++ * HEROLTE (Galaxy S7 SM-G930F, Exynos 8890) fuel gauge: the MAX77854 FG
++ * (Linux max77854_fuelgauge.c, "sec-fuelgauge") at 0x36 on HSI2C_0
++ * 0x13640000, pins GPD1-0/1 function 2 (BOOT DTB hs-i2c0-bus). Read-only:
++ * REPSOC 0x06 (1/256 %), REPCAP 0x05 and FULLCAP 0x10 (0.5 mAh with the
++ * 10 mOhm sense resistor), VCELL 0x09 (78.125 uV), CURRENT 0x0a (signed,
++ * 156.25 uA, positive = charging). Polled by SweetBattery's work loop.
++ */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int herolte_fg_init(void);
++int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah);
++
++#define FG_HSI2C_PA     0x13640000u
++#define FG_PINS_PA      0x136d0000u     /* GPI0 +0x00, GPD0 +0x20, GPD1 +0x40 */
++#define FG_GPD1         0x40
++#define FG_ADDR         0x36u
++#define FG_REPCAP       0x05
++#define FG_REPSOC       0x06
++#define FG_VCELL        0x09
++#define FG_CURRENT      0x0a
++#define FG_FULLCAP      0x10
++/* DTB fuelgauge,capacity_max: Samsung shows 99.0 % of REPSOC as 100 %. */
++#define FG_CAPACITY_MAX 990u
++
++#define HSI2C_CTL       0x00
++#define HSI2C_FIFO_CTL  0x04
++#define HSI2C_TRAILING  0x08
++#define HSI2C_INT_EN    0x20
++#define HSI2C_INT_STAT  0x24
++#define HSI2C_FIFO_STAT 0x30
++#define HSI2C_TX_DATA   0x34
++#define HSI2C_RX_DATA   0x38
++#define HSI2C_CONF      0x40
++#define HSI2C_AUTO_CONF 0x44
++#define HSI2C_TIMEOUT   0x48
++#define HSI2C_TRANS     0x50
++#define HSI2C_FS1       0x60
++#define HSI2C_FS2       0x64
++#define HSI2C_FS3       0x68
++#define HSI2C_SLA       0x6c
++#define HSI2C_ADDR      0x70
++
++static vm_offset_t fg_i2c, fg_pins;
++
++static uint32_t
++fg_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++fg_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++/* Same AUTO-mode setup as the touch bus (herolte_touch.c ht_bus_init). */
++static void
++fg_bus_init(void)
++{
++	fg_wr(fg_i2c, HSI2C_CTL, 0x80000009u);
++	fg_wr(fg_i2c, HSI2C_CTL, 0x00000009u);
++	fg_wr(fg_i2c, HSI2C_TIMEOUT, 0);
++	fg_wr(fg_i2c, HSI2C_FS1, 0x78787800u);
++	fg_wr(fg_i2c, HSI2C_FS2, 0x3c007878u);
++	fg_wr(fg_i2c, HSI2C_FS3, 0x000100f0u);
++	fg_wr(fg_i2c, HSI2C_SLA, 0x3cu);
++	fg_wr(fg_i2c, HSI2C_TRAILING, 0xfu);
++	fg_wr(fg_i2c, HSI2C_CONF, 0x80000000u);
++	fg_wr(fg_i2c, HSI2C_INT_EN, 0);
++}
++
++/*
++ * One message; without stop the next one starts with a repeated START, as
++ * Linux i2c-exynos5.c does for every message but the last.
++ */
++static bool
++fg_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
++{
++	uint32_t last = 0;
++	bool xfer_done = false;
++	unsigned done = 0;
++
++	fg_wr(fg_i2c, HSI2C_INT_STAT, fg_rd(fg_i2c, HSI2C_INT_STAT));
++	fg_wr(fg_i2c, HSI2C_FIFO_CTL, 3u | (receive ? (1u << 4) : (1u << 16)));
++	fg_wr(fg_i2c, HSI2C_ADDR, FG_ADDR << 10);
++	fg_wr(fg_i2c, HSI2C_CTL, 9u | (receive ? 0x40u : 0x80u));
++	fg_wr(fg_i2c, HSI2C_INT_EN, 0xf80u | (receive ? 0x42u : 1u));
++	/* Bit 16 read, bit 17 STOP_AFTER_TRANS, bit 31 MASTER_RUN. */
++	fg_wr(fg_i2c, HSI2C_AUTO_CONF, count | (receive ? 0x10000u : 0) |
++	    (stop ? 0x20000u : 0) | 0x80000000u);
++	for (unsigned us = 0; us < 20000; us++) {
++		uint32_t irq = fg_rd(fg_i2c, HSI2C_INT_STAT);
++		if (irq) {
++			last |= irq;
++			fg_wr(fg_i2c, HSI2C_INT_STAT, irq);
++		}
++		if (irq & 0xf00u) {
++			break;
++		}
++		if (irq & 0x80u) {
++			xfer_done = true;
++		}
++		if (receive) {
++			while (done < count && ((fg_rd(fg_i2c, HSI2C_FIFO_STAT) >> 16) & 0x7fu)) {
++				bytes[done++] = (uint8_t)fg_rd(fg_i2c, HSI2C_RX_DATA);
++			}
++		} else {
++			while (done < count && !(fg_rd(fg_i2c, HSI2C_FIFO_STAT) & (1u << 7))) {
++				fg_wr(fg_i2c, HSI2C_TX_DATA, bytes[done++]);
++			}
++		}
++		if (done == count && (xfer_done || (receive && stop))) {
++			fg_wr(fg_i2c, HSI2C_INT_EN, 0);
++			if (!stop) {
++				return true;
++			}
++			for (unsigned n = 0; n < 10000; n++) {
++				if (!(fg_rd(fg_i2c, HSI2C_TRANS) & (1u << 17))) {
++					return true;
++				}
++				delay(1);
++			}
++			break;
++		}
++		delay(1);
++	}
++	static unsigned errors_logged;
++	if (errors_logged++ < 8) {
++		printf("HEROLTE FG: %s %u/%u failed int=%#x trans=%#x fifo=%#x\n",
++		    receive ? "rx" : "tx", done, count, last,
++		    fg_rd(fg_i2c, HSI2C_TRANS), fg_rd(fg_i2c, HSI2C_FIFO_STAT));
++	}
++	fg_wr(fg_i2c, HSI2C_INT_EN, 0);
++	fg_bus_init();
++	return false;
++}
++
++static bool
++fg_word(uint8_t reg, uint16_t *value)
++{
++	uint8_t b[2];
++	for (unsigned attempt = 0; attempt < 3; attempt++) {
++		if (fg_message(false, &reg, 1, false) && fg_message(true, b, 2, true)) {
++			*value = (uint16_t)(b[0] | (b[1] << 8));
++			return true;
++		}
++		delay(500);
++	}
++	return false;
++}
++
++int
++herolte_fg_init(void)
++{
++	int enabled = 1;
++	PE_parse_boot_argn("herofg", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return -1;
++	}
++	fg_i2c = ml_io_map(FG_HSI2C_PA, 0x1000);
++	fg_pins = ml_io_map(FG_PINS_PA, 0x1000);
++	if (!fg_i2c || !fg_pins) {
++		return -1;
++	}
++	uint32_t con = fg_rd(fg_pins, FG_GPD1);
++	printf("HEROLTE FG: GPD1 con=%#x dat=%#x pud=%#x; HSI2C ctl=%#x conf=%#x (as found)\n",
++	    con, fg_rd(fg_pins, FG_GPD1 + 4), fg_rd(fg_pins, FG_GPD1 + 8),
++	    fg_rd(fg_i2c, HSI2C_CTL), fg_rd(fg_i2c, HSI2C_CONF));
++	/* GPD1-0/1 to HSI2C (function 2), no pulls, as the DTB hs-i2c0-bus. */
++	fg_wr(fg_pins, FG_GPD1 + 8, fg_rd(fg_pins, FG_GPD1 + 8) & ~0xfu);
++	fg_wr(fg_pins, FG_GPD1, (con & ~0xffu) | 0x22u);
++	fg_bus_init();
++	uint16_t soc;
++	if (!fg_word(FG_REPSOC, &soc)) {
++		printf("HEROLTE FG: no answer at 0x36\n");
++		return -1;
++	}
++	printf("HEROLTE FG: MAX77854 answers, REPSOC=%#x\n", soc);
++	return 0;
++}
++
++int
++herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah)
++{
++	uint16_t soc, vcell, current, rem, full;
++	if (!fg_i2c || !fg_word(FG_REPSOC, &soc) || !fg_word(FG_VCELL, &vcell) ||
++	    !fg_word(FG_CURRENT, &current) || !fg_word(FG_REPCAP, &rem) ||
++	    !fg_word(FG_FULLCAP, &full)) {
++		return -1;
++	}
++	unsigned permille = ((unsigned)soc * 10u) >> 8;
++	unsigned p = (permille * 1000u / FG_CAPACITY_MAX + 5u) / 10u;
++	*percent = p > 100 ? 100 : p;
++	*mv = (unsigned)(((uint64_t)vcell * 78125u) / 1000000u);
++	*ma = (int)(((int64_t)(int16_t)current * 15625) / 100000);
++	*rem_mah = rem / 2u;
++	*full_mah = full / 2u;
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_HEROLTE */
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9969739..6d8a0fd 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -4,7 +4,7 @@
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+  * See report.md for binary evidence, register provenance and integration.
+  */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_HEROLTE)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOWorkLoop.h>
+@@ -12,9 +12,18 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++/* bsd/dev/herolte_battery.c: MAX77854 fuel gauge, read-only. */
++extern "C" int herolte_fg_init(void);
++extern "C" int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma,
++    unsigned *rem_mah, unsigned *full_mah);
++#define BATTERY_DESIGN_MAH 3000u        /* SM-G930F EB-BG930ABE */
++#else
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++#define BATTERY_DESIGN_MAH 5020u
++#endif
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -101,11 +110,11 @@ void
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units (DT nominal). powerd computes C*100/M. */
++	const unsigned capacity = (BATTERY_DESIGN_MAH * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(BATTERY_DESIGN_MAH);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -119,8 +128,8 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", BATTERY_DESIGN_MAH);
++	putNumber("DesignCapacity", BATTERY_DESIGN_MAH);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+ 	putNumber("Temperature", 2500);
+@@ -137,7 +146,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, BATTERY_DESIGN_MAH, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -154,12 +163,17 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		    measured ? "MAX77854 fuel gauge" : "static fallback",
++#else
+ 		    measured ? "PM6150 / estimated SOC" : "static fallback",
++#endif
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+ }
+ 
++#if !defined(ARM64_BOARD_CONFIG_HEROLTE)
+ /* Keep the proven single-byte observer command. Read two matching whole
+  * words to reject most torn ADC samples without writing the QG HOLD bit.
+  * This is a bounded consistency check, not a hardware snapshot guarantee. */
+@@ -202,7 +216,30 @@ SweetBattery::estimatePercent(unsigned mv)
+ 	}
+ 	return 100;
+ }
++#endif
+ 
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++void
++SweetBattery::poll(void)
++{
++	unsigned percent, mv, rem, full;
++	int ma;
++	/* Zero, floating or implausible data cannot become 0% battery. */
++	if (!fReal || herolte_fg_read(&percent, &mv, &ma, &rem, &full) != 0 ||
++	    mv < 2800 || mv > 4600) {
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	/* No charger driver: the gauge's charge current marks a cable. */
++	bool charging = ma > 20;
++	static unsigned logged;
++	if (logged++ % 10 == 0) {
++		IOLog("SWEET BATTERY: %u%% %umV %dmA rem=%umAh full=%umAh\n",
++		    percent, mv, ma, rem, full);
++	}
++	publish(percent, mv, ma, charging, charging, charging, false, true, true);
++}
++#else
+ void
+ SweetBattery::poll(void)
+ {
+@@ -245,6 +282,7 @@ SweetBattery::poll(void)
+ 	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
+ 	    charging, full, true, currentValid);
+ }
++#endif
+ 
+ void
+ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -262,9 +300,14 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/* Default on; herofg=0 keeps the static fallback. */
++	fReal = herolte_fg_init() == 0;
++#else
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
++#endif
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+@@ -316,4 +359,4 @@ SweetBattery::free(void)
+ 	OSSafeReleaseNULL(fLoop);
+ 	IOPMPowerSource::free();
+ }
+-#endif /* ARM64_BOARD_CONFIG_SWEET */
++#endif /* ARM64_BOARD_CONFIG_SWEET || ARM64_BOARD_CONFIG_HEROLTE */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 95205eb..e18602c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,9 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++extern "C" uint64_t a5xelte_power_pressed_at;   /* bsd/dev/a5xelte_keys.c */
++#endif
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include <IOKit/IOService.h>
+@@ -658,8 +661,18 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 			int keep_on = 0;
+ 			if (off && PE_parse_boot_argn("a5fb_keep_on", &keep_on, sizeof(keep_on)) && keep_on) {
+-				IOLog("A5XELTE FB: display-off request ignored (a5fb_keep_on)\n");
+-				break;
++				/* backboardd also asks for off on its own (right after the
++				 * first swap, idle); only a Power press just before is the
++				 * user locking the phone (bsd/dev/a5xelte_keys.c). */
++				uint64_t pressed = a5xelte_power_pressed_at, since_ns = UINT64_MAX;
++				if (pressed) {
++					absolutetime_to_nanoseconds(mach_absolute_time() - pressed, &since_ns);
++				}
++				if (since_ns > 3 * NSEC_PER_SEC) {
++					IOLog("A5XELTE FB: display-off request ignored (a5fb_keep_on)\n");
++					break;
++				}
++				IOLog("A5XELTE FB: display-off after Power press\n");
+ 			}
+ #endif
+ 			IOLockLock(fFB->fLock);
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 2c3af25..b89b64d 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -89,7 +89,7 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
+-#if !defined(ARM64_BOARD_CONFIG_A5XELTE)
++#if !defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(ARM64_BOARD_CONFIG_HEROLTE)
+     "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"

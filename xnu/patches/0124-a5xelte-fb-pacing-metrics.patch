@@ -1,0 +1,146 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 356ff51..7e2383c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -118,6 +118,14 @@ public:
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	bool          fPerfLog;       /* A5-only copy timing; never on the donor */
++	uint64_t      fPerfFrames;
++	uint64_t      fPerfBytes;
++	uint64_t      fPerfNS;
++	uint64_t      fPerfMaxNS;
++	uint64_t      fPerfWindowStart;
++#endif
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+@@ -125,7 +133,7 @@ public:
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+-	void present(const uint8_t *rec);
++	uint64_t present(const uint8_t *rec);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -209,8 +217,31 @@ AppleCLCD::start(IOService *provider)
+ 		return false;
+ 	}
+ 	uint32_t hz = 10;
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* A5's 1080x1920 panel copies 8.29 MB per full frame. Keep the
++	 * donor's 10 Hz default while allowing 30 Hz on this board. */
++	hz = 30;
++#endif
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	PE_parse_boot_argn("a5fb_hz", &hz, sizeof(hz));
++	int perf = 1;
++	PE_parse_boot_argn("a5fb_perf", &perf, sizeof(perf));
++	fPerfLog = perf != 0;
++	fPerfFrames = fPerfBytes = fPerfNS = fPerfMaxNS = 0;
++	fPerfWindowStart = mach_absolute_time();
++#endif
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	if (hz == 0) {
++		hz = 30;
++	} else if (hz > 60) {
++		hz = 60;
++	}
++	/* Round the tick interval up so 31-59 Hz never silently means 60 Hz. */
++	fFlushTicks = (60 + hz - 1) / hz;
++#else
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++#endif
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -219,6 +250,10 @@ AppleCLCD::start(IOService *provider)
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	IOLog("A5XELTE FB: requested %u Hz, effective %u Hz, copy timing %s\n",
++	    hz, 60 / fFlushTicks, fPerfLog ? "on" : "off");
++#endif
+ 	return true;
+ }
+ 
+@@ -269,9 +304,44 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+-		fb->present(rec);
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++		uint64_t before = fb->fPerfLog ? mach_absolute_time() : 0;
++#endif
++		uint64_t bytes = fb->present(rec);
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++		if (fb->fPerfLog) {
++			uint64_t ns = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time() - before, &ns);
++			fb->fPerfFrames++;
++			fb->fPerfBytes += bytes;
++			fb->fPerfNS += ns;
++			if (ns > fb->fPerfMaxNS) {
++				fb->fPerfMaxNS = ns;
++			}
++		}
++#else
++		(void)bytes;
++#endif
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* Aggregate after 300 callbacks; measure wall time because expensive
++	 * copies can delay the timer and reduce the actual frame rate. */
++	if (fb->fPerfLog && (count % 300) == 0) {
++		uint64_t elapsedNS = 0;
++		uint64_t finished = mach_absolute_time();
++		absolutetime_to_nanoseconds(finished - fb->fPerfWindowStart, &elapsedNS);
++		if (fb->fPerfFrames != 0 && elapsedNS != 0) {
++			uint64_t fpsTenths = fb->fPerfFrames * 10000000000ULL / elapsedNS;
++			IOLog("A5XELTE FB: frames=%llu elapsed_ms=%llu fps=%llu.%llu bytes=%llu avg_copy_us=%llu max_copy_us=%llu\n",
++			    fb->fPerfFrames, elapsedNS / 1000000, fpsTenths / 10,
++			    fpsTenths % 10, fb->fPerfBytes,
++			    fb->fPerfNS / fb->fPerfFrames / 1000, fb->fPerfMaxNS / 1000);
++		}
++		fb->fPerfFrames = fb->fPerfBytes = fb->fPerfNS = fb->fPerfMaxNS = 0;
++		fb->fPerfWindowStart = finished;
++	}
++#endif
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
+@@ -324,10 +394,11 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
+-void
++uint64_t
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	uint64_t copied = 0;
+ 
+ 
+ 	if (!fConsolePaused) {
+@@ -411,6 +482,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			copied += (uint64_t)w * (uint64_t)h * 4;
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+@@ -419,6 +491,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	return copied;
+ }
+ 
+ bool

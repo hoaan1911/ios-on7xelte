@@ -1,0 +1,61 @@
+diff --git a/bsd/pthread/sweet_pthread_init.c b/bsd/pthread/sweet_pthread_init.c
+index 5a82439..cc0a095 100644
+--- a/bsd/pthread/sweet_pthread_init.c
++++ b/bsd/pthread/sweet_pthread_init.c
+@@ -1,5 +1,5 @@
+ /* Built-in provider: Apple libpthread-514.100.2, paired with xnu-8796.141.3. */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include "sweet_pthread_compat.h"
+ #include "sweet_libpthread/kern/kern_init.c"
+ 
+@@ -20,7 +20,11 @@ sweet_pthread_register(void)
+     if (kr != KERN_SUCCESS || sweet_pthread_kern == NULL) {
+         panic("SWEET: pthread provider registration failed: %d", kr);
+     }
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++    kprintf("A5XELTE pthread: libpthread-514.100.2 registered\n");
++#else
+     kprintf("SWEET pthread: libpthread-514.100.2 registered\n");
++#endif
+ }
+ STARTUP(EARLY_BOOT, STARTUP_RANK_SECOND, sweet_pthread_register);
+-#endif /* ARM64_BOARD_CONFIG_SWEET */
++#endif /* SWEET || A5XELTE */
+diff --git a/bsd/pthread/sweet_pthread_support.c b/bsd/pthread/sweet_pthread_support.c
+index beae777..672fce2 100644
+--- a/bsd/pthread/sweet_pthread_support.c
++++ b/bsd/pthread/sweet_pthread_support.c
+@@ -1,5 +1,5 @@
+ /* Built-in provider: Apple libpthread-514.100.2, paired with xnu-8796.141.3. */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include "sweet_pthread_compat.h"
+ #include "sweet_libpthread/kern/kern_support.c"
+-#endif /* ARM64_BOARD_CONFIG_SWEET */
++#endif /* SWEET || A5XELTE */
+diff --git a/bsd/pthread/sweet_pthread_synch.c b/bsd/pthread/sweet_pthread_synch.c
+index 08baa1b..9b35020 100644
+--- a/bsd/pthread/sweet_pthread_synch.c
++++ b/bsd/pthread/sweet_pthread_synch.c
+@@ -1,5 +1,5 @@
+ /* Built-in provider: Apple libpthread-514.100.2, paired with xnu-8796.141.3. */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include "sweet_pthread_compat.h"
+ #include "sweet_libpthread/kern/kern_synch.c"
+-#endif /* ARM64_BOARD_CONFIG_SWEET */
++#endif /* SWEET || A5XELTE */
+diff --git a/bsd/sys/pthread_internal.h b/bsd/sys/pthread_internal.h
+index 135405e..0042011 100644
+--- a/bsd/sys/pthread_internal.h
++++ b/bsd/sys/pthread_internal.h
+@@ -34,7 +34,7 @@
+ 
+ struct ksyn_waitq_element {
+ #if __LP64__
+-	#if defined(ARM64_BOARD_CONFIG_SWEET)
++	#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	/* libpthread-514.100.2 includes the trailing kwe_uth pointer. */
+ 	char opaque[56];
+ #else

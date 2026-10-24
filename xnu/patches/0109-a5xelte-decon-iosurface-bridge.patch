@@ -1,0 +1,121 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index c1ca075..a2daa87 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -38,7 +38,7 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
+@@ -69,7 +69,11 @@ enum {
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#define SWEET_FB_DOT_PITCH              424     /* 1080 pixels across 5.2 inches */
++#else
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
++#endif
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+  * screens (UIKit: "No status bar visual provider for screen", the red
+@@ -158,10 +162,20 @@ AppleCLCD::start(IOService *provider)
+ 		return false;
+ 	}
+ 	PE_current_console(&video);
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* The loader's DECON handoff scans out this physical XRGB8888 buffer.
++	 * It does not fill boot_args.Video, so PE_current_console is empty.
++	 * Keep the physical address out of the donor path. */
++	fPhys = 0x67000000ULL;
++	fWidth = 1080;
++	fHeight = 1920;
++	fRowBytes = 4320;
++#else
+ 	fPhys = video.v_baseAddr;
+ 	fWidth = (uint32_t)video.v_width;
+ 	fHeight = (uint32_t)video.v_height;
+ 	fRowBytes = (uint32_t)video.v_rowBytes;
++#endif
+ 	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+@@ -170,10 +184,12 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
++#if !defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
++#endif
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+@@ -317,7 +333,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+ 		fConsolePaused = true;
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++		if (PE_parse_boot_argn("a5fb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
++#else
+ 		if (PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
++#endif
+ 			/* Not PE_initialize_console(kPEDisableScreen): its console switch
+ 			 * writes the read-only-late cons_ops_index and panics. */
+ 			sweet_console_muted = 1;
+@@ -568,4 +588,4 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	}
+ 	return ret;
+ }
+-#endif /* ARM64_BOARD_CONFIG_SWEET */
++#endif /* SWEET || A5XELTE */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index f81aa3d..f35a98d 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -70,12 +70,16 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOCoreSurfaceRoot;"
+     "   },"
+-#if !defined(ARM64_BOARD_CONFIG_A5XELTE)
+     "   {"
+     "     'IOClass'         = AppleCLCD;"
+     "     'IOProviderClass' = IOPlatformDevice;"
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++    "     'IONameMatch'     = 'samsung,a5xelte-display';"
++#else
+     "     'IONameMatch'     = 'sweet,display';"
++#endif
+     "   },"
++#if !defined(ARM64_BOARD_CONFIG_A5XELTE)
+     "   {"
+     "     'IOClass'         = SweetHIDButtons;"
+     "     'IOProviderClass' = IOResources;"
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index c86b9e7..d0322b5 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -268,6 +268,8 @@ _cnputc(char c, bool poll)
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern void sweet_log_append(const char *c, int size);  /* bsd/dev/sweet_ufs.c */
++#endif
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ /*
+  * Set by AppleCLCD (boot-arg sweetfb_noconsole=1) once the GUI presents:
+  * console text still goes to the persistent log, but is not drawn over
+@@ -283,6 +285,8 @@ _cnputs(char *c, int size, bool poll)
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_log_append(c, size);
++#endif
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	if (sweet_console_muted && !panic_active()) {
+ 		return;
+ 	}

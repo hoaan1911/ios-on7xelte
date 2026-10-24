@@ -1,0 +1,127 @@
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+index ac54e10..0acd6ea 100644
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -1,14 +1,13 @@
+ /*
+  * Exynos7580 Mali-T720 resource service for Samsung a5xelte.
+  *
+- * Stage 1 intentionally claims no GPU capability: no PMU/CMU/GPU MMIO,
+- * clock, regulator, interrupt, memory manager or user client is touched.
+- * It gives the next stage a board-specific IOKit provider with the
+- * verified Linux resource map while keeping CPU display fallback intact.
++ * Stage 1 registers a resource-only IOKit service (a5gpu=1). Stage 2 can
++ * passively probe the PMU/clock gates and, only if they are already on,
++ * read GPU_ID (a5gpu=2). It does not write registers or claim acceleration.
+  *
+  * The Exynos7580 G3D domain needs an ordered BUCK4/bus/PMU/CMU sequence.
+- * Reading GPU_ID while it is power-gated can abort. Implement that
+- * bounded sequence before adding any GPU register probe here.
++ * Reading GPU_ID while power-gated can abort. Active power-up and job
++ * submission require a separately verified BUCK4/bus/PMU/CMU sequence.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -17,6 +16,78 @@
+ #include <IOKit/IOLib.h>
+ #include <pexpert/pexpert.h>
+ 
++/* The IOKit exported machine header omits these kernel-private mappings. */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" void ml_io_unmap(vm_offset_t addr, vm_size_t size);
++
++/* Passive probe of the already-powered GPU only. All offsets are from the
++ * native Exynos7580 Linux G3D clock/PMU driver. A powered-off GPU register
++ * access can abort XNU, so the PMU and both CMU gate banks are checked first.
++ */
++static uint32_t
++a5g3d_read32(vm_offset_t base, vm_offset_t offset)
++{
++    return *reinterpret_cast<volatile uint32_t *>(base + offset);
++}
++
++static void
++a5g3d_probe_existing_power(IOService *service)
++{
++    vm_offset_t pmu = ml_io_map(0x10464000, 0x1000);
++    if (!pmu) {
++        service->setProperty("A5G3DProbeResult", "pmu-map-failed");
++        return;
++    }
++    uint32_t power = a5g3d_read32(pmu, 0x64);
++    service->setProperty("A5G3DPMUStatus", static_cast<uint64_t>(power), 32);
++    if ((power & 0xf) != 0xf) {
++        service->setProperty("A5G3DProbeResult", "power-off");
++        IOLog("A5XELTE G3D: PMU off (%08x); GPU aperture untouched\n", power);
++        ml_io_unmap(pmu, 0x1000);
++        return;
++    }
++
++    vm_offset_t cmu = ml_io_map(0x11460000, 0x1000);
++    if (!cmu) {
++        service->setProperty("A5G3DProbeResult", "cmu-map-failed");
++        ml_io_unmap(pmu, 0x1000);
++        return;
++    }
++    uint32_t gate0 = a5g3d_read32(cmu, 0x800);
++    uint32_t gate1 = a5g3d_read32(cmu, 0x900);
++    service->setProperty("A5G3DGate0", static_cast<uint64_t>(gate0), 32);
++    service->setProperty("A5G3DGate1", static_cast<uint64_t>(gate1), 32);
++    /* The native Linux clk enable path sets bits 0, 1 and 4 in both banks. */
++    if ((gate0 & 0x13) != 0x13 || (gate1 & 0x13) != 0x13 ||
++        (a5g3d_read32(pmu, 0x64) & 0xf) != 0xf) {
++        service->setProperty("A5G3DProbeResult", "clock-gated");
++        IOLog("A5XELTE G3D: clock gate off (%08x/%08x); GPU aperture untouched\n",
++            gate0, gate1);
++        ml_io_unmap(cmu, 0x1000);
++        ml_io_unmap(pmu, 0x1000);
++        return;
++    }
++
++    vm_offset_t gpu = ml_io_map(0x11400000, 0x1000);
++    if (!gpu) {
++        service->setProperty("A5G3DProbeResult", "gpu-map-failed");
++        ml_io_unmap(cmu, 0x1000);
++        ml_io_unmap(pmu, 0x1000);
++        return;
++    }
++    /* GPU_ID at +0x0, decoded by Panfrost as product bits 31:16. */
++    uint32_t id = a5g3d_read32(gpu, 0);
++    uint32_t product = id >> 16;
++    service->setProperty("A5G3DGPUId", static_cast<uint64_t>(id), 32);
++    service->setProperty("A5G3DProduct", static_cast<uint64_t>(product), 32);
++    service->setProperty("A5G3DProbeResult", product == 0x720 ? "mali-t720" : "unexpected-id");
++    IOLog("A5XELTE G3D: passive GPU_ID=%08x product=%04x (expected 0720); no GPU jobs\n",
++        id, product);
++    ml_io_unmap(gpu, 0x1000);
++    ml_io_unmap(cmu, 0x1000);
++    ml_io_unmap(pmu, 0x1000);
++}
++
+ class A5XELTEGPU : public IOService {
+     OSDeclareDefaultStructors(A5XELTEGPU);
+ 
+@@ -30,7 +101,8 @@ bool
+ A5XELTEGPU::start(IOService *provider)
+ {
+     int enabled = 0;
+-    if (!PE_parse_boot_argn("a5gpu", &enabled, sizeof(enabled)) || enabled != 1) {
++    if (!PE_parse_boot_argn("a5gpu", &enabled, sizeof(enabled)) ||
++        (enabled != 1 && enabled != 2)) {
+         return false; /* a5gpu=0, the safe default */
+     }
+     if (!IOService::start(provider)) {
+@@ -50,9 +122,12 @@ A5XELTEGPU::start(IOService *provider)
+     setProperty("A5G3DJobSPI", 282ULL, 32);
+     setProperty("A5G3DMMUSPI", 283ULL, 32);
+     setProperty("A5G3DGpuSPI", 281ULL, 32);
+-    setProperty("A5G3DDriverStage", "resources-only");
++    setProperty("A5G3DDriverStage", enabled == 2 ? "passive-id-probe" : "resources-only");
+     registerService();
+     IOLog("A5XELTE G3D: resource service registered; GPU power unchanged; CPU display active\n");
++    if (enabled == 2) {
++        a5g3d_probe_existing_power(this);
++    }
+     return true;
+ }
+ #endif /* ARM64_BOARD_CONFIG_A5XELTE */

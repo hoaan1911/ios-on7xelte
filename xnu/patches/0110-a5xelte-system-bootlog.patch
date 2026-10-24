@@ -1,0 +1,250 @@
+diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
+index 1fe580d..ffd011a 100644
+--- a/bsd/dev/a5xelte_emmc.c
++++ b/bsd/dev/a5xelte_emmc.c
+@@ -2,8 +2,9 @@
+  * Exynos7580 DesignWare eMMC bring-up.
+  *
+  * The Samsung bootloader has already selected the eMMC user area and set up
+- * its clocks and pads. Do not reset that state. SYSTEM stays read-only;
+- * writes require emmcroot=USERDATA and emmcwrite=1 and stay within that GPT range.
++ * its clocks and pads. Do not reset that state. Root writes require
++ * emmcroot=USERDATA and emmcwrite=1. An opt-in console log uses only the
++ * first 4 MiB + 512 bytes of the GPT-verified SYSTEM partition.
+  * The host register map and FIFO width rules follow the working downstream
+  * dw_mmc / dw_mmc-exynos driver for the SM-A510F.
+  */
+@@ -18,11 +19,19 @@
+ #include <sys/uio.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
++#include <kern/sched_prim.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
++#include <machine/atomic.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++
++#define A5_LOG_SIZE   (4u << 20)
++#define A5_LOG_SECTORS (1u + A5_LOG_SIZE / 512u)
+ 
+ #define EMMC_CTRL       0x000u
+ #define EMMC_PWREN      0x004u
+@@ -66,6 +75,11 @@ static char emmc_partition_name[16] = "SYSTEM";
+ static dev_t emmc_bdev;
+ static bool emmc_ready;
+ static bool emmc_writable;
++static uint64_t emmc_log_first_lba, emmc_log_nsectors;
++static bool emmc_log_enabled;
++static char emmc_log_ring[A5_LOG_SIZE];
++static uint64_t _Atomic emmc_log_total;
++static int emmc_log_chan;
+ static LCK_GRP_DECLARE(a5xelte_emmc_grp, "a5xelte_emmc");
+ static LCK_MTX_DECLARE(a5xelte_emmc_lock, &a5xelte_emmc_grp);
+ 
+@@ -194,7 +208,12 @@ emmc_write_sector(uint32_t lba, const uint8_t *sector)
+ 	uint32_t ints = emmc_rd(EMMC_INTMASK);
+ 	int error = 0;
+ 
+-	if (!emmc_writable || strcmp(emmc_partition_name, "USERDATA")) {
++	uint64_t address = lba;
++	bool root_write = emmc_writable && address >= emmc_first_lba &&
++	    address - emmc_first_lba < emmc_nsectors;
++	bool log_write = emmc_log_enabled && address >= emmc_log_first_lba &&
++	    address - emmc_log_first_lba < A5_LOG_SECTORS;
++	if (!root_write && !log_write) {
+ 		return EROFS;
+ 	}
+ 	if (width > 2 || ver == 0 || ver == 0xffff ||
+@@ -321,6 +340,8 @@ emmc_find_root_partition(void)
+ 	}
+ 	emmc_first_lba = 0;
+ 	emmc_nsectors = 0;
++	emmc_log_first_lba = 0;
++	emmc_log_nsectors = 0;
+ 	int error = emmc_read_sector(1, hdr);
+ 	if (error) {
+ 		return error;
+@@ -359,6 +380,8 @@ emmc_find_root_partition(void)
+ 		for (uint32_t j = 0; j < 4; j++) {
+ 			const uint8_t *p = entry + j * 128;
+ 			bool match = true;
++			bool system_match = true;
++			static const char system_name[] = "SYSTEM";
+ 			for (unsigned k = 0; k <= strlen(emmc_partition_name); k++) {
+ 				if (p[56 + k * 2] != (uint8_t)emmc_partition_name[k] ||
+ 				    p[57 + k * 2] != 0) {
+@@ -366,14 +389,27 @@ emmc_find_root_partition(void)
+ 					break;
+ 				}
+ 			}
+-			if (match) {
++			for (unsigned k = 0; k < sizeof(system_name); k++) {
++				if (p[56 + k * 2] != (uint8_t)system_name[k] ||
++				    p[57 + k * 2] != 0) {
++					system_match = false;
++					break;
++				}
++			}
++			if (match || system_match) {
+ 				uint64_t first = emmc_le64(p + 32);
+ 				uint64_t last = emmc_le64(p + 40);
+ 				if (first < first_usable || last > last_usable || first > last) {
+ 					return EINVAL;
+ 				}
+-				emmc_first_lba = first;
+-				emmc_nsectors = last - first + 1;
++				if (match) {
++					emmc_first_lba = first;
++					emmc_nsectors = last - first + 1;
++				}
++				if (system_match) {
++					emmc_log_first_lba = first;
++					emmc_log_nsectors = last - first + 1;
++				}
+ 			}
+ 		}
+ 	}
+@@ -381,6 +417,11 @@ emmc_find_root_partition(void)
+ 		printf("A5XELTE eMMC: GPT entries CRC mismatch\n");
+ 		return EIO;
+ 	}
++	if (emmc_log_first_lba == emmc_first_lba && emmc_log_nsectors &&
++	    strcmp(emmc_partition_name, "SYSTEM") == 0) {
++		/* A log writer must never overlap the selected root. */
++		emmc_log_nsectors = 0;
++	}
+ 	if (!emmc_nsectors) {
+ 		printf("A5XELTE eMMC: %s partition not found\n", emmc_partition_name);
+ 		return ENXIO;
+@@ -582,6 +623,94 @@ static const struct cdevsw emmc_cdevsw = {
+ 	.d_reserved_2 = eno_putc, .d_type = D_DISK,
+ };
+ 
++/* _cnputs may execute in any context. Keep this path free of locks and I/O. */
++void a5xelte_log_append(const char *c, int size);
++void
++a5xelte_log_append(const char *c, int size)
++{
++	if (size <= 0) {
++		return;
++	}
++	uint64_t at = os_atomic_add_orig(&emmc_log_total, (uint64_t)size, relaxed);
++	for (int i = 0; i < size; i++) {
++		emmc_log_ring[(at + (uint64_t)i) % A5_LOG_SIZE] = c[i];
++	}
++}
++
++struct a5_log_header {
++	char magic[8];
++	uint32_t version, size;
++	uint64_t total, seq;
++};
++
++static void
++emmc_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t flushed = 0, seq = 0;
++	uint8_t sector[512];
++	for (;;) {
++		(void)tsleep(&emmc_log_chan, PZERO, "a5log", hz * 10);
++		uint64_t total = os_atomic_load(&emmc_log_total, relaxed);
++		if (total == flushed) {
++			continue;
++		}
++		uint64_t pos = total - flushed >= A5_LOG_SIZE ? total - A5_LOG_SIZE : flushed;
++		int error = 0;
++		lck_mtx_lock(&a5xelte_emmc_lock);
++		while (pos < total && !error) {
++			uint32_t block = (uint32_t)((pos % A5_LOG_SIZE) / 512u);
++			uint64_t lba = emmc_log_first_lba + 1u + block;
++			if (lba >= emmc_log_first_lba + A5_LOG_SECTORS || lba > UINT32_MAX) {
++				error = EINVAL;
++				break;
++			}
++			memcpy(sector, emmc_log_ring + (size_t)block * 512u, 512u);
++			error = emmc_write_sector((uint32_t)lba, sector);
++			pos += 512u - (pos & 511u);
++		}
++		if (!error) {
++			struct a5_log_header h = {
++				.magic = { 'A', '5', 'X', 'L', 'O', 'G', '1', '\0' },
++				.version = 1, .size = A5_LOG_SIZE, .total = total, .seq = ++seq,
++			};
++			memset(sector, 0, sizeof(sector));
++			memcpy(sector, &h, sizeof(h));
++			error = emmc_write_sector((uint32_t)emmc_log_first_lba, sector);
++		}
++		lck_mtx_unlock(&a5xelte_emmc_lock);
++		if (error) {
++			printf("A5XELTE LOG: write failed (%d), stopping\n", error);
++			return;
++		}
++		flushed = total;
++	}
++}
++
++static void
++emmc_log_start(void)
++{
++	int enabled = 0;
++	thread_t thread;
++	(void)PE_parse_boot_argn("a5log", &enabled, sizeof(enabled));
++	if (enabled != 1 || !emmc_ready || !emmc_writable ||
++	    strcmp(emmc_partition_name, "USERDATA") ||
++	    emmc_log_nsectors < A5_LOG_SECTORS ||
++	    emmc_log_first_lba == 0 ||
++	    (emmc_log_first_lba < emmc_first_lba + emmc_nsectors &&
++	    emmc_first_lba < emmc_log_first_lba + A5_LOG_SECTORS) ||
++	    emmc_log_first_lba + A5_LOG_SECTORS - 1 > UINT32_MAX) {
++		return;
++	}
++	emmc_log_enabled = true;
++	printf("A5XELTE LOG: SYSTEM GPT first=%llu, %u sectors reserved\n",
++	    emmc_log_first_lba, A5_LOG_SECTORS);
++	if (kernel_thread_start(emmc_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		emmc_log_enabled = false;
++	}
++}
++
+ int
+ a5xelte_emmc_rootdev(dev_t *dev)
+ {
+@@ -608,6 +737,7 @@ a5xelte_emmc_rootdev(dev_t *dev)
+ 		emmc_ready = true;
+ 		printf("A5XELTE eMMC: /dev/emmcroot0 ready, GPT %s %s\n",
+ 		    emmc_partition_name, emmc_writable ? "writable" : "read-only");
++		emmc_log_start();
+ 	}
+ 	*dev = emmc_bdev;
+ 	return 0;
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index d0322b5..2ab4334 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -269,6 +269,9 @@ _cnputc(char c, bool poll)
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern void sweet_log_append(const char *c, int size);  /* bsd/dev/sweet_ufs.c */
+ #endif
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++extern void a5xelte_log_append(const char *c, int size); /* bsd/dev/a5xelte_emmc.c */
++#endif
+ #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ /*
+  * Set by AppleCLCD (boot-arg sweetfb_noconsole=1) once the GUI presents:
+@@ -286,6 +289,9 @@ _cnputs(char *c, int size, bool poll)
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_log_append(c, size);
+ #endif
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	a5xelte_log_append(c, size);
++#endif
+ #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	if (sweet_console_muted && !panic_active()) {
+ 		return;

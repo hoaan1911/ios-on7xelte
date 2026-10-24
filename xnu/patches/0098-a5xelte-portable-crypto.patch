@@ -1,0 +1,214 @@
+diff --git a/libkern/crypto/corecrypto_aes.c b/libkern/crypto/corecrypto_aes.c
+index 384abb6..9f20dd4 100644
+--- a/libkern/crypto/corecrypto_aes.c
++++ b/libkern/crypto/corecrypto_aes.c
+@@ -32,7 +32,7 @@
+ #include <corecrypto/ccaes.h>
+ #include <kern/debug.h>
+ 
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ /* SWEET has a built-in portable AES provider for the legacy CBC/ECB API. */
+ extern const struct ccmode_cbc sweet_aes_cbc_encrypt;
+ extern const struct ccmode_cbc sweet_aes_cbc_decrypt;
+diff --git a/libkern/crypto/corecrypto_md5.c b/libkern/crypto/corecrypto_md5.c
+index e9bbc42..65a34eb 100644
+--- a/libkern/crypto/corecrypto_md5.c
++++ b/libkern/crypto/corecrypto_md5.c
+@@ -17,7 +17,7 @@ setCount(MD5_CTX *ctx, uint64_t count)
+ }
+ 
+ /* Copy a ccdigest ctx into a legacy MD5 context */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ /*
+  * SWEET has no corecrypto kext (g_crypto_funcs stays NULL). MD5 uses
+  * BearSSL's portable implementation (libkern/crypto/sweet_md5.c), with
+diff --git a/libkern/crypto/corecrypto_sha1.c b/libkern/crypto/corecrypto_sha1.c
+index 409533d..1ec1708 100644
+--- a/libkern/crypto/corecrypto_sha1.c
++++ b/libkern/crypto/corecrypto_sha1.c
+@@ -16,7 +16,7 @@ setCount(SHA1_CTX *ctx, uint64_t count)
+ 	ctx->c.b64[0] = count;
+ }
+ 
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ /*
+  * SWEET has no corecrypto kext (g_crypto_funcs stays NULL). SHA-1 uses
+  * BearSSL's portable implementation (libkern/crypto/sweet_sha1.c), with
+diff --git a/libkern/crypto/corecrypto_sha2.c b/libkern/crypto/corecrypto_sha2.c
+index c954dd2..37eed68 100644
+--- a/libkern/crypto/corecrypto_sha2.c
++++ b/libkern/crypto/corecrypto_sha2.c
+@@ -34,7 +34,7 @@
+ 
+ #if defined(CRYPTO_SHA2)
+ 
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ /*
+  * SWEET has no corecrypto kext, so g_crypto_funcs stays NULL. SHA-256 uses
+  * XNU's built-in implementation directly, as the SWEET PRNG does; this also
+@@ -84,7 +84,7 @@ SHA256_Final(void *digest, SHA256_CTX *ctx)
+ 	ccdigest_final(di, ctx->ctx, digest);
+ }
+ 
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include "sweet_bearssl/inc/bearssl_hash.h"
+ 
+ _Static_assert(sizeof(br_sha384_context) <= sizeof(SHA512_CTX),
+diff --git a/libkern/crypto/sweet_aes.c b/libkern/crypto/sweet_aes.c
+index 21be4eb..f4c23ad 100644
+--- a/libkern/crypto/sweet_aes.c
++++ b/libkern/crypto/sweet_aes.c
+@@ -4,7 +4,7 @@
+  * No heap, SIMD or CPU crypto extension is needed. Contexts can be copied:
+  * their only pointer is the immutable BearSSL class descriptor.
+  */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include <libkern/libkern.h>
+ #include <libkern/crypto/aes.h>
+ #include <corecrypto/ccmode.h>
+diff --git a/libkern/crypto/sweet_aes_ct.c b/libkern/crypto/sweet_aes_ct.c
+index 684003b..2fbe11f 100644
+--- a/libkern/crypto/sweet_aes_ct.c
++++ b/libkern/crypto/sweet_aes_ct.c
+@@ -1,4 +1,4 @@
+ /* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include "sweet_bearssl/src/symcipher/aes_ct.c"
+ #endif
+diff --git a/libkern/crypto/sweet_aes_ct_cbcdec.c b/libkern/crypto/sweet_aes_ct_cbcdec.c
+index ea26fbb..7abab80 100644
+--- a/libkern/crypto/sweet_aes_ct_cbcdec.c
++++ b/libkern/crypto/sweet_aes_ct_cbcdec.c
+@@ -1,4 +1,4 @@
+ /* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include "sweet_bearssl/src/symcipher/aes_ct_cbcdec.c"
+ #endif
+diff --git a/libkern/crypto/sweet_aes_ct_cbcenc.c b/libkern/crypto/sweet_aes_ct_cbcenc.c
+index 83ab8c3..ccbe834 100644
+--- a/libkern/crypto/sweet_aes_ct_cbcenc.c
++++ b/libkern/crypto/sweet_aes_ct_cbcenc.c
+@@ -1,4 +1,4 @@
+ /* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include "sweet_bearssl/src/symcipher/aes_ct_cbcenc.c"
+ #endif
+diff --git a/libkern/crypto/sweet_aes_ct_dec.c b/libkern/crypto/sweet_aes_ct_dec.c
+index 52e2d6a..972d1aa 100644
+--- a/libkern/crypto/sweet_aes_ct_dec.c
++++ b/libkern/crypto/sweet_aes_ct_dec.c
+@@ -1,4 +1,4 @@
+ /* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include "sweet_bearssl/src/symcipher/aes_ct_dec.c"
+ #endif
+diff --git a/libkern/crypto/sweet_aes_ct_enc.c b/libkern/crypto/sweet_aes_ct_enc.c
+index 6827157..31fd1bb 100644
+--- a/libkern/crypto/sweet_aes_ct_enc.c
++++ b/libkern/crypto/sweet_aes_ct_enc.c
+@@ -1,4 +1,4 @@
+ /* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include "sweet_bearssl/src/symcipher/aes_ct_enc.c"
+ #endif
+diff --git a/libkern/crypto/sweet_dec32be.c b/libkern/crypto/sweet_dec32be.c
+index 7415ae8..11f93a5 100644
+--- a/libkern/crypto/sweet_dec32be.c
++++ b/libkern/crypto/sweet_dec32be.c
+@@ -1,4 +1,4 @@
+ /* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include "sweet_bearssl/src/codec/dec32be.c"
+ #endif
+diff --git a/libkern/crypto/sweet_dec32le.c b/libkern/crypto/sweet_dec32le.c
+index cc0414e..c9da564 100644
+--- a/libkern/crypto/sweet_dec32le.c
++++ b/libkern/crypto/sweet_dec32le.c
+@@ -1,4 +1,4 @@
+ /* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include "sweet_bearssl/src/codec/dec32le.c"
+ #endif
+diff --git a/libkern/crypto/sweet_dec64be.c b/libkern/crypto/sweet_dec64be.c
+index 15d924c..505a00c 100644
+--- a/libkern/crypto/sweet_dec64be.c
++++ b/libkern/crypto/sweet_dec64be.c
+@@ -1,4 +1,4 @@
+ /* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include "sweet_bearssl/src/codec/dec64be.c"
+ #endif
+diff --git a/libkern/crypto/sweet_enc32be.c b/libkern/crypto/sweet_enc32be.c
+index 179919b..fdbb88d 100644
+--- a/libkern/crypto/sweet_enc32be.c
++++ b/libkern/crypto/sweet_enc32be.c
+@@ -1,4 +1,4 @@
+ /* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include "sweet_bearssl/src/codec/enc32be.c"
+ #endif
+diff --git a/libkern/crypto/sweet_enc32le.c b/libkern/crypto/sweet_enc32le.c
+index ab7dbd1..4a3d92a 100644
+--- a/libkern/crypto/sweet_enc32le.c
++++ b/libkern/crypto/sweet_enc32le.c
+@@ -1,4 +1,4 @@
+ /* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include "sweet_bearssl/src/codec/enc32le.c"
+ #endif
+diff --git a/libkern/crypto/sweet_enc64be.c b/libkern/crypto/sweet_enc64be.c
+index b9a8e87..8d3cd0e 100644
+--- a/libkern/crypto/sweet_enc64be.c
++++ b/libkern/crypto/sweet_enc64be.c
+@@ -1,4 +1,4 @@
+ /* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include "sweet_bearssl/src/codec/enc64be.c"
+ #endif
+diff --git a/libkern/crypto/sweet_md5.c b/libkern/crypto/sweet_md5.c
+index 2832b92..320309a 100644
+--- a/libkern/crypto/sweet_md5.c
++++ b/libkern/crypto/sweet_md5.c
+@@ -1,4 +1,4 @@
+ /* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include "sweet_bearssl/src/hash/md5.c"
+ #endif
+diff --git a/libkern/crypto/sweet_sha1.c b/libkern/crypto/sweet_sha1.c
+index 77365ed..106947d 100644
+--- a/libkern/crypto/sweet_sha1.c
++++ b/libkern/crypto/sweet_sha1.c
+@@ -1,4 +1,4 @@
+ /* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include "sweet_bearssl/src/hash/sha1.c"
+ #endif
+diff --git a/libkern/crypto/sweet_sha2big.c b/libkern/crypto/sweet_sha2big.c
+index a405254..8bd227f 100644
+--- a/libkern/crypto/sweet_sha2big.c
++++ b/libkern/crypto/sweet_sha2big.c
+@@ -1,4 +1,4 @@
+ /* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include "sweet_bearssl/src/hash/sha2big.c"
+ #endif

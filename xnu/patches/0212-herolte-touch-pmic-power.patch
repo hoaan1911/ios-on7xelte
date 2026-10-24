@@ -1,0 +1,219 @@
+diff --git a/bsd/dev/herolte_touch.c b/bsd/dev/herolte_touch.c
+index 8e826a5..846872d 100644
+--- a/bsd/dev/herolte_touch.c
++++ b/bsd/dev/herolte_touch.c
+@@ -6,9 +6,13 @@
+  * events with READ_ONE_EVENT (0x71). Polled (no XNU IRQ for the GPIO), in
+  * its own thread so boot never waits on the bus.
+  *
+- * Supplies tsp_io/tsp_avdd are S2MPS16 LDO32/LDO33 on the PMIC bus that the
+- * APM firmware shares; they are not touched here. If S-Boot left them off
+- * the chip does not ACK, and that is logged. Boot-arg herotouch=0 disables.
++ * Supplies tsp_io/tsp_avdd are S2MPS16 (0x66) LDO32 (1.85 V) and LDO33
++ * (3.3 V), off after S-Boot (SDA/SCL and INT read low). The PMIC sits on
++ * HSI2C 0x10550000, shared with the APM firmware: like Linux
++ * (i2c-exynos5.c exynos5_i2c_xfer_batcher) every PMIC transfer goes through
++ * the controller's batcher, which takes the AP/APM hardware semaphore. The
++ * LDOs are switched on only if their programmed voltage is the expected one.
++ * Boot-arg herotouch=0 disables everything here.
+  */
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ #include <sys/param.h>
+@@ -56,7 +60,26 @@ void herolte_touch_probe(void);
+ 
+ #define HT_FINGERS      10
+ 
+-static vm_offset_t ht_alive, ht_pins, ht_i2c;
++/* PMIC bus: HSI2C 0x10550000 batcher (offsets from i2c-exynos5.c). */
++#define PM_HSI2C_PA     0x10550000u
++#define PM_ADDR         0x66u
++#define PM_SMRELEASE    0x200
++#define PM_BAT_CON      0x500
++#define PM_BAT_STATE    0x504
++#define PM_BAT_INT_EN   0x508
++#define PM_BAT_INT_STAT 0x510
++#define PM_BAT_OPCODE   0x600
++#define PM_PAYLOAD      0x1000
++#define PM_PAYLOAD_END  0x1060
++#define S2MPS16_L32CTRL 0x5c    /* tsp_io: 0.7 V + 25 mV * sel */
++#define S2MPS16_L33CTRL 0x5d    /* tsp_avdd: 1.8 V + 25 mV * sel */
++#define S2MPS16_SEL_1V85 0x2e
++#define S2MPS16_SEL_3V3 0x3c
++#define S2MPS16_ENABLE  0xc0u
++
++static vm_offset_t ht_alive, ht_pins, ht_i2c, ht_pm;
++static uint32_t pm_cmd_buffer;
++static unsigned pm_cmd_index, pm_cmd_pointer, pm_desc;
+ static int ht_sleep;
+ static bool ht_down[HT_FINGERS];
+ static int ht_x[HT_FINGERS], ht_y[HT_FINGERS];
+@@ -86,6 +109,144 @@ ht_msleep(unsigned ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/* Batcher program: register offsets as opcodes, 4 per word; 0xff ends it. */
++static void
++pm_batch(uint32_t value, uint32_t reg)
++{
++	if (PM_PAYLOAD + pm_desc * 4 > PM_PAYLOAD_END) {
++		return;
++	}
++	pm_cmd_buffer &= ~(0xffu << (8 * pm_cmd_index));
++	pm_cmd_buffer |= reg << (8 * pm_cmd_index);
++	ht_wr(ht_pm, PM_BAT_OPCODE + pm_cmd_pointer * 4, pm_cmd_buffer);
++	ht_wr(ht_pm, PM_PAYLOAD + pm_desc++ * 4, value);
++	if (++pm_cmd_index == 4) {
++		pm_cmd_index = 0;
++		pm_cmd_pointer++;
++		pm_cmd_buffer = 0xffffffffu;
++	}
++}
++
++/* One PMIC message through the batcher, as exynos5_i2c_xfer_batcher. */
++static bool
++pm_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
++{
++	uint32_t read_at;
++	uint32_t state = 0;
++
++	pm_cmd_buffer = 0xffffffffu;
++	pm_cmd_index = pm_cmd_pointer = pm_desc = 0;
++	ht_wr(ht_pm, PM_BAT_CON, 0);                                    /* idle */
++	ht_wr(ht_pm, PM_BAT_CON, ht_rd(ht_pm, PM_BAT_CON) | 3u);        /* enable, dedicate */
++	/* hs_clock 3 MHz (DTB clock-frequency) and the fixed FS timing. */
++	pm_batch((7u << 24) | (7u << 16) | (7u << 8) | 7u, 0x54);
++	pm_batch((0xfu << 16) | (3u << 24) | (7u << 8) | 1u, 0x58);
++	pm_batch(8u, 0x5c);
++	pm_batch(3u, HSI2C_SLA);
++	pm_batch((38u << 24) | (38u << 16) | (38u << 8), HSI2C_FS1);
++	pm_batch((0xfu << 16) | (19u << 24) | (38u << 8) | 38u, HSI2C_FS2);
++	pm_batch((1u << 16) | 76u, HSI2C_FS3);
++	pm_batch(0x2ffu, HSI2C_TRAILING);
++	pm_batch((receive ? (1u << 30) : 0) | (1u << 29) | (1u << 31) | (3u << 16) | (3u << 13) |
++	    (1u << 28) | (1u << 27) | 0xffu, HSI2C_CONF);
++	pm_batch(0, HSI2C_TIMEOUT);
++	pm_batch(3u | (8u << 16) | (count << 4), HSI2C_FIFO_CTL);
++	pm_batch((1u << 3) | (receive ? ((1u << 6) | (1u << 30)) : (1u << 7)), HSI2C_CTL);
++	pm_batch(PM_ADDR << 10, HSI2C_ADDR);
++	pm_batch((receive ? (1u << 16) : 0) | (stop ? (1u << 17) : 0) | count | (1u << 31),
++	    HSI2C_AUTO_CONF);
++	ht_wr(ht_pm, PM_BAT_INT_STAT, ht_rd(ht_pm, PM_BAT_INT_STAT));
++	pm_batch(receive ? (1u << 1) : ((1u << 0) | (1u << 7)), HSI2C_INT_EN);
++	read_at = PM_PAYLOAD + pm_desc * 4;
++	for (unsigned n = 0; n < count; n++) {
++		pm_batch(receive ? 0x77u : bytes[n], receive ? HSI2C_RX_DATA : HSI2C_TX_DATA);
++	}
++	pm_batch(0, 0xff);
++	/* Start: the batcher waits for the APM semaphore, runs, releases it. */
++	ht_wr(ht_pm, PM_BAT_INT_EN, 1u);
++	ht_wr(ht_pm, PM_BAT_CON, ht_rd(ht_pm, PM_BAT_CON) | (1u << 4));
++	for (unsigned us = 0; us < 500000; us++) {
++		state = ht_rd(ht_pm, PM_BAT_STATE);
++		if (state & 3u) {
++			break;
++		}
++		delay(1);
++	}
++	ht_wr(ht_pm, PM_BAT_INT_EN, 0);
++	if ((state & 3u) != 1u) {
++		printf("HEROLTE PMIC: batcher %s failed state=%#x int=%#x fifo=%#x\n",
++		    receive ? "rx" : "tx", state, ht_rd(ht_pm, PM_BAT_INT_STAT),
++		    ht_rd(ht_pm, 0x50c));
++		/* Linux recover_batcher: reset only if stuck in CONFIG..CLEAN_INTR. */
++		if (state >= (1u << 6) && state <= (1u << 13)) {
++			ht_wr(ht_pm, PM_BAT_CON, 1u << 31);
++			ht_wr(ht_pm, PM_BAT_CON, 0);
++			ht_wr(ht_pm, PM_SMRELEASE, 1u);
++		}
++		ht_wr(ht_pm, PM_BAT_STATE, ht_rd(ht_pm, PM_BAT_STATE) | 1u);
++		ht_wr(ht_pm, PM_BAT_CON, 0);
++		return false;
++	}
++	if (receive) {
++		for (unsigned n = 0; n < count; n++) {
++			bytes[n] = (uint8_t)ht_rd(ht_pm, read_at + n * 4);
++		}
++	}
++	ht_wr(ht_pm, PM_BAT_STATE, state | 1u);
++	ht_wr(ht_pm, PM_BAT_INT_STAT, ht_rd(ht_pm, PM_BAT_INT_STAT));
++	ht_wr(ht_pm, PM_BAT_CON, 0);
++	return true;
++}
++
++/* regmap-style register access: [reg] then read without a STOP between. */
++static bool
++pm_read(uint8_t reg, uint8_t *value)
++{
++	return pm_message(false, &reg, 1, false) && pm_message(true, value, 1, true);
++}
++
++static bool
++pm_write(uint8_t reg, uint8_t value)
++{
++	uint8_t data[2] = {reg, value};
++	return pm_message(false, data, 2, true);
++}
++
++/* Switch on tsp_io (LDO32) then tsp_avdd (LDO33), as sec_ts_power(). */
++static bool
++pm_touch_power_on(void)
++{
++	uint8_t id = 0, l32 = 0, l33 = 0, c32 = 0, c33 = 0;
++
++	printf("HEROLTE PMIC: batcher con=%#x state=%#x (as found)\n",
++	    ht_rd(ht_pm, PM_BAT_CON), ht_rd(ht_pm, PM_BAT_STATE));
++	if (!pm_read(0x00, &id) || !pm_read(S2MPS16_L32CTRL, &l32) ||
++	    !pm_read(S2MPS16_L33CTRL, &l33)) {
++		printf("HEROLTE PMIC: S2MPS16 read failed\n");
++		return false;
++	}
++	printf("HEROLTE PMIC: S2MPS16 id=%#x L32CTRL=%#x L33CTRL=%#x\n", id, l32, l33);
++	if ((l32 & 0x3fu) != S2MPS16_SEL_1V85 || (l33 & 0x3fu) != S2MPS16_SEL_3V3) {
++		printf("HEROLTE PMIC: unexpected LDO32/33 voltage, leaving them off\n");
++		return false;
++	}
++	if (!(l32 & S2MPS16_ENABLE) && !pm_write(S2MPS16_L32CTRL, l32 | S2MPS16_ENABLE)) {
++		printf("HEROLTE PMIC: LDO32 enable failed\n");
++		return false;
++	}
++	delay(1000);
++	if (!(l33 & S2MPS16_ENABLE) && !pm_write(S2MPS16_L33CTRL, l33 | S2MPS16_ENABLE)) {
++		printf("HEROLTE PMIC: LDO33 enable failed\n");
++		return false;
++	}
++	if (!pm_read(S2MPS16_L32CTRL, &c32) || !pm_read(S2MPS16_L33CTRL, &c33)) {
++		printf("HEROLTE PMIC: LDO readback failed\n");
++		return false;
++	}
++	printf("HEROLTE PMIC: LDO32=%#x LDO33=%#x (on = bits 7:6 set)\n", c32, c33);
++	return (c32 & S2MPS16_ENABLE) && (c33 & S2MPS16_ENABLE);
++}
++
+ /*
+  * AUTO mode master, as the A5's Exynos HSI2C PMIC path (a5xelte_touch.c).
+  * FS timing tSCL_L = tSCL_H = 120 clocks with CLK_DIV 1: about 200 kHz
+@@ -258,6 +419,14 @@ ht_thread(__unused void *arg, __unused wait_result_t wr)
+ 	printf("HEROLTE TOUCH: HSI2C ctl=%#x conf=%#x fs1=%#x fs2=%#x fs3=%#x trans=%#x (as found)\n",
+ 	    ht_rd(ht_i2c, HSI2C_CTL), ht_rd(ht_i2c, HSI2C_CONF), ht_rd(ht_i2c, HSI2C_FS1),
+ 	    ht_rd(ht_i2c, HSI2C_FS2), ht_rd(ht_i2c, HSI2C_FS3), ht_rd(ht_i2c, HSI2C_TRANS));
++	if (!pm_touch_power_on()) {
++		printf("HEROLTE TOUCH: no supply; stopping\n");
++		return;
++	}
++	/* sec_ts_power() 5 ms, then probe waits 60 ms for the IC to boot. */
++	ht_msleep(70);
++	printf("HEROLTE TOUCH: powered: GPF1 dat=%#x (SDA/SCL should be high) GPA1 dat=%#x\n",
++	    ht_rd(ht_pins, 4), ht_rd(ht_alive, 0x24));
+ 	/* GPF1-0/1 to HSI2C (function 2), no pulls, as the DTB hs-i2c7-bus. */
+ 	ht_wr(ht_pins, 8, ht_rd(ht_pins, 8) & ~0xfu);
+ 	ht_wr(ht_pins, 0, (ht_rd(ht_pins, 0) & ~0xffu) | 0x22u);
+@@ -321,7 +490,8 @@ herolte_touch_probe(void)
+ 	ht_alive = ml_io_map(HT_ALIVE_PA, 0x1000);
+ 	ht_pins = ml_io_map(HT_PINS_PA, 0x1000);
+ 	ht_i2c = ml_io_map(HT_HSI2C_PA, 0x1000);
+-	if (!ht_alive || !ht_pins || !ht_i2c) {
++	ht_pm = ml_io_map(PM_HSI2C_PA, 0x2000);
++	if (!ht_alive || !ht_pins || !ht_i2c || !ht_pm) {
+ 		printf("HEROLTE TOUCH: MMIO mapping failed\n");
+ 		return;
+ 	}

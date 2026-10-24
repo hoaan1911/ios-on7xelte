@@ -1,0 +1,82 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index f365878..5b66c3a 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -920,6 +920,25 @@ La5_mmu_pixel:
+ 	msr		CPACR_EL1, x0
+ #endif
+ 
++#if defined(A5XELTE)
++	/* fp_enabled: write directly to the DECON scanout alias. */
++	MOV64	x10, 0x670a08c0
++	MOV64	x11, 0xff00ffff
++	mov	x12, #21
++	mov	x15, #4320
++La5_fp_enabled_row:
++	mov	x14, x10
++	mov	x13, #36
++La5_fp_enabled_pixel:
++	str	w11, [x14], #4
++	subs	x13, x13, #1
++	b.ne	La5_fp_enabled_pixel
++	add	x10, x10, x15
++	subs	x12, x12, #1
++	b.ne	La5_fp_enabled_row
++	dsb	sy
++#endif
++
+ 	// Clear thread pointer
+ 	msr		TPIDR_EL1, xzr						// Set thread register
+ 
+@@ -936,6 +955,25 @@ La5_mmu_pixel:
+ 
+ 	APPLY_TUNABLES x12, x13, x14
+ 
++#if defined(A5XELTE)
++	/* tunables_done: write directly to the DECON scanout alias. */
++	MOV64	x10, 0x670c24c0
++	MOV64	x11, 0xffff00ff
++	mov	x12, #21
++	mov	x15, #4320
++La5_tunables_done_row:
++	mov	x14, x10
++	mov	x13, #36
++La5_tunables_done_pixel:
++	str	w11, [x14], #4
++	subs	x13, x13, #1
++	b.ne	La5_tunables_done_pixel
++	add	x10, x10, x15
++	subs	x12, x12, #1
++	b.ne	La5_tunables_done_row
++	dsb	sy
++#endif
++
+ 
+ #if HAS_CLUSTER
+ 	// Unmask external IRQs if we're restarting from non-retention WFI
+@@ -964,6 +1002,25 @@ La5_mmu_pixel:
+ 	mov	lr, x21
+ #endif
+ 
++#if defined(A5XELTE)
++	/* arm_init_jump: write directly to the DECON scanout alias. */
++	MOV64	x10, 0x670e40c0
++	MOV64	x11, 0xffffff00
++	mov	x12, #21
++	mov	x15, #4320
++La5_arm_init_jump_row:
++	mov	x14, x10
++	mov	x13, #36
++La5_arm_init_jump_pixel:
++	str	w11, [x14], #4
++	subs	x13, x13, #1
++	b.ne	La5_arm_init_jump_pixel
++	add	x10, x10, x15
++	subs	x12, x12, #1
++	b.ne	La5_arm_init_jump_row
++	dsb	sy
++#endif
++
+ 	// Return to arm_init()
+ 	ret
+ 

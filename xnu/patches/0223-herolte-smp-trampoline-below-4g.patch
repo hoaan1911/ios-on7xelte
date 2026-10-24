@@ -1,0 +1,43 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2b73e31..b269868 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -23,6 +23,9 @@ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ #if defined(HEROLTE)
+ /* kern/sched_prim.h declares it for MACH_KERNEL_PRIVATE only. */
+ extern "C" processor_t thread_bind(processor_t processor);
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++/* Free page in the first DRAM bank, below the loader log page 0x8ffff000. */
++#define HEROLTE_SMP_TRAMPOLINE_PA 0x8fffe000u
+ #endif
+ #if defined(A5XELTE)
+ extern "C" void a5xelte_send_self_ipi(void);
+@@ -350,6 +353,28 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 		panic(CPU_PORT_NAME " CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
+ 	vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
++#if defined(HEROLTE)
++	/* With RAM in the second DRAM bank (0x880000000) CPU_ON returns 0 but
++	 * the core never arrives: the firmware keeps a 32-bit entry address.
++	 * Enter through a trampoline in the first bank instead, next to the
++	 * loader's log page (shim/herolte): ldr x16, =entry; br x16. x0 (the
++	 * context id) is left for sweet_secondary_entry. */
++	if (entry >> 32) {
++		static vm_offset_t trampoline;
++		if (trampoline == 0) {
++			trampoline = ml_io_map(HEROLTE_SMP_TRAMPOLINE_PA, PAGE_SIZE);
++		}
++		volatile uint32_t *code = (volatile uint32_t *)trampoline;
++		code[0] = 0x58000050;   /* ldr x16, #8 */
++		code[1] = 0xd61f0200;   /* br x16 */
++		code[2] = (uint32_t)entry;
++		code[3] = (uint32_t)((uint64_t)entry >> 32);
++		__builtin_arm_dsb(DSB_SY);
++		IOLog(CPU_PORT_NAME " CPU: cpu=%u entry 0x%llx via trampoline 0x%x\n",
++		    getCPUNumber(), (uint64_t)entry, HEROLTE_SMP_TRAMPOLINE_PA);
++		entry = HEROLTE_SMP_TRAMPOLINE_PA;
++	}
++#endif
+ 	IOLog(CPU_PORT_NAME " CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
+ 	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
+ 	__builtin_arm_dsb(DSB_SY);

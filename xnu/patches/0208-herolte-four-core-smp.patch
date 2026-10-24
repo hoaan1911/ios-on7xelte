@@ -1,0 +1,174 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index f870d0c..14eaf21 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -22,6 +22,7 @@ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ #if defined(A5XELTE)
+ extern "C" void a5xelte_send_self_ipi(void);
++extern "C" void a5xelte_send_ipi(unsigned int logical);
+ #define CPU_PORT_NAME "A5XELTE"
+ #else
+ #define CPU_PORT_NAME "SWEET"
+@@ -79,7 +80,14 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-#if defined(A5XELTE)
++#if defined(HEROLTE)
++	/* Logical 0..3 = MPIDR 0x100..0x103, the boot CPU's A53 cluster. */
++	if (cpu->phys_id != A5XELTE_BOOT_MPIDR + cpu->cpu_id ||
++	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++		panic(CPU_PORT_NAME " CPU: unsupported topology cpu=%u mpidr=0x%x count=%u",
++		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
++	}
++#elif defined(A5XELTE)
+ 	/* Only the boot CPU is described and tested on these boards. */
+ 	if (cpu->phys_id != A5XELTE_BOOT_MPIDR || topology->num_cpus != 1) {
+ 		panic(CPU_PORT_NAME " CPU: unsupported topology cpu=%u mpidr=0x%x count=%u",
+@@ -225,6 +233,16 @@ SweetCPU::initCPU(bool boot)
+ 	 * Waiting here with DAIF.I set would deadlock every secondary. */
+ 	signalCPU(this);
+ 	setCPUState(kIOCPUStateRunning);
++#if defined(HEROLTE)
++	if (getCPUNumber() != 0) {
++		/* As on the A5 (GICv2): a secondary enters at splsched with DAIF.I
++		 * set; take the queued self-SGI here, then restore the mask that
++		 * cpu_machine_init() expects. */
++		boolean_t old_irq = ml_set_interrupts_enabled(TRUE);
++		__builtin_arm_isb(ISB_SY);
++		ml_set_interrupts_enabled(old_irq);
++	}
++#endif
+ 	kprintf(CPU_PORT_NAME " CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u\n",
+ 	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
+ 	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
+@@ -234,7 +252,13 @@ SweetCPU::initCPU(bool boot)
+ void
+ SweetCPU::signalCPU(IOCPU *target)
+ {
+-#if defined(A5XELTE)
++#if defined(HEROLTE)
++	if (target == this) {
++		a5xelte_send_self_ipi();
++	} else {
++		a5xelte_send_ipi(target->getCPUNumber());
++	}
++#elif defined(A5XELTE)
+ 	if (target != this) {
+ 		panic("a5xelte: secondary CPU signalling is not enabled");
+ 	}
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 5b7ddb0..00b0198 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -306,11 +306,14 @@ LEXT(sweet_secondary_entry)
+ 	mov		x1, #3
+ 	msr		CNTHCTL_EL2, x1
+ 	msr		CNTVOFF_EL2, xzr
++	/* GICv2 on A5XELTE/HEROLTE has no ICC_SRE system-register interface. */
++#if !defined(A5XELTE)
+ 	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access. */
+ 	mrs		x1, ICC_SRE_EL2
+ 	orr		x1, x1, #1
+ 	orr		x1, x1, #8
+ 	msr		ICC_SRE_EL2, x1
++#endif
+ 	/* Known Armv8 SCTLR RES1 bits, M/C/I off, little endian. */
+ 	MOV64	x1, 0x30d00800
+ 	msr		SCTLR_EL1, x1
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 9b2e99f..c37636f 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -259,24 +259,52 @@ a5xelte_send_self_ipi(void)
+ 	a5_gic_write32(a5_gicd_base, 0xf00, (2U << 24) | 1U);
+ }
+ 
++#if defined(HEROLTE)
++/* GIC CPU-interface bit of each logical CPU (banked ITARGETSR0). */
++static uint8_t a5_gic_cpu_masks[SWEET_SMP_MAX_CPUS];
++
++void
++a5xelte_send_ipi(unsigned int logical)
++{
++	if (logical >= SWEET_SMP_MAX_CPUS || a5_gic_cpu_masks[logical] == 0) {
++		panic("herolte: GICv2 target CPU%u unavailable", logical);
++	}
++	__builtin_arm_dsb(DSB_ISHST);
++	a5_gic_write32(a5_gicd_base, 0xf00,
++	    ((uint32_t)a5_gic_cpu_masks[logical] << 16) | 1U);
++}
++#endif
++
+ void
+ pe_init_fiq(void)
+ {
+-	DTEntry entry;
+-	const void *reg;
+-	unsigned int size;
+-	if (SecureDTLookupEntry(NULL, "/arm-io/gic", &entry) != kSuccess ||
+-	    SecureDTGetProperty(entry, "reg", &reg, &size) != kSuccess ||
+-	    size < 4 * sizeof(uint64_t)) {
+-		panic("a5xelte: missing GICv2 reg in ADT");
++	/* Runs on every CPU. The boot CPU maps the controller before any
++	 * secondary starts; SecureDT iterators are not safe on secondaries. */
++	if (!a5_gicd_base) {
++		DTEntry entry;
++		const void *reg;
++		unsigned int size;
++		if (SecureDTLookupEntry(NULL, "/arm-io/gic", &entry) != kSuccess ||
++		    SecureDTGetProperty(entry, "reg", &reg, &size) != kSuccess ||
++		    size < 4 * sizeof(uint64_t)) {
++			panic("a5xelte: missing GICv2 reg in ADT");
++		}
++		const uint64_t *r = reg;
++		vm_offset_t soc = pe_arm_get_soc_base_phys();
++		a5_gicd_base = ml_io_map(soc + r[0], r[1]);
++		a5_gicc_base = ml_io_map(soc + r[2], r[3]);
+ 	}
+-	const uint64_t *r = reg;
+-	vm_offset_t soc = pe_arm_get_soc_base_phys();
+-	a5_gicd_base = ml_io_map(soc + r[0], r[1]);
+-	a5_gicc_base = ml_io_map(soc + r[2], r[3]);
+ 	if (!a5_gicd_base || !a5_gicc_base) {
+ 		panic("a5xelte: cannot map GICv2");
+ 	}
++#if defined(HEROLTE)
++	unsigned int logical = ml_get_cpu_number_local();
++	uint8_t mask = a5_gic_read32(a5_gicd_base, 0x800) & 0xff;
++	if (logical >= SWEET_SMP_MAX_CPUS || mask == 0 || (mask & (mask - 1)) != 0) {
++		panic("herolte: invalid GICv2 CPU%u target mask 0x%x", logical, mask);
++	}
++	a5_gic_cpu_masks[logical] = mask;
++#endif
+ 	/* INTID 27 is the virtual timer PPI; SGI 1 is the local self signal. */
+ 	a5_gic_write32(a5_gicd_base, 0x080,
+ 	    a5_gic_read32(a5_gicd_base, 0x080) | (1U << 27) | (1U << 1));
+diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
+index 47b0324..7a3ba54 100644
+--- a/pexpert/pexpert/arm64/A5XELTE.h
++++ b/pexpert/pexpert/arm64/A5XELTE.h
+@@ -8,12 +8,13 @@
+ #define A5XELTE                       1
+ /* Reuse donor's SoC-neutral early services until their guards are renamed. */
+ #define SWEET                         1
+-#define SWEET_SMP_MAX_CPUS            1
+ 
+ /* Firmware scanout buffer and the earliest XNU marker (physical). */
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ /* Galaxy S7 SM-G930F: S-Boot leaves DECON_F scanning out this buffer. */
+ #define HEROLTE                       1
++/* The four Cortex-A53 "Apollo" cores, MPIDR 0x100..0x103, via PSCI CPU_ON. */
++#define SWEET_SMP_MAX_CPUS            4
+ #define A5XELTE_FB_PA                 0xe2a00000
+ #define A5XELTE_FB_WIDTH              1440
+ #define A5XELTE_FB_HEIGHT             2560
+@@ -25,6 +26,7 @@
+ /* S-Boot starts on the Cortex-A53 "Apollo" cluster, Aff1 = 1. */
+ #define A5XELTE_BOOT_MPIDR            0x100
+ #else
++#define SWEET_SMP_MAX_CPUS            1
+ #define A5XELTE_FB_PA                 0x67000000
+ #define A5XELTE_FB_WIDTH              1080
+ #define A5XELTE_FB_HEIGHT             1920

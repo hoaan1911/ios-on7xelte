@@ -1,0 +1,41 @@
+diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
+index 329a2c1..a0c613a 100644
+--- a/bsd/dev/herolte_battery.c
++++ b/bsd/dev/herolte_battery.c
+@@ -1,7 +1,9 @@
+ /*
+  * HEROLTE (Galaxy S7 SM-G930F, Exynos 8890) fuel gauge: the MAX77854 FG
+- * (Linux max77854_fuelgauge.c, "sec-fuelgauge") at 0x36 on HSI2C_0
+- * 0x13640000, pins GPD1-0/1 function 2 (BOOT DTB hs-i2c0-bus). Read-only:
++ * (BOOT DTB /battery fuelgauge_name "max77854-fuelgauge"), 0x36 next to
++ * the MFD at 0x66 on HSI2C_1 0x13650000, pins GPD1-2/3 function 2
++ * (hs-i2c1-bus). HSI2C_0's sec-fuelgauge@36 is not on this board: no ACK
++ * there on the phone. Read-only:
+  * REPSOC 0x06 (1/256 %), REPCAP 0x05 and FULLCAP 0x10 (0.5 mAh with the
+  * 10 mOhm sense resistor), VCELL 0x09 (78.125 uV), CURRENT 0x0a (signed,
+  * 156.25 uA, positive = charging). Polled by SweetBattery's work loop.
+@@ -17,8 +19,9 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int herolte_fg_init(void);
+ int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah);
+ 
+-#define FG_HSI2C_PA     0x13640000u
++#define FG_HSI2C_PA     0x13650000u
+ #define FG_PINS_PA      0x136d0000u     /* GPI0 +0x00, GPD0 +0x20, GPD1 +0x40 */
++/* GPD1 pins 0/1 (HSI2C_0, speaker amp) are left as found. */
+ #define FG_GPD1         0x40
+ #define FG_ADDR         0x36u
+ #define FG_REPCAP       0x05
+@@ -178,9 +181,10 @@ herolte_fg_init(void)
+ 	printf("HEROLTE FG: GPD1 con=%#x dat=%#x pud=%#x; HSI2C ctl=%#x conf=%#x (as found)\n",
+ 	    con, fg_rd(fg_pins, FG_GPD1 + 4), fg_rd(fg_pins, FG_GPD1 + 8),
+ 	    fg_rd(fg_i2c, HSI2C_CTL), fg_rd(fg_i2c, HSI2C_CONF));
+-	/* GPD1-0/1 to HSI2C (function 2), no pulls, as the DTB hs-i2c0-bus. */
+-	fg_wr(fg_pins, FG_GPD1 + 8, fg_rd(fg_pins, FG_GPD1 + 8) & ~0xfu);
+-	fg_wr(fg_pins, FG_GPD1, (con & ~0xffu) | 0x22u);
++	/* GPD1-2/3 to HSI2C (function 2), no pulls, as the DTB hs-i2c1-bus.
++	 * The phone left them as outputs (con 0x1100). */
++	fg_wr(fg_pins, FG_GPD1 + 8, fg_rd(fg_pins, FG_GPD1 + 8) & ~0xf0u);
++	fg_wr(fg_pins, FG_GPD1, (con & ~0xff00u) | 0x2200u);
+ 	fg_bus_init();
+ 	uint16_t soc;
+ 	if (!fg_word(FG_REPSOC, &soc)) {

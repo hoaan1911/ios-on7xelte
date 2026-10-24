@@ -1,0 +1,188 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index e6210d3..6a40f85 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/a5xelte_emmc.c			standard
+ bsd/dev/herolte_ufs.c			standard
+ bsd/dev/herolte_touch.c			standard
+ bsd/dev/herolte_battery.c		standard
++bsd/dev/herolte_gpu.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/sweet_sample.c			standard
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+new file mode 100644
+index 0000000..a5df730
+--- /dev/null
++++ b/bsd/dev/herolte_gpu.c
+@@ -0,0 +1,156 @@
++/*
++ * HEROLTE (Galaxy S7 SM-G930F, Exynos 8890) Mali-T880 MP12, stage 1:
++ * read-only probe, as A5XELTE's 0126 did for its Mali-T720. From the stock
++ * BOOT DTB: mali@14AC0000 (0x5000, SPIs JOB 0xe1, MMU 0xe2, GPU 0xe0),
++ * CMU_G3D 0x14AA0000, PMU G3D domain CONFIGURATION/STATUS 0x105C4060/4064
++ * (exynos-snapshot reads CMU_G3D only when 0x105C4064 and 0x105C6104 say
++ * powered), vdd_g3d = S2MPS16 BUCK6, regulator-always-on.
++ *
++ * Nothing is written. CMU_G3D and the GPU are read only when the domain
++ * status low nibble is 0xf: a powered-off block can hang the bus. Boot-arg
++ * herogpu=0 skips the probe.
++ */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void herolte_gpu_probe(void);
++
++#define HG_PMU_PA       0x105c0000u
++#define HG_PMU_G3D_CONF 0x4060u
++#define HG_PMU_G3D_STAT 0x4064u
++#define HG_PMU_G3D_AUX  0x6104u         /* second exynos-snapshot condition */
++#define HG_CMU_PA       0x14aa0000u
++#define HG_GPU_PA       0x14ac0000u
++
++/* Mali Midgard register offsets (Linux mali_kbase / Panfrost). */
++#define GPU_ID                  0x000
++#define L2_FEATURES             0x004
++#define TILER_FEATURES          0x00c
++#define MEM_FEATURES            0x010
++#define MMU_FEATURES            0x014
++#define AS_PRESENT              0x018
++#define JS_PRESENT              0x01c
++#define GPU_IRQ_RAWSTAT         0x020
++#define GPU_STATUS              0x034
++#define SHADER_PRESENT_LO       0x100
++#define TILER_PRESENT_LO        0x110
++#define L2_PRESENT_LO           0x120
++#define SHADER_READY_LO         0x140
++#define TILER_READY_LO          0x150
++#define L2_READY_LO             0x160
++
++static int hg_sleep;
++
++static uint32_t
++hg_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++hg_msleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&hg_sleep, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++hg_powered(vm_offset_t pmu)
++{
++	return (hg_rd(pmu, HG_PMU_G3D_STAT) & 0xf) == 0xf;
++}
++
++static void
++hg_probe(vm_offset_t pmu, const char *when)
++{
++	uint32_t conf = hg_rd(pmu, HG_PMU_G3D_CONF);
++	uint32_t stat = hg_rd(pmu, HG_PMU_G3D_STAT);
++	uint32_t aux = hg_rd(pmu, HG_PMU_G3D_AUX);
++	printf("HEROLTE GPU: %s: PMU G3D conf=%#x status=%#x aux=%#x\n", when, conf, stat, aux);
++	if ((stat & 0xf) != 0xf) {
++		printf("HEROLTE GPU: %s: G3D domain off; CMU and Mali not read\n", when);
++		return;
++	}
++	static vm_offset_t cmu, gpu;
++	if (!cmu) {
++		cmu = ml_io_map(HG_CMU_PA, 0x2000);
++	}
++	if (!gpu) {
++		gpu = ml_io_map(HG_GPU_PA, 0x5000);
++	}
++	if (!cmu || !gpu) {
++		printf("HEROLTE GPU: MMIO mapping failed\n");
++		return;
++	}
++	/* The exynos-snapshot CMU_G3D list: muxes 0x2xx, dividers 0x4xx,
++	 * 0x6xx, gates 0x8xx/0x9xx/0xa00. */
++	static const uint16_t regs[] = {
++		0x200, 0x204, 0x20c, 0x210, 0x214, 0x400, 0x404, 0x408, 0x40c,
++		0x600, 0x604, 0x60c, 0x610, 0x614, 0x800, 0x804, 0x900, 0xa00,
++	};
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i += 6) {
++		printf("HEROLTE GPU: CMU_G3D");
++		for (unsigned j = i; j < i + 6 && j < sizeof(regs) / sizeof(regs[0]); j++) {
++			printf(" %03x=%#x", regs[j], hg_rd(cmu, regs[j]));
++		}
++		printf("\n");
++	}
++	if (!hg_powered(pmu)) {
++		printf("HEROLTE GPU: %s: domain went off; Mali not read\n", when);
++		return;
++	}
++	uint32_t id = hg_rd(gpu, GPU_ID);
++	printf("HEROLTE GPU: %s: GPU_ID=%#x product %#x (0x880 = Mali-T880) rev r%up%u\n",
++	    when, id, id >> 16, (id >> 12) & 0xf, (id >> 4) & 0xff);
++	printf("HEROLTE GPU: L2_FEATURES=%#x TILER=%#x MEM=%#x MMU=%#x AS=%#x JS=%#x\n",
++	    hg_rd(gpu, L2_FEATURES), hg_rd(gpu, TILER_FEATURES), hg_rd(gpu, MEM_FEATURES),
++	    hg_rd(gpu, MMU_FEATURES), hg_rd(gpu, AS_PRESENT), hg_rd(gpu, JS_PRESENT));
++	printf("HEROLTE GPU: present shader=%#x tiler=%#x l2=%#x; ready shader=%#x tiler=%#x l2=%#x\n",
++	    hg_rd(gpu, SHADER_PRESENT_LO), hg_rd(gpu, TILER_PRESENT_LO), hg_rd(gpu, L2_PRESENT_LO),
++	    hg_rd(gpu, SHADER_READY_LO), hg_rd(gpu, TILER_READY_LO), hg_rd(gpu, L2_READY_LO));
++	printf("HEROLTE GPU: GPU_STATUS=%#x IRQ_RAWSTAT=%#x; no GPU jobs\n",
++	    hg_rd(gpu, GPU_STATUS), hg_rd(gpu, GPU_IRQ_RAWSTAT));
++}
++
++static void
++hg_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	vm_offset_t pmu = ml_io_map(HG_PMU_PA, 0x8000);
++	if (!pmu) {
++		printf("HEROLTE GPU: PMU mapping failed\n");
++		return;
++	}
++	/* Once early, once after the UI is up (in case something changed it). */
++	hg_msleep(5000);
++	hg_probe(pmu, "5s");
++	hg_msleep(55000);
++	hg_probe(pmu, "60s");
++}
++
++void
++herolte_gpu_probe(void)
++{
++	int enabled = 1;
++	thread_t thread;
++
++	PE_parse_boot_argn("herogpu", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("HEROLTE GPU: probe disabled\n");
++		return;
++	}
++	if (kernel_thread_start(hg_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_HEROLTE */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index d7a266c..10449ab 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -778,6 +778,9 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	/* sec_ts on the Exynos 8890 HSI2C (bsd/dev/herolte_touch.c). */
+ 	extern void herolte_touch_probe(void);
+ 	herolte_touch_probe();
++	/* Mali-T880 read-only probe (bsd/dev/herolte_gpu.c). */
++	extern void herolte_gpu_probe(void);
++	herolte_gpu_probe();
+ #else
+ 	/* Exynos 7580 I2C touch. */
+ 	a5xelte_touch_probe();

@@ -1,0 +1,171 @@
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index e46d739..05d61ac 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -1,12 +1,13 @@
+ /*
+  * Read-only Exynos7580 ZT7538 bring-up probe.  The working native Linux
+  * port uses I2C2 at 0x13850000, GPC3-0/1, GPA1-1 and S2MPU03 LDO33.
+- * Keep this first XNU probe out of the PMIC and touchscreen register files:
+- * their controller clocks and power sequencing need a separate device test.
++ * The optional I2C2 trial only reads the ZT7538 chip code. It does not
++ * change the PMIC rail, run touch initialization, or write touch NVM.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <kern/clock.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+@@ -20,6 +21,138 @@ a5touch_read(vm_offset_t base, uint32_t offset)
+ 	return value;
+ }
+ 
++static void
++a5touch_write(vm_offset_t base, uint32_t offset, uint32_t value)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + offset) = value;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/* S3C2440 I2C2: one bounded message, with STOP between Zinitix phases. */
++static bool
++a5touch_wait_irq(vm_offset_t i2c)
++{
++	for (unsigned n = 0; n < 20000; n++) {
++		if (a5touch_read(i2c, 0) & 0x10u) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++a5touch_clear_irq(vm_offset_t i2c)
++{
++	a5touch_write(i2c, 0, a5touch_read(i2c, 0) & ~0x10u);
++}
++
++static void
++a5touch_stop(vm_offset_t i2c)
++{
++	a5touch_write(i2c, 4, a5touch_read(i2c, 4) & ~0x20u);
++	a5touch_clear_irq(i2c);
++	for (unsigned n = 0; n < 5000; n++) {
++		if (!(a5touch_read(i2c, 4) & 0x20u)) {
++			break;
++		}
++		delay(1);
++	}
++}
++
++static bool
++a5touch_message(vm_offset_t i2c, bool receive, uint8_t *bytes, unsigned count)
++{
++	const uint32_t mode = receive ? 0x90u : 0xd0u;
++	bool ok = false;
++	if (!count || count > 4) {
++		return false;
++	}
++	for (unsigned n = 0; n < 5000; n++) {
++		if (!(a5touch_read(i2c, 4) & 0x20u)) {
++			break;
++		}
++		if (n == 4999) {
++			printf("A5XELTE TOUCH: I2C2 busy before message\n");
++			return false;
++		}
++		delay(1);
++	}
++	/* Conservative divider; the working Linux controller also sets ACK/IRQ. */
++	a5touch_write(i2c, 0, 0xe3u);
++	a5touch_write(i2c, 0x10, 7u); /* S3C2440 SDA delay/filter */
++	a5touch_write(i2c, 4, mode);
++	a5touch_write(i2c, 0xc, 0x40u | (receive ? 1u : 0u));
++	delay(1);
++	a5touch_write(i2c, 4, mode | 0x20u);
++	if (!a5touch_wait_irq(i2c)) {
++		printf("A5XELTE TOUCH: I2C2 address timeout stat=%#x con=%#x\n",
++		    a5touch_read(i2c, 4), a5touch_read(i2c, 0));
++		goto out;
++	}
++	if (a5touch_read(i2c, 4) & 1u) {
++		printf("A5XELTE TOUCH: I2C2 address NACK stat=%#x\n",
++		    a5touch_read(i2c, 4));
++		goto out;
++	}
++	for (unsigned n = 0; n < count; n++) {
++		if (receive) {
++			if (n + 1 == count) {
++				a5touch_write(i2c, 0, a5touch_read(i2c, 0) & ~0x80u);
++			}
++		} else {
++			a5touch_write(i2c, 0xc, bytes[n]);
++			delay(1);
++		}
++		a5touch_clear_irq(i2c);
++		if (!a5touch_wait_irq(i2c)) {
++			printf("A5XELTE TOUCH: I2C2 data timeout byte=%u stat=%#x\n",
++			    n, a5touch_read(i2c, 4));
++			goto out;
++		}
++		if (receive) {
++			bytes[n] = (uint8_t)a5touch_read(i2c, 0xc);
++		} else if (a5touch_read(i2c, 4) & 1u) {
++			printf("A5XELTE TOUCH: I2C2 data NACK byte=%u stat=%#x\n",
++			    n, a5touch_read(i2c, 4));
++			goto out;
++		}
++	}
++	ok = true;
++out:
++	a5touch_stop(i2c);
++	return ok;
++}
++
++static void
++a5touch_chip_code_trial(vm_offset_t nfc)
++{
++	vm_offset_t i2c = ml_io_map(0x13850000, 0x1000);
++	if (!i2c) {
++		printf("A5XELTE TOUCH: I2C2 mapping failed\n");
++		return;
++	}
++	uint32_t old_con = a5touch_read(nfc, 0);
++	uint32_t old_pud = a5touch_read(nfc, 8);
++	/* GPC3-0/1: Linux touch_bus function 2 and PUD 3; preserve other pins. */
++	a5touch_write(nfc, 8, (old_pud & ~0xfu) | 0xfu);
++	a5touch_write(nfc, 0, (old_con & ~0xffu) | 0x22u);
++	delay(100);
++	uint8_t reg[2] = {0x00, 0xcc};
++	uint8_t code[2] = {0, 0};
++	bool sent = a5touch_message(i2c, false, reg, sizeof(reg));
++	if (sent) {
++		delay(75); /* ZT7538 requires a STOP and 50 us before receive. */
++	}
++	bool got = sent && a5touch_message(i2c, true, code, sizeof(code));
++	printf("A5XELTE TOUCH: I2C2 chip-code sent=%d received=%d value=%#x stat=%#x con=%#x\n",
++	    sent, got, (unsigned)code[0] | ((unsigned)code[1] << 8),
++	    a5touch_read(i2c, 4), a5touch_read(i2c, 0));
++	a5touch_write(nfc, 0, old_con);
++	a5touch_write(nfc, 8, old_pud);
++}
++
+ void
+ a5xelte_touch_probe(void)
+ {
+@@ -53,6 +186,11 @@ a5xelte_touch_probe(void)
+ 			    a5touch_read(i2c, 0), a5touch_read(i2c, 4),
+ 			    a5touch_read(i2c, 8), a5touch_read(i2c, 0x10));
+ 		}
++		int bus_trial = 0;
++		(void)PE_parse_boot_argn("a5touchbus", &bus_trial, sizeof(bus_trial));
++		if (bus_trial) {
++			a5touch_chip_code_trial(nfc);
++		}
+ 	}
+ }
+ #endif

@@ -1,0 +1,33 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b7eb773..07c8b02 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -193,7 +193,14 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+-#if !defined(ARM64_BOARD_CONFIG_A5XELTE)
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/* iPhone X userland on the 1440x2560 panel: its 1125x2436 canvas is
++	 * shown centered (fOffX/fOffY are negative), unscaled. */
++	if (!native) {
++		fLogicalW = SWEET_FB_LOGICAL_W;
++		fLogicalH = SWEET_FB_LOGICAL_H;
++	}
++#elif !defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
+index 3cf6d22..47b0324 100644
+--- a/pexpert/pexpert/arm64/A5XELTE.h
++++ b/pexpert/pexpert/arm64/A5XELTE.h
+@@ -20,7 +20,7 @@
+ #define A5XELTE_FB_STRIDE             5760
+ #define A5XELTE_FB_BLOCKS             8     /* 2 MiB VA=PA bootstrap blocks */
+ #define A5XELTE_FB_TEXT_SCALE         3
+-#define A5XELTE_FB_DOT_PITCH          577   /* 1440 pixels across 5.1 inches */
++#define A5XELTE_FB_DOT_PITCH          458   /* iPhone X userland density */
+ #define A5XELTE_MARKER_PA             0x8ffff100
+ /* S-Boot starts on the Cortex-A53 "Apollo" cluster, Aff1 = 1. */
+ #define A5XELTE_BOOT_MPIDR            0x100

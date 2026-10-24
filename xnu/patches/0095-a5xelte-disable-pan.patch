@@ -1,0 +1,13 @@
+diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
+index f8d4288..dd22be9 100644
+--- a/pexpert/pexpert/arm64/A5XELTE.h
++++ b/pexpert/pexpert/arm64/A5XELTE.h
+@@ -18,7 +18,7 @@
+ #define __ARM_DEBUG__                 7
+ #define __ARM_ENABLE_SWAP__           1
+ #define __ARM_V8_CRYPTO_EXTENSIONS__  1
+-#define __ARM_PAN_AVAILABLE__         1
++#define __ARM_PAN_AVAILABLE__         0
+ 
+ /* Exynos7580 has a GICv2 distributor and CPU interface, not GICv3. */
+ #define HAS_GIC_V3                    0

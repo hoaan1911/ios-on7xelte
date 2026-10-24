@@ -1,0 +1,95 @@
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+new file mode 100644
+index 0000000..ac54e10
+--- /dev/null
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -0,0 +1,58 @@
++/*
++ * Exynos7580 Mali-T720 resource service for Samsung a5xelte.
++ *
++ * Stage 1 intentionally claims no GPU capability: no PMU/CMU/GPU MMIO,
++ * clock, regulator, interrupt, memory manager or user client is touched.
++ * It gives the next stage a board-specific IOKit provider with the
++ * verified Linux resource map while keeping CPU display fallback intact.
++ *
++ * The Exynos7580 G3D domain needs an ordered BUCK4/bus/PMU/CMU sequence.
++ * Reading GPU_ID while it is power-gated can abort. Implement that
++ * bounded sequence before adding any GPU register probe here.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++
++class A5XELTEGPU : public IOService {
++    OSDeclareDefaultStructors(A5XELTEGPU);
++
++public:
++    bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(A5XELTEGPU, IOService);
++
++bool
++A5XELTEGPU::start(IOService *provider)
++{
++    int enabled = 0;
++    if (!PE_parse_boot_argn("a5gpu", &enabled, sizeof(enabled)) || enabled != 1) {
++        return false; /* a5gpu=0, the safe default */
++    }
++    if (!IOService::start(provider)) {
++        return false;
++    }
++
++    /* These are physical addresses from the working Exynos7580 Linux DT.
++     * The matching ADT node uses arm-io-relative addresses. This service
++     * only publishes numbers; it does not map these ranges.
++     */
++    setProperty("A5G3DMMIOBase", 0x11400000ULL, 64);
++    setProperty("A5G3DMMIOSize", 0x5000ULL, 64);
++    setProperty("A5G3DCMUBase", 0x11460000ULL, 64);
++    setProperty("A5G3DCMUSize", 0x1000ULL, 64);
++    setProperty("A5G3DPMUBase", 0x10460000ULL, 64);
++    setProperty("A5G3DPMUSize", 0x5000ULL, 64);
++    setProperty("A5G3DJobSPI", 282ULL, 32);
++    setProperty("A5G3DMMUSPI", 283ULL, 32);
++    setProperty("A5G3DGpuSPI", 281ULL, 32);
++    setProperty("A5G3DDriverStage", "resources-only");
++    registerService();
++    IOLog("A5XELTE G3D: resource service registered; GPU power unchanged; CPU display active\n");
++    return true;
++}
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 9987f5a..2c3af25 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -96,6 +96,14 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
+ #endif
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++    "   {"
++    "     'IOClass'         = A5XELTEGPU;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'samsung,exynos7580-mali';"
++    "     'IOProbeScore'    = 10000:32;"
++    "   },"
++#endif
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..4a5f5f4 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -15,6 +15,7 @@ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/A5XELTEGPU.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp

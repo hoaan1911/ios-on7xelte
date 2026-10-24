@@ -1,0 +1,89 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 5b66c3a..f7a54ac 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -535,6 +535,11 @@ La5_entry_pixel:
+ 	subs	x12, x12, #1
+ 	b.ne	La5_entry_row
+ 	dsb		sy
++	/* This is XNU text, drawn before stack setup or any C runtime. */
++	adr	x0, La5_text_entry
++	mov	x1, #24
++	mov	x2, #256
++	bl	La5_draw_text
+ #endif
+ 
+ #if defined(SWEET) && !defined(A5XELTE)
+@@ -900,6 +905,13 @@ La5_mmu_pixel:
+ 	subs	x12, x12, #1
+ 	b.ne	La5_mmu_row
+ 	dsb		sy
++	/* Preserve the arm_init KVA return address across the text routine. */
++	mov	x17, lr
++	adr	x0, La5_text_mmu
++	mov	x1, #24
++	mov	x2, #288
++	bl	La5_draw_text
++	mov	lr, x17
+ #endif
+ 
+ #if !VMAPPLE && !defined(SWEET)
+@@ -1081,6 +1093,58 @@ arm_init_tramp:
+ 	/* Return to arm_init() */
+ 	ret
+ 
++#if defined(A5XELTE)
++/* Physical DECON framebuffer text using XNU's built-in 8x16 iso_font.
++ * x0: NUL-terminated string, x1: x pixel, x2: y pixel. No stack.
++ * Caller-saved x0-x14 only; lr is untouched until ret. */
++	.align 2
++La5_draw_text:
++	adrp	x3, EXT(iso_font)@page
++	add	x3, x3, EXT(iso_font)@pageoff
++	MOV64	x4, 0x67000000
++	mov	x5, #4320
++	madd	x4, x2, x5, x4
++	add	x4, x4, x1, lsl #2
++La5_text_next_char:
++	ldrb	w6, [x0], #1
++	cbz	w6, La5_text_done
++	add	x7, x3, x6, lsl #4
++	mov	x8, #0
++La5_text_row:
++	ldrb	w9, [x7, x8]
++	mov	x10, #0
++La5_text_column:
++	mov	w11, #1
++	lsl	w11, w11, w10
++	tst	w9, w11
++	b.eq	La5_text_skip_pixel
++	mov	x13, #8640
++	madd	x12, x8, x13, x4
++	add	x12, x12, x10, lsl #3
++	mov	w14, #-1
++	str	w14, [x12]
++	str	w14, [x12, #4]
++	add	x12, x12, x5
++	str	w14, [x12]
++	str	w14, [x12, #4]
++La5_text_skip_pixel:
++	add	x10, x10, #1
++	cmp	x10, #8
++	b.ne	La5_text_column
++	add	x8, x8, #1
++	cmp	x8, #16
++	b.ne	La5_text_row
++	add	x4, x4, #64
++	b	La5_text_next_char
++La5_text_done:
++	dsb	sy
++	ret
++La5_text_entry:
++	.asciz "XNU ENTRY"
++La5_text_mmu:
++	.asciz "XNU MMU ON"
++#endif
++
+ //#include	"globals_asm.h"
+ 
+ /* vim: set ts=4: */

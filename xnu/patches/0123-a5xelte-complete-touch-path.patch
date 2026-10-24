@@ -1,0 +1,419 @@
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index e561da9..7ba309b 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -15,11 +15,18 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void thread_terminate_self(void);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void a5xelte_touch_probe(void);
++static bool a5touch_controller_init(void);
++static bool a5touch_report_packet(const uint8_t packet[34], unsigned *lines);
++static void a5touch_release_contacts(void);
+ 
+ static vm_offset_t a5_touch_bus;
+ static vm_offset_t a5_touch_alive;
++static vm_offset_t a5_touch_hsi;
+ static int a5_touch_sleep;
++static bool a5_touch_active[5];
++static uint16_t a5_touch_x[5], a5_touch_y[5];
+ 
+ static uint16_t
+ a5touch_le16(const uint8_t *bytes)
+@@ -65,59 +72,102 @@ a5pmic_message(vm_offset_t hsi, bool receive, uint8_t *bytes,
+ {
+ 	uint32_t ctl;
+ 	uint32_t cfg;
++	uint32_t last_irq = 0;
++	bool transfer_done = false;
+ 	unsigned done = 0;
+ 	if (!count || count > 4) {
+ 		return false;
+ 	}
++	/* Exynos7580 is EXYNOS7: TRANS_STATUS[3:0] is an FSM state,
++	 * not the Exynos5 completion/error bitmap. Linux uses INT_STATUS. */
+ 	a5touch_write(hsi, 0x24, a5touch_read(hsi, 0x24));
+ 	a5touch_write(hsi, 0x04, 3u | (count << (receive ? 4 : 16)));
+ 	ctl = 9u | (receive ? 0x40u : 0x80u);
+ 	a5touch_write(hsi, 0x70, 0x66u << 10);
+ 	a5touch_write(hsi, 0x00, ctl);
+ 	cfg = count | (receive ? 0x10000u : 0) | (stop ? 0x20000u : 0);
++	/* GIC SPI for this controller is masked in the A5XELTE platform;
++	 * enable the controller's status bits and service them by polling. */
++	a5touch_write(hsi, 0x20, 0xf80u | (receive ? 0x42u : 1u));
+ 	a5touch_write(hsi, 0x44, cfg | 0x80000000u);
+-	for (unsigned us = 0; us < 50000; us++) {
++	for (unsigned us = 0; us < 100000; us++) {
+ 		uint32_t fifo = a5touch_read(hsi, 0x30);
+-		uint32_t status = a5touch_read(hsi, 0x50);
+-		if (status & 0x1eu) {
+-			printf("A5XELTE TOUCH: PMIC HSI2C error rx=%d sent=%u/%u status=%#x irq=%#x fifo=%#x\n",
+-			    receive, done, count, status,
+-			    a5touch_read(hsi, 0x24), fifo);
+-			return false;
++		uint32_t irq = a5touch_read(hsi, 0x24);
++		if (irq) {
++			last_irq |= irq;
++			a5touch_write(hsi, 0x24, irq);
++		}
++		if (irq & 0xf00u) {
++			printf("A5XELTE TOUCH: PMIC HSI2C error rx=%d done=%u/%u irq=%#x state=%#x fifo=%#x\n",
++			    receive, done, count, last_irq, a5touch_read(hsi, 0x50), fifo);
++			goto fail;
++		}
++		if (irq & 0x80u) {
++			transfer_done = true;
+ 		}
+ 		if (receive) {
+-			if (!(fifo & (1u << 24)) && done < count) {
++			while (done < count && ((a5touch_read(hsi, 0x30) >> 16) & 0x7fu)) {
+ 				bytes[done++] = (uint8_t)a5touch_read(hsi, 0x38);
+ 			}
+-		} else if (!(fifo & (1u << 7)) && done < count) {
+-			a5touch_write(hsi, 0x34, bytes[done++]);
++		} else {
++			while (done < count && !(a5touch_read(hsi, 0x30) & (1u << 7))) {
++				a5touch_write(hsi, 0x34, bytes[done++]);
++			}
++			if (done == count) {
++				a5touch_write(hsi, 0x20, 0xf80u);
++			}
+ 		}
+-		if (done == count && (status & 1u)) {
+-			printf("A5XELTE TOUCH: PMIC HSI2C complete rx=%d status=%#x irq=%#x\n",
+-			    receive, status, a5touch_read(hsi, 0x24));
++		if (done == count && transfer_done) {
++			a5touch_write(hsi, 0x20, 0);
++			if (stop) {
++				for (unsigned n = 0; n < 100000; n++) {
++					if (!(a5touch_read(hsi, 0x50) & (1u << 17))) {
++						return true;
++					}
++					delay(1);
++				}
++				printf("A5XELTE TOUCH: PMIC STOP busy irq=%#x state=%#x\n",
++				    last_irq, a5touch_read(hsi, 0x50));
++				goto fail;
++			}
+ 			return true;
+ 		}
+ 		delay(1);
+ 	}
+-	printf("A5XELTE TOUCH: PMIC HSI2C timeout rx=%d done=%u/%u status=%#x irq=%#x fifo=%#x\n",
+-	    receive, done, count, a5touch_read(hsi, 0x50),
+-	    a5touch_read(hsi, 0x24), a5touch_read(hsi, 0x30));
++	printf("A5XELTE TOUCH: PMIC HSI2C timeout rx=%d done=%u/%u irq=%#x state=%#x fifo=%#x\n",
++	    receive, done, count, last_irq | a5touch_read(hsi, 0x24),
++	    a5touch_read(hsi, 0x50), a5touch_read(hsi, 0x30));
++fail:
++	a5touch_write(hsi, 0x20, 0);
++	a5pmic_bus_init(hsi);
+ 	return false;
+ }
+ 
+ static bool
+ a5pmic_read(vm_offset_t hsi, uint8_t reg, uint8_t *value)
+ {
+-	uint8_t address = reg;
+-	return a5pmic_message(hsi, false, &address, 1, false) &&
+-	    a5pmic_message(hsi, true, value, 1, true);
++	for (unsigned attempt = 0; attempt < 3; attempt++) {
++		uint8_t address = reg;
++		if (a5pmic_message(hsi, false, &address, 1, false) &&
++		    a5pmic_message(hsi, true, value, 1, true)) {
++			return true;
++		}
++		delay(1000);
++	}
++	return false;
+ }
+ 
+ static bool
+ a5pmic_write(vm_offset_t hsi, uint8_t reg, uint8_t value)
+ {
+-	uint8_t data[2] = {reg, value};
+-	return a5pmic_message(hsi, false, data, 2, true);
++	for (unsigned attempt = 0; attempt < 3; attempt++) {
++		uint8_t data[2] = {reg, value};
++		if (a5pmic_message(hsi, false, data, 2, true)) {
++			return true;
++		}
++		delay(1000);
++	}
++	return false;
+ }
+ 
+ static bool
+@@ -161,6 +211,7 @@ a5touch_power_on(vm_offset_t mifpins)
+ 		goto fail;
+ 	}
+ 	printf("A5XELTE TOUCH: LDO33 enabled at 3.3 V, readback=%#x\n", check);
++	a5_touch_hsi = hsi;
+ 	delay(15000);
+ 	return true;
+ fail:
+@@ -297,11 +348,23 @@ a5touch_chip_code_trial(vm_offset_t nfc)
+ 	a5touch_write(nfc, 8, old_pud);
+ }
+ 
++static bool
++a5touch_send(uint8_t *data, unsigned length)
++{
++	for (unsigned attempt = 0; attempt < 8; attempt++) {
++		if (a5touch_message(a5_touch_bus, false, data, length)) {
++			return true;
++		}
++		delay(1100);
++	}
++	return false;
++}
++
+ static bool
+ a5touch_cmd(uint16_t reg)
+ {
+ 	uint8_t data[2] = {(uint8_t)reg, (uint8_t)(reg >> 8)};
+-	bool ok = a5touch_message(a5_touch_bus, false, data, 2);
++	bool ok = a5touch_send(data, 2);
+ 	delay(20);
+ 	return ok;
+ }
+@@ -311,7 +374,7 @@ a5touch_write_reg(uint16_t reg, uint16_t value)
+ {
+ 	uint8_t data[4] = {(uint8_t)reg, (uint8_t)(reg >> 8),
+ 	    (uint8_t)value, (uint8_t)(value >> 8)};
+-	bool ok = a5touch_message(a5_touch_bus, false, data, 4);
++	bool ok = a5touch_send(data, 4);
+ 	delay(20);
+ 	return ok;
+ }
+@@ -320,7 +383,7 @@ static bool
+ a5touch_read_reg(uint16_t reg, uint8_t *data, unsigned length)
+ {
+ 	uint8_t address[2] = {(uint8_t)reg, (uint8_t)(reg >> 8)};
+-	if (!a5touch_message(a5_touch_bus, false, address, 2)) {
++	if (!a5touch_send(address, 2)) {
+ 		return false;
+ 	}
+ 	delay(75); /* The ZT7538 requires STOP then at least 50 us. */
+@@ -351,79 +414,131 @@ a5touch_sleep_5ms(void)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++static bool
++a5touch_recover(void)
++{
++	uint8_t ldo = 0;
++	uint8_t check = 0;
++	a5touch_release_contacts();
++	if (!a5_touch_hsi || !a5pmic_read(a5_touch_hsi, 0x4e, &ldo) ||
++	    (ldo & 0x3fu) != 0x3cu ||
++	    !a5pmic_write(a5_touch_hsi, 0x4e, ldo & ~0xc0u)) {
++		printf("A5XELTE TOUCH: LDO33 recovery power-off failed\n");
++		return false;
++	}
++	delay(50000);
++	if (!a5pmic_write(a5_touch_hsi, 0x4e, ldo | 0xc0u) ||
++	    !a5pmic_read(a5_touch_hsi, 0x4e, &check) || check != (ldo | 0xc0u)) {
++		printf("A5XELTE TOUCH: LDO33 recovery power-on failed value=%#x\n", check);
++		return false;
++	}
++	delay(50000);
++	return a5touch_controller_init();
++}
++
+ static void
+ a5touch_log_thread(void *arg, wait_result_t result)
+ {
+ 	unsigned lines = 0;
+ 	unsigned errors = 0;
++	unsigned idle_ticks = 0;
++	unsigned recoveries = 0;
+ 	(void)arg;
+ 	(void)result;
+-	printf("A5XELTE TOUCH: contact text logger started (GPA1-1)\n");
++	printf("A5XELTE TOUCH: contact HID worker started (GPA1-1)\n");
+ 	for (;;) {
+ 		/* ZT7538 holds INTN low until CLEAR_INT_STATUS. */
+ 		if (!(a5touch_read(a5_touch_alive, 0x24) & 2u)) {
+ 			uint8_t packet[34] = {0};
+ 			bool read_ok = a5touch_read_reg(0x0080, packet, sizeof(packet));
+ 			bool ack_ok = a5touch_cmd(0x0003);
+-			if (!read_ok || !ack_ok) {
++			idle_ticks = 0;
++			if (!read_ok || !ack_ok ||
++			    (read_ok && ack_ok && !a5touch_report_packet(packet, &lines))) {
+ 				if (++errors <= 8) {
+-					printf("A5XELTE TOUCH: packet/ACK failed read=%d ack=%d\n",
+-					    read_ok, ack_ok);
+-				}
+-				if (errors >= 8) {
+-					printf("A5XELTE TOUCH: logger stopped after I2C errors\n");
+-					break;
++					printf("A5XELTE TOUCH: packet/ACK failed read=%d ack=%d errors=%u\n",
++					    read_ok, ack_ok, errors);
+ 				}
+ 			} else {
+-				uint16_t status = a5touch_le16(packet);
+-				unsigned count = packet[2];
+ 				errors = 0;
+-				if (status && status != 0xffffu && status != 1u &&
+-				    !(status & (1u << 13)) && count <= 5) {
+-					for (unsigned slot = 0; slot < 5; slot++) {
+-						unsigned at = 4 + 6 * slot;
+-						uint16_t x = a5touch_le16(packet + at);
+-						uint16_t y = a5touch_le16(packet + at + 2);
+-						unsigned sub = packet[at + 5];
+-						if ((sub & 0x0fu) && x <= 1080 && y <= 1920 && lines < 256) {
+-							printf("A5XELTE TOUCH: contact slot=%u x=%u y=%u width=%u flags=%#x status=%#x\n",
+-							    slot, x, y, packet[at + 4], sub, status);
+-							lines++;
+-						}
+-					}
+-					if (lines == 256) {
+-						printf("A5XELTE TOUCH: contact log capped at 256 lines\n");
+-						lines++;
+-					}
+-				}
+ 			}
++		} else if (idle_ticks < 600) {
++			idle_ticks++;
++		}
++		if (errors >= 8 || idle_ticks >= 600) {
++			printf("A5XELTE TOUCH: recovery reason=%s attempt=%u\n",
++			    errors >= 8 ? "transfer" : "health IRQ", recoveries + 1);
++			if (!a5touch_recover() && ++recoveries >= 3) {
++				printf("A5XELTE TOUCH: worker stopped after recovery failures\n");
++				break;
++			}
++			errors = 0;
++			idle_ticks = 0;
+ 		}
+ 		a5touch_sleep_5ms();
+ 	}
++	a5touch_release_contacts();
+ 	thread_terminate_self();
+ }
+ 
+ static void
+-a5touch_start_early(vm_offset_t nfc, vm_offset_t alive)
++a5touch_release_contacts(void)
++{
++	for (unsigned slot = 0; slot < 5; slot++) {
++		if (a5_touch_active[slot]) {
++			sweet_hid_touch(slot, 0, a5_touch_x[slot], a5_touch_y[slot]);
++			a5_touch_active[slot] = false;
++		}
++	}
++}
++
++/* Native Linux mode-0 packet policy, followed by the existing iOS HID
++ * digitizer service.  A heartbeat leaves all slots unchanged. */
++static bool
++a5touch_report_packet(const uint8_t packet[34], unsigned *lines)
++{
++	uint16_t status = a5touch_le16(packet);
++	unsigned count = packet[2];
++	if (status == 0) {
++		return true;
++	}
++	if (status == 0xffffu || status == 1u || (status & (1u << 13)) || count > 5) {
++		printf("A5XELTE TOUCH: corrupt packet status=%#x count=%u\n", status, count);
++		return false;
++	}
++	for (unsigned slot = 0; slot < 5; slot++) {
++		unsigned at = 4 + 6 * slot;
++		uint16_t x = a5touch_le16(packet + at);
++		uint16_t y = a5touch_le16(packet + at + 2);
++		unsigned sub = packet[at + 5];
++		bool active = (status & (1u << 11)) && !(status & 0x30u) &&
++		    (sub & 1u) && !(sub & 8u) && x <= 1080 && y <= 1920;
++		if (active) {
++			if (*lines < 256 && (!a5_touch_active[slot] ||
++			    a5_touch_x[slot] != x || a5_touch_y[slot] != y)) {
++				printf("A5XELTE TOUCH: contact slot=%u x=%u y=%u width=%u flags=%#x status=%#x\n",
++				    slot, x, y, packet[at + 4], sub, status);
++				(*lines)++;
++			}
++			a5_touch_x[slot] = x;
++			a5_touch_y[slot] = y;
++			a5_touch_active[slot] = true;
++			sweet_hid_touch(slot, 1, x, y);
++		} else if (a5_touch_active[slot]) {
++			sweet_hid_touch(slot, 0, a5_touch_x[slot], a5_touch_y[slot]);
++			a5_touch_active[slot] = false;
++		}
++	}
++	return true;
++}
++
++static bool
++a5touch_controller_init(void)
+ {
+-	uint32_t con;
+-	uint32_t pud;
+ 	uint16_t chip = 0;
+ 	uint16_t crc = 0;
+ 	uint16_t x = 0;
+ 	uint16_t y = 0;
+-	thread_t thread;
+-	a5_touch_bus = ml_io_map(0x13850000, 0x1000);
+-	a5_touch_alive = alive;
+-	if (!a5_touch_bus) {
+-		printf("A5XELTE TOUCH: I2C2 mapping failed\n");
+-		return;
+-	}
+-	con = a5touch_read(nfc, 0);
+-	pud = a5touch_read(nfc, 8);
+-	a5touch_write(nfc, 8, (pud & ~0xfu) | 0xfu);
+-	a5touch_write(nfc, 0, (con & ~0xffu) | 0x22u);
+-	delay(100);
+ 	/* Native ZT7538 power-on sequence; abort on each failed transfer. */
+ 	if (!a5touch_write_reg(0xc000, 1) ||
+ 	    !a5touch_read_u16(0xcc00, &chip) || chip != 0xe538) {
+@@ -465,16 +580,39 @@ a5touch_start_early(vm_offset_t nfc, vm_offset_t alive)
+ 		goto fail;
+ 	}
+ 	printf("A5XELTE TOUCH: mode 0 ready, INTN=%u\n",
+-	    (unsigned)!!(a5touch_read(alive, 0x24) & 2u));
++	    (unsigned)!!(a5touch_read(a5_touch_alive, 0x24) & 2u));
++	return true;
++fail:
++	return false;
++}
++
++static void
++a5touch_start_early(vm_offset_t nfc, vm_offset_t alive)
++{
++	uint32_t con;
++	uint32_t pud;
++	thread_t thread;
++	a5_touch_bus = ml_io_map(0x13850000, 0x1000);
++	a5_touch_alive = alive;
++	if (!a5_touch_bus) {
++		printf("A5XELTE TOUCH: I2C2 mapping failed\n");
++		return;
++	}
++	con = a5touch_read(nfc, 0);
++	pud = a5touch_read(nfc, 8);
++	a5touch_write(nfc, 8, (pud & ~0xfu) | 0xfu);
++	a5touch_write(nfc, 0, (con & ~0xffu) | 0x22u);
++	delay(100);
++	if (!a5touch_controller_init()) {
++		a5touch_write(nfc, 0, con);
++		a5touch_write(nfc, 8, pud);
++		return;
++	}
+ 	if (kernel_thread_start(a5touch_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
+-		printf("A5XELTE TOUCH: logger thread start failed\n");
++		printf("A5XELTE TOUCH: contact thread start failed\n");
+ 	}
+-	return;
+-fail:
+-	a5touch_write(nfc, 0, con);
+-	a5touch_write(nfc, 8, pud);
+ }
+ 
+ void

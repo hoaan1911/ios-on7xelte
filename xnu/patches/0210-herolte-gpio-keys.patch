@@ -1,0 +1,108 @@
+diff --git a/bsd/dev/a5xelte_keys.c b/bsd/dev/a5xelte_keys.c
+index 3ba2fd4..cec8c13 100644
+--- a/bsd/dev/a5xelte_keys.c
++++ b/bsd/dev/a5xelte_keys.c
+@@ -4,6 +4,11 @@
+  * The working Linux device tree locates Power/Volume Up/Volume Down/Home at
+  * GPA2 pins 7/0/1/5, all active low.  Poll only GPA2DAT; boot firmware owns
+  * the pin mux and pull-ups.  No ALIVE or interrupt-controller writes occur.
++ *
++ * HEROLTE (Galaxy S7, Exynos 8890, from its BOOT DTB gpio_keys): ALIVE at
++ * 0x10580000, Power GPA2 pin 4, Volume Up/Down and Home GPA0 pins 3/4/5,
++ * active low.  S-Boot reads them too, so their mux is already set; the two
++ * DAT registers are sampled together (bits 0-7 GPA0, 8-15 GPA2).
+  */
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include <sys/param.h>
+@@ -17,7 +22,14 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+ 
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#define A5_ALIVE_PA 0x10580000u
++#define A5_GPA0_CON 0x00u
++#define A5_GPA0_DAT 0x04u
++#define A5_GPA0_PUD 0x08u
++#else
+ #define A5_ALIVE_PA 0x139b0000u
++#endif
+ #define A5_GPA2_CON 0x40u
+ #define A5_GPA2_DAT 0x44u
+ #define A5_GPA2_PUD 0x48u
+@@ -43,17 +55,34 @@ a5_keys_wait(void)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/* Key order of sweet_hid_key(): power, volume up, volume down, home. */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++static uint16_t
++a5_keys_sample(void)
++{
++	return (uint16_t)((a5_keys_read(A5_GPA0_DAT) & 0xff) |
++	       ((a5_keys_read(A5_GPA2_DAT) & 0xff) << 8));
++}
++static const uint8_t a5_key_pins[4] = {8 + 4, 3, 4, 5};
++#else
++static uint16_t
++a5_keys_sample(void)
++{
++	return (uint16_t)(a5_keys_read(A5_GPA2_DAT) & 0xff);
++}
++static const uint8_t a5_key_pins[4] = {7, 0, 1, 5};
++#endif
++
+ static void
+ a5_keys_thread(void *arg, wait_result_t result)
+ {
+-	static const uint8_t pins[4] = {7, 0, 1, 5};
+-	uint8_t stable = (uint8_t)a5_keys_read(A5_GPA2_DAT);
+-	uint8_t previous = stable;
++	uint16_t stable = a5_keys_sample();
++	uint16_t previous = stable;
+ 	unsigned repeated = 0;
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+-		uint8_t sample = (uint8_t)a5_keys_read(A5_GPA2_DAT);
++		uint16_t sample = a5_keys_sample();
+ 		if (sample == previous) {
+ 			if (repeated < 2) {
+ 				repeated++;
+@@ -64,7 +93,7 @@ a5_keys_thread(void *arg, wait_result_t result)
+ 		}
+ 		if (repeated == 2 && stable != sample) {
+ 			for (unsigned key = 0; key < 4; key++) {
+-				uint8_t bit = 1u << pins[key];
++				uint16_t bit = (uint16_t)(1u << a5_key_pins[key]);
+ 				if ((stable ^ sample) & bit) {
+ 					int down = !(sample & bit);
+ 					printf("A5XELTE KEYS: key=%u down=%d gpio=%#x\n",
+@@ -97,6 +126,11 @@ a5xelte_keys_init(void)
+ 		printf("A5XELTE KEYS: ALIVE mapping failed\n");
+ 		return;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	printf("A5XELTE KEYS: GPA0 con=%#x dat=%#x pud=%#x (read only)\n",
++	    a5_keys_read(A5_GPA0_CON), a5_keys_read(A5_GPA0_DAT),
++	    a5_keys_read(A5_GPA0_PUD));
++#endif
+ 	printf("A5XELTE KEYS: GPA2 con=%#x dat=%#x pud=%#x (read only)\n",
+ 	    a5_keys_read(A5_GPA2_CON), a5_keys_read(A5_GPA2_DAT),
+ 	    a5_keys_read(A5_GPA2_PUD));
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 14b89f3..2590d2f 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -772,9 +772,10 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	}
+ 
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+-#if !defined(ARM64_BOARD_CONFIG_HEROLTE)
+-	/* Exynos 7580 GPIO/I2C addresses; HEROLTE needs its own drivers. */
++	/* GPIO keys: Exynos 7580 or, on HEROLTE, the Exynos 8890 ALIVE pins. */
+ 	a5xelte_keys_init();
++#if !defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/* Exynos 7580 I2C touch; HEROLTE needs its own driver. */
+ 	a5xelte_touch_probe();
+ #endif
+ 	{

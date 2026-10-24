@@ -1,0 +1,45 @@
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+index 0acd6ea..021f378 100644
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -15,9 +15,12 @@
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOLib.h>
+ #include <pexpert/pexpert.h>
++#include <vm/memory_types.h>
++#include <arm/memory_types.h>
+ 
+ /* The IOKit exported machine header omits these kernel-private mappings. */
+-extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size,
++    unsigned int flags);
+ extern "C" void ml_io_unmap(vm_offset_t addr, vm_size_t size);
+ 
+ /* Passive probe of the already-powered GPU only. All offsets are from the
+@@ -33,7 +36,7 @@ a5g3d_read32(vm_offset_t base, vm_offset_t offset)
+ static void
+ a5g3d_probe_existing_power(IOService *service)
+ {
+-    vm_offset_t pmu = ml_io_map(0x10464000, 0x1000);
++    vm_offset_t pmu = ml_io_map_unmappable(0x10464000, 0x1000, VM_WIMG_IO);
+     if (!pmu) {
+         service->setProperty("A5G3DProbeResult", "pmu-map-failed");
+         return;
+@@ -47,7 +50,7 @@ a5g3d_probe_existing_power(IOService *service)
+         return;
+     }
+ 
+-    vm_offset_t cmu = ml_io_map(0x11460000, 0x1000);
++    vm_offset_t cmu = ml_io_map_unmappable(0x11460000, 0x1000, VM_WIMG_IO);
+     if (!cmu) {
+         service->setProperty("A5G3DProbeResult", "cmu-map-failed");
+         ml_io_unmap(pmu, 0x1000);
+@@ -68,7 +71,7 @@ a5g3d_probe_existing_power(IOService *service)
+         return;
+     }
+ 
+-    vm_offset_t gpu = ml_io_map(0x11400000, 0x1000);
++    vm_offset_t gpu = ml_io_map_unmappable(0x11400000, 0x1000, VM_WIMG_IO);
+     if (!gpu) {
+         service->setProperty("A5G3DProbeResult", "gpu-map-failed");
+         ml_io_unmap(cmu, 0x1000);

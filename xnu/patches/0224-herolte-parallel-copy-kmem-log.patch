@@ -1,0 +1,198 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 82c2f7b..afac9b2 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -53,8 +53,13 @@ extern "C" uint64_t a5xelte_power_pressed_at;   /* bsd/dev/a5xelte_keys.c */
+ #include <pexpert/pexpert.h>
+ #include <pexpert/arm64/board_config.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
+ #include <sys/proc.h>
+ 
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++static void sweet_fb_copy_init(void);
++#endif
++
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+@@ -267,6 +272,9 @@ AppleCLCD::start(IOService *provider)
+ 	fFlushTicks = (60 + hz - 1) / hz;
+ #else
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++#endif
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	sweet_fb_copy_init();
+ #endif
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+@@ -401,6 +409,115 @@ get32(const uint8_t *p, uint32_t off)
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++/*
++ * A full 1440x2560 frame is 14.7 MB into write-combined memory: 10-20 ms
++ * on one core (a5fb_perf). Helper threads copy row bands next to the
++ * caller. Boot-arg sweetfb_copythreads=N helpers (default 3, 0 = off).
++ */
++#define SWEET_FB_COPY_MAX_HELPERS 7
++struct sweet_fb_copy_job {
++	uintptr_t       dst;
++	uintptr_t       src;
++	uint64_t        dstStride, srcStride;
++	size_t          rowBytes;
++	int32_t         rows;
++};
++static IOLock *sweet_fb_copy_lock;
++static struct sweet_fb_copy_job sweet_fb_copy;
++static uint32_t sweet_fb_copy_helpers;
++static uint64_t sweet_fb_copy_generation;
++static uint32_t sweet_fb_copy_pending;
++
++static void
++sweet_fb_copy_band(const struct sweet_fb_copy_job *job, uint32_t band, uint32_t bands)
++{
++	int32_t first = (int32_t)((int64_t)job->rows * band / bands);
++	int32_t last = (int32_t)((int64_t)job->rows * (band + 1) / bands);
++	for (int32_t y = first; y < last; y++) {
++		memcpy((void *)(job->dst + (uint64_t)y * job->dstStride),
++		    (const void *)(job->src + (uint64_t)y * job->srcStride), job->rowBytes);
++	}
++}
++
++static void
++sweet_fb_copy_helper(void *arg, wait_result_t wr __unused)
++{
++	uint32_t band = (uint32_t)(uintptr_t)arg;
++	uint64_t seen = 0;
++	for (;;) {
++		IOLockLock(sweet_fb_copy_lock);
++		while (sweet_fb_copy_generation == seen) {
++			IOLockSleep(sweet_fb_copy_lock, &sweet_fb_copy_generation, THREAD_UNINT);
++		}
++		seen = sweet_fb_copy_generation;
++		struct sweet_fb_copy_job job = sweet_fb_copy;
++		IOLockUnlock(sweet_fb_copy_lock);
++
++		sweet_fb_copy_band(&job, band, sweet_fb_copy_helpers + 1);
++
++		IOLockLock(sweet_fb_copy_lock);
++		if (--sweet_fb_copy_pending == 0) {
++			IOLockWakeup(sweet_fb_copy_lock, &sweet_fb_copy_pending, false);
++		}
++		IOLockUnlock(sweet_fb_copy_lock);
++	}
++}
++
++static void
++sweet_fb_copy_init(void)
++{
++	uint32_t helpers = 3;
++	PE_parse_boot_argn("sweetfb_copythreads", &helpers, sizeof(helpers));
++	if (helpers > SWEET_FB_COPY_MAX_HELPERS) {
++		helpers = SWEET_FB_COPY_MAX_HELPERS;
++	}
++	sweet_fb_copy_lock = IOLockAlloc();
++	if (sweet_fb_copy_lock == NULL) {
++		return;
++	}
++	uint32_t started = 0;
++	for (uint32_t i = 0; i < helpers; i++) {
++		thread_t thread;
++		/* Band 0 is the caller's; helper i copies band i + 1. */
++		if (kernel_thread_start(&sweet_fb_copy_helper, (void *)(uintptr_t)(i + 1), &thread) != KERN_SUCCESS) {
++			break;
++		}
++		thread_deallocate(thread);
++		started++;
++	}
++	sweet_fb_copy_helpers = started;
++	IOLog("A5XELTE FB: parallel copy with %u helper threads\n", started);
++}
++
++/* Copies rows; returns after every band is done. */
++static void
++sweet_fb_copy_rows(uintptr_t dst, uint64_t dstStride, uintptr_t src, uint64_t srcStride,
++    size_t rowBytes, int32_t rows)
++{
++	struct sweet_fb_copy_job job = { dst, src, dstStride, srcStride, rowBytes, rows };
++	uint32_t helpers = sweet_fb_copy_helpers;
++	if (helpers == 0 || rows < 64) {
++		sweet_fb_copy_band(&job, 0, 1);
++		return;
++	}
++	IOLockLock(sweet_fb_copy_lock);
++	sweet_fb_copy = job;
++	sweet_fb_copy_pending = helpers;
++	sweet_fb_copy_generation++;
++	IOLockWakeup(sweet_fb_copy_lock, &sweet_fb_copy_generation, false);
++	IOLockUnlock(sweet_fb_copy_lock);
++
++	sweet_fb_copy_band(&job, 0, helpers + 1);
++
++	IOLockLock(sweet_fb_copy_lock);
++	while (sweet_fb_copy_pending != 0) {
++		IOLockSleep(sweet_fb_copy_lock, &sweet_fb_copy_pending, THREAD_UNINT);
++	}
++	IOLockUnlock(sweet_fb_copy_lock);
++}
++#endif
++
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+  * A swap only records the frame: copying 10 MB into the panel on every
+@@ -581,11 +698,17 @@ AppleCLCD::present(const uint8_t *rec)
+ 			    s->bytesPerRow, dx, dy, w, h);
+ 		} else if (src != 0 && bpe == 4) {
+ 			copied += (uint64_t)w * (uint64_t)h * 4;
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++			sweet_fb_copy_rows(fPixels + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4, fRowBytes,
++			    src + s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4, s->bytesPerRow,
++			    (size_t)w * 4, h);
++#else
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
++#endif
+ 		}
+ 		s->release();
+ 	}
+diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
+index 54edb01..acd774e 100644
+--- a/osfmk/vm/vm_kern.c
++++ b/osfmk/vm/vm_kern.c
+@@ -3542,6 +3542,17 @@ kmem_add_extra_claims(void)
+ 		total_claims += kmem_claims[i].kc_size;
+ 	}
+ 	assert((total_claims & PAGE_MASK) == 0);
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/* 2 GiB of RAM failed in kmem_range_init: record what is claimed. */
++	printf("HEROLTE KMEM: kernel_map %#llx-%#llx largest_free %#llx claims %#llx (%u) mem %#llx\n",
++	    (uint64_t)kernel_map->min_offset, (uint64_t)kernel_map->max_offset,
++	    (uint64_t)largest_free_size, (uint64_t)total_claims, kmem_claim_count,
++	    (uint64_t)sane_size);
++	for (uint32_t i = 0; i < kmem_claim_count; i++) {
++		printf("HEROLTE KMEM: claim %s %#llx\n", kmem_claims[i].kc_name,
++		    (uint64_t)kmem_claims[i].kc_size);
++	}
++#endif
+ 	largest_free_size -= total_claims;
+ 
+ 	/*
+@@ -3641,8 +3652,13 @@ kmem_scramble_ranges(void)
+ 		struct mach_vm_range *sp_range = sp.kc_range;
+ 		if (vm_map_locate_space(kernel_map, sp.kc_size, 0,
+ 		    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL) != KERN_SUCCESS) {
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++			panic("kmem_range_init: vm_map_locate_space failing for claim %s size %#llx at %#llx",
++			    sp.kc_name, (uint64_t)sp.kc_size, (uint64_t)start);
++#else
+ 			panic("kmem_range_init: vm_map_locate_space failing for claim %s",
+ 			    sp.kc_name);
++#endif
+ 		}
+ 
+ 		end = start + sp.kc_size;

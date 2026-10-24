@@ -1,0 +1,64 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 6996772..f870d0c 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -80,8 +80,8 @@ SweetCPU::start(IOService *provider)
+ 		return false;
+ 	}
+ #if defined(A5XELTE)
+-	/* Only CPU0 is described and tested for the Exynos7580 port. */
+-	if (cpu->phys_id != 0 || topology->num_cpus != 1) {
++	/* Only the boot CPU is described and tested on these boards. */
++	if (cpu->phys_id != A5XELTE_BOOT_MPIDR || topology->num_cpus != 1) {
+ 		panic(CPU_PORT_NAME " CPU: unsupported topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
+@@ -163,8 +163,15 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		IOSleep(1);
+ 	}
+ 	/* Both current ADTs describe CPU0 as the boot CPU. */
++#if defined(A5XELTE)
++	if (topology->boot_cpu->cpu_id != 0 ||
++	    topology->boot_cpu->phys_id != A5XELTE_BOOT_MPIDR) {
++		panic(CPU_PORT_NAME " CPU: expected boot MPIDR 0x%x and logical CPU 0",
++		    A5XELTE_BOOT_MPIDR);
++#else
+ 	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
+ 		panic(CPU_PORT_NAME " CPU: expected boot MPIDR 0 and logical CPU 0");
++#endif
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+@@ -259,7 +266,11 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ {
+ 	const ml_topology_cpu_t *cpu = &ml_get_topology_info()->cpus[getCPUNumber()];
+ 	/* cpu_start() passes NULL,NULL: x20/x21 are set by LowResetVectorBase. */
++#if defined(A5XELTE)
++	if (start_paddr != 0 || arg_paddr != 0 || cpu->phys_id == A5XELTE_BOOT_MPIDR ||
++#else
+ 	if (start_paddr != 0 || arg_paddr != 0 || cpu->phys_id == 0 ||
++#endif
+ 	    __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) != 0) {
+ 		panic(CPU_PORT_NAME " CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
+diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
+index a3b4772..3cf6d22 100644
+--- a/pexpert/pexpert/arm64/A5XELTE.h
++++ b/pexpert/pexpert/arm64/A5XELTE.h
+@@ -22,6 +22,8 @@
+ #define A5XELTE_FB_TEXT_SCALE         3
+ #define A5XELTE_FB_DOT_PITCH          577   /* 1440 pixels across 5.1 inches */
+ #define A5XELTE_MARKER_PA             0x8ffff100
++/* S-Boot starts on the Cortex-A53 "Apollo" cluster, Aff1 = 1. */
++#define A5XELTE_BOOT_MPIDR            0x100
+ #else
+ #define A5XELTE_FB_PA                 0x67000000
+ #define A5XELTE_FB_WIDTH              1080
+@@ -31,6 +33,7 @@
+ #define A5XELTE_FB_TEXT_SCALE         2
+ #define A5XELTE_FB_DOT_PITCH          424   /* 1080 pixels across 5.2 inches */
+ #define A5XELTE_MARKER_PA             0x469ff100
++#define A5XELTE_BOOT_MPIDR            0x0
+ #endif
+ 
+ #define ARM_ARCH_TIMER

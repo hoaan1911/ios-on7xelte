@@ -1,0 +1,172 @@
+diff --git a/bsd/dev/herolte_touch.c b/bsd/dev/herolte_touch.c
+index 846872d..94d4299 100644
+--- a/bsd/dev/herolte_touch.c
++++ b/bsd/dev/herolte_touch.c
+@@ -127,12 +127,62 @@ pm_batch(uint32_t value, uint32_t reg)
+ 	}
+ }
+ 
+-/* One PMIC message through the batcher, as exynos5_i2c_xfer_batcher. */
++static void
++pm_dump(const char *what)
++{
++	printf("HEROLTE PMIC: %s: ctl=%#x conf=%#x auto=%#x int=%#x trans=%#x fifo=%#x "
++	    "bat_con=%#x bat_state=%#x bat_int=%#x bat_fifo=%#x\n", what,
++	    ht_rd(ht_pm, HSI2C_CTL), ht_rd(ht_pm, HSI2C_CONF), ht_rd(ht_pm, HSI2C_AUTO_CONF),
++	    ht_rd(ht_pm, HSI2C_INT_STAT), ht_rd(ht_pm, HSI2C_TRANS), ht_rd(ht_pm, HSI2C_FIFO_STAT),
++	    ht_rd(ht_pm, PM_BAT_CON), ht_rd(ht_pm, PM_BAT_STATE), ht_rd(ht_pm, PM_BAT_INT_STAT),
++	    ht_rd(ht_pm, 0x50c));
++}
++
++/*
++ * exynos5_i2c_probe() for a batcher bus: clear pending interrupts, SW
++ * reset, then exynos5_i2c_init(): master, trailing count, the HS master
++ * code (bus 15: MASTER_ID = (15 & 7) + 8) and CONF HS | AUTO.
++ */
++static void
++pm_bus_init(void)
++{
++	ht_wr(ht_pm, HSI2C_INT_STAT, ht_rd(ht_pm, HSI2C_INT_STAT));
++	ht_wr(ht_pm, HSI2C_CTL, ht_rd(ht_pm, HSI2C_CTL) | (1u << 31));
++	ht_wr(ht_pm, HSI2C_CTL, ht_rd(ht_pm, HSI2C_CTL) & ~(1u << 31));
++	ht_wr(ht_pm, HSI2C_CTL, 1u << 3);
++	ht_wr(ht_pm, HSI2C_TRAILING, 0xfu);
++	ht_wr(ht_pm, HSI2C_ADDR, 0x0fu << 24);
++	ht_wr(ht_pm, HSI2C_CONF, ht_rd(ht_pm, HSI2C_CONF) | (1u << 29) | (1u << 31));
++}
++
++/* Linux recover_batcher()/reset_batcher() for a stuck program. */
++static void
++pm_batcher_recover(uint32_t state)
++{
++	if (state >= (1u << 6) && state <= (1u << 13)) {
++		ht_wr(ht_pm, PM_BAT_CON, 1u << 31);
++		ht_wr(ht_pm, PM_BAT_CON, 0);
++		if (ht_rd(ht_pm, PM_BAT_STATE) & 1u) {
++			ht_wr(ht_pm, PM_BAT_STATE, 1u);
++		}
++		pm_bus_init();
++		ht_wr(ht_pm, PM_BAT_CON, 0);
++		ht_wr(ht_pm, PM_SMRELEASE, 1u);
++	}
++	ht_wr(ht_pm, PM_BAT_CON, 0);
++}
++
++/*
++ * One PMIC message through the batcher, as exynos5_i2c_xfer_batcher.
++ * ext_read: Linux's read form (10-bit mode + EXT_ADDR); otherwise a plain
++ * 7-bit read is tried as the alternative.
++ */
+ static bool
+-pm_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
++pm_message(bool receive, uint8_t *bytes, unsigned count, bool stop, bool ext_read)
+ {
+ 	uint32_t read_at;
+ 	uint32_t state = 0;
++	bool ext = receive && ext_read;
+ 
+ 	pm_cmd_buffer = 0xffffffffu;
+ 	pm_cmd_index = pm_cmd_pointer = pm_desc = 0;
+@@ -147,11 +197,12 @@ pm_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
+ 	pm_batch((0xfu << 16) | (19u << 24) | (38u << 8) | 38u, HSI2C_FS2);
+ 	pm_batch((1u << 16) | 76u, HSI2C_FS3);
+ 	pm_batch(0x2ffu, HSI2C_TRAILING);
+-	pm_batch((receive ? (1u << 30) : 0) | (1u << 29) | (1u << 31) | (3u << 16) | (3u << 13) |
++	pm_batch((ext ? (1u << 30) : 0) | (1u << 29) | (1u << 31) | (3u << 16) | (3u << 13) |
+ 	    (1u << 28) | (1u << 27) | 0xffu, HSI2C_CONF);
+ 	pm_batch(0, HSI2C_TIMEOUT);
+ 	pm_batch(3u | (8u << 16) | (count << 4), HSI2C_FIFO_CTL);
+-	pm_batch((1u << 3) | (receive ? ((1u << 6) | (1u << 30)) : (1u << 7)), HSI2C_CTL);
++	pm_batch((1u << 3) | (receive ? ((1u << 6) | (ext ? (1u << 30) : 0)) : (1u << 7)),
++	    HSI2C_CTL);
+ 	pm_batch(PM_ADDR << 10, HSI2C_ADDR);
+ 	pm_batch((receive ? (1u << 16) : 0) | (stop ? (1u << 17) : 0) | count | (1u << 31),
+ 	    HSI2C_AUTO_CONF);
+@@ -165,26 +216,19 @@ pm_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
+ 	/* Start: the batcher waits for the APM semaphore, runs, releases it. */
+ 	ht_wr(ht_pm, PM_BAT_INT_EN, 1u);
+ 	ht_wr(ht_pm, PM_BAT_CON, ht_rd(ht_pm, PM_BAT_CON) | (1u << 4));
+-	for (unsigned us = 0; us < 500000; us++) {
++	for (unsigned n = 0; n < 2000; n++) {          /* >= 200 ms */
+ 		state = ht_rd(ht_pm, PM_BAT_STATE);
+ 		if (state & 3u) {
+ 			break;
+ 		}
+-		delay(1);
++		delay(100);
+ 	}
+ 	ht_wr(ht_pm, PM_BAT_INT_EN, 0);
+ 	if ((state & 3u) != 1u) {
+-		printf("HEROLTE PMIC: batcher %s failed state=%#x int=%#x fifo=%#x\n",
+-		    receive ? "rx" : "tx", state, ht_rd(ht_pm, PM_BAT_INT_STAT),
+-		    ht_rd(ht_pm, 0x50c));
+-		/* Linux recover_batcher: reset only if stuck in CONFIG..CLEAN_INTR. */
+-		if (state >= (1u << 6) && state <= (1u << 13)) {
+-			ht_wr(ht_pm, PM_BAT_CON, 1u << 31);
+-			ht_wr(ht_pm, PM_BAT_CON, 0);
+-			ht_wr(ht_pm, PM_SMRELEASE, 1u);
+-		}
+-		ht_wr(ht_pm, PM_BAT_STATE, ht_rd(ht_pm, PM_BAT_STATE) | 1u);
+-		ht_wr(ht_pm, PM_BAT_CON, 0);
++		printf("HEROLTE PMIC: %s%s failed, state=%#x\n", receive ? "rx" : "tx",
++		    ext ? " (ext)" : "", state);
++		pm_dump("after failure");
++		pm_batcher_recover(state);
+ 		return false;
+ 	}
+ 	if (receive) {
+@@ -198,18 +242,26 @@ pm_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
+ 	return true;
+ }
+ 
+-/* regmap-style register access: [reg] then read without a STOP between. */
++/*
++ * Read forms: 0 = Linux regmap over the batcher ([reg] without STOP, then
++ * the 10-bit/EXT read), 1 = the same with a plain 7-bit read, 2 = [reg]
++ * with STOP, then a plain read. The first one that works is kept.
++ */
++static int pm_read_form;
++static const char *const pm_form_name[3] = {"ext", "plain", "stop"};
++
+ static bool
+ pm_read(uint8_t reg, uint8_t *value)
+ {
+-	return pm_message(false, &reg, 1, false) && pm_message(true, value, 1, true);
++	return pm_message(false, &reg, 1, pm_read_form == 2, false) &&
++	       pm_message(true, value, 1, true, pm_read_form == 0);
+ }
+ 
+ static bool
+ pm_write(uint8_t reg, uint8_t value)
+ {
+ 	uint8_t data[2] = {reg, value};
+-	return pm_message(false, data, 2, true);
++	return pm_message(false, data, 2, true, false);
+ }
+ 
+ /* Switch on tsp_io (LDO32) then tsp_avdd (LDO33), as sec_ts_power(). */
+@@ -218,10 +270,20 @@ pm_touch_power_on(void)
+ {
+ 	uint8_t id = 0, l32 = 0, l33 = 0, c32 = 0, c33 = 0;
+ 
+-	printf("HEROLTE PMIC: batcher con=%#x state=%#x (as found)\n",
+-	    ht_rd(ht_pm, PM_BAT_CON), ht_rd(ht_pm, PM_BAT_STATE));
+-	if (!pm_read(0x00, &id) || !pm_read(S2MPS16_L32CTRL, &l32) ||
+-	    !pm_read(S2MPS16_L33CTRL, &l33)) {
++	pm_dump("as found");
++	pm_bus_init();
++	pm_dump("after init");
++	/* Try the read forms in order; keep the first that works. */
++	bool read_ok = false;
++	for (pm_read_form = 0; pm_read_form < 3; pm_read_form++) {
++		read_ok = pm_read(0x00, &id);
++		printf("HEROLTE PMIC: read form %s: %s id=%#x\n", pm_form_name[pm_read_form],
++		    read_ok ? "ok" : "failed", id);
++		if (read_ok) {
++			break;
++		}
++	}
++	if (!read_ok || !pm_read(S2MPS16_L32CTRL, &l32) || !pm_read(S2MPS16_L33CTRL, &l33)) {
+ 		printf("HEROLTE PMIC: S2MPS16 read failed\n");
+ 		return false;
+ 	}

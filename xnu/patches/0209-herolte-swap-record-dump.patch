@@ -1,0 +1,30 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 07c8b02..95205eb 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -397,6 +397,25 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/* Raw record of the first swaps: offset=value of every non-zero word. */
++	if (sweet_fb_swap_count < 8) {
++		char line[160];
++		int n = 0;
++		for (uint32_t off = 0; off + 4 <= SWEET_FB_SWAP_REC_SIZE; off += 4) {
++			uint32_t v = get32(rec, off);
++			if (v == 0) {
++				continue;
++			}
++			n += snprintf(line + n, sizeof(line) - n, " %x=%x", off, v);
++			if (n > (int)sizeof(line) - 24) {
++				IOLog("HEROLTE FB: rec %llu%s\n", sweet_fb_swap_count, line);
++				n = 0;
++			}
++		}
++		IOLog("HEROLTE FB: rec %llu%s\n", sweet_fb_swap_count, n ? line : " end");
++	}
++#endif
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}

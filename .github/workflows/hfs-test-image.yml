@@ -1,0 +1,44 @@
+name: hfs-test-image
+
+# A small partition-less HFSX volume for the first root-mount test on
+# herolte (rd=ufsroot0 ufsroot=USERDATA). It has no launchd: a successful
+# boot mounts it and then panics on the missing /sbin/launchd.
+on:
+  workflow_dispatch:
+  push:
+    branches: [herolte]
+    paths:
+      - ".github/workflows/hfs-test-image.yml"
+
+jobs:
+  image:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - name: Create 32 MiB HFSX volume
+        run: |
+          set -euo pipefail
+          hdiutil create -size 32m -fs "Case-sensitive Journaled HFS+" \
+            -volname HEROTEST -layout NONE -type UDIF -o hfstest
+          dev=$(hdiutil attach -nobrowse -owners on hfstest.dmg | awk '/HEROTEST/ {print $1}')
+          vol=/Volumes/HEROTEST
+          sudo mkdir -p "$vol/private/var" "$vol/sbin"
+          echo "herolte root mount test $(date -u +%FT%TZ)" | sudo tee "$vol/HEROLTE_ROOT_TEST" >/dev/null
+          ls -la "$vol"
+          hdiutil detach "$dev"
+          hdiutil convert hfstest.dmg -format UDTO -o hfstest
+          mv hfstest.cdr hfstest.img
+          # Raw HFSX: volume header signature "HX" at byte 1024.
+          sig=$(dd if=hfstest.img bs=1 skip=1024 count=2 2>/dev/null)
+          echo "signature: $sig"
+          test "$sig" = "HX"
+          ls -l hfstest.img
+          gzip -9 -k hfstest.img
+          shasum -a 256 hfstest.img hfstest.img.gz | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hfs-test-image
+          path: |
+            hfstest.img.gz
+            SHA256SUMS

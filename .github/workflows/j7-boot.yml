@@ -1,0 +1,48 @@
+name: j7-boot
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_run_id:
+        description: "Run id of an xnu workflow run built with machine_config A5XELTE (the number in its URL)"
+        required: true
+      cmdline:
+        description: "XNU boot-args"
+        default: "debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress"
+
+jobs:
+  boot:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+      - name: Kernel from the xnu run
+        uses: actions/download-artifact@v4
+        with:
+          name: xnu-kernel
+          path: kernel
+          run-id: ${{ inputs.kernel_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Loader
+        run: |
+          CC=aarch64-linux-gnu-gcc LD=aarch64-linux-gnu-ld OBJCOPY=aarch64-linux-gnu-objcopy \
+            sh shim/j7prime/build-xnu-boot.sh
+      - name: ADT, payload and boot image
+        run: |
+          mkdir -p out
+          ls -l kernel
+          python3 tools/mkadt_j7prime.py out/j7prime.adt
+          python3 tools/mkpayload.py kernel/kernel.development.a5xelte out/j7prime.adt out/payload.bin --cmdline "${{ inputs.cmdline }}"
+          python3 tools/mkdtbh.py -o out/dt.img device/on7xelte.dtb
+          python3 tools/mkj7img.py --kernel shim/j7prime/outxnu/Image --ramdisk out/payload.bin --dt out/dt.img --name j7xnu -o out/j7-xnu-boot.img
+          ls -l out
+          test "$(stat -c %s out/j7-xnu-boot.img)" -lt 33554432
+      - uses: actions/upload-artifact@v4
+        with:
+          name: j7-xnu-boot
+          path: |
+            out/j7-xnu-boot.img
+            out/j7prime.adt

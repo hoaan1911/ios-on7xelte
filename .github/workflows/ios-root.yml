@@ -1,0 +1,118 @@
+name: ios-root
+
+# Build the iOS 16 root volume for herolte (HFSX, partition-less) from the
+# iPhone X IPSW (iPhone10,3 / D22AP, the donor's tested identity) and
+# publish it as assets of a release in THIS repository.
+# The image contains Apple software: the job refuses to run in a public
+# repository, and the release must stay private to its owner.
+on:
+  push:
+    branches: [ios-root-build]
+  workflow_dispatch:
+    inputs:
+      size_mb:
+        description: HFSX volume size in MiB (must fit USERDATA, 21566 MiB on SM-G930F)
+        default: "20480"
+      ipsw_device:
+        description: ipsw.me identifier of the userland source
+        default: "iPhone10,3"
+      ios_version:
+        description: iOS version
+        default: "16.7.16"
+
+permissions:
+  contents: write
+
+jobs:
+  root:
+    if: github.event.repository.private == true
+    runs-on: macos-14
+    timeout-minutes: 180
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space (Xcode and simulators are not needed)
+        run: |
+          df -h /
+          sudo rm -rf /Applications/Xcode*.app /Library/Developer/CoreSimulator \
+            ~/Library/Developer/CoreSimulator /Users/runner/Library/Android || true
+          df -h /
+
+      - name: Fetch IPSW members
+        run: |
+          set -euo pipefail
+          url=$(curl -sf "https://api.ipsw.me/v4/device/${{ inputs.ipsw_device || 'iPhone10,3' }}?type=ipsw" | python3 -c "
+          import json, sys
+          fw = [f for f in json.load(sys.stdin)['firmwares'] if f['version'] == '${{ inputs.ios_version || '16.7.16' }}']
+          print(fw[0]['url'])")
+          echo "IPSW: $url"
+          mkdir -p ipsw
+          python3 tools/remotezip.py "$url" BuildManifest.plist ipsw
+          python3 - ipsw/BuildManifest.plist > members.txt <<'PY'
+          import plistlib, sys
+          m = plistlib.load(open(sys.argv[1], 'rb'))
+          ident = next(i for i in m['BuildIdentities']
+                       if i['Info']['DeviceClass'].lower() == 'd22ap'
+                       and 'Erase' in i['Info'].get('Variant', ''))
+          want = {'OS': 'os', 'Cryptex1,SystemOS': 'systemos', 'Cryptex1,AppOS': 'appos',
+                  'DeviceTree': 'devicetree'}
+          for key, name in want.items():
+              print(name, ident['Manifest'][key]['Info']['Path'])
+          PY
+          cat members.txt
+          while read -r name path; do
+            python3 tools/remotezip.py "$url" "$path" ipsw
+            mv "ipsw/$path" "ipsw/$name.${path##*.}"
+          done < members.txt
+          ls -la ipsw
+          df -h /
+
+      - name: Extract the D22AP device tree (for the ADT /product node)
+        run: |
+          set -euo pipefail
+          # Homebrew's Python is externally managed (PEP 668): use a venv.
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet pyimg4
+          "$RUNNER_TEMP/venv/bin/pyimg4" im4p extract -i ipsw/devicetree.im4p -o d22ap.adt
+          ls -l d22ap.adt
+
+      - name: Stage the root volume
+        run: |
+          set -euo pipefail
+          attach() { hdiutil attach -nobrowse -readonly -owners on "$1" | awk -F'\t' '/\/Volumes\// {print $NF}' | tail -1; }
+          os=$(attach ipsw/os.dmg); sys=$(attach ipsw/systemos.dmg); app=$(attach ipsw/appos.dmg)
+          echo "OS=$os SystemOS=$sys AppOS=$app"
+          hdiutil create -size "${{ inputs.size_mb || '20480' }}m" -type SPARSE -layout NONE \
+            -fs "Case-sensitive Journaled HFS+" -volname IOSROOT root
+          root=$(hdiutil attach -nobrowse -owners on root.sparseimage | awk -F'\t' '/\/Volumes\// {print $NF}' | tail -1)
+          echo "root=$root"
+          sudo env STAGE_ALL_APPS=1 bash tools/a5xelte-stage-ios-root.sh "$os" "$sys" "$app" "$root"
+          build=$(/usr/libexec/PlistBuddy -c 'Print :ProductBuildVersion' ipsw/BuildManifest.plist)
+          sudo bash tools/herolte-tune-ios-root.sh "$root" "$build"
+          hdiutil detach "$root"; hdiutil detach "$os"; hdiutil detach "$sys"; hdiutil detach "$app"
+          rm -f ipsw/os.dmg ipsw/systemos.dmg ipsw/appos.dmg
+          df -h /
+
+      - name: Raw image, compressed and split
+        run: |
+          set -euo pipefail
+          brew install pigz >/dev/null
+          dev=$(hdiutil attach -nomount -nobrowse root.sparseimage | awk 'NR==1 {print $1}')
+          echo "device $dev"
+          sudo dd if="/dev/r${dev#/dev/}" bs=4m | pigz -1 > root.img.gz
+          hdiutil detach "$dev"
+          rm -f root.sparseimage
+          ls -l root.img.gz
+          split -b 1900m -d -a 2 root.img.gz root.img.gz.part
+          rm root.img.gz
+          shasum -a 256 root.img.gz.part* d22ap.adt | tee SHA256SUMS
+
+      - name: Publish as a private release
+        run: |
+          set -euo pipefail
+          tag="ios-root-${{ inputs.ios_version || '16.7.16' }}-${{ github.run_id }}"
+          gh release create "$tag" root.img.gz.part* d22ap.adt SHA256SUMS \
+            --title "iOS ${{ inputs.ios_version || '16.7.16' }} root for herolte (${{ inputs.size_mb || '20480' }} MiB)" \
+            --notes "Apple software for personal use on the owner's device. Do not make this repository or release public."

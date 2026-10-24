@@ -1,0 +1,175 @@
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -16,6 +16,7 @@
+ extern void thread_terminate_self(void);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void a5xelte_touch_probe(void);
++bool a5xelte_gpu_prepare_buck4(void);
+ static bool a5touch_controller_init(void);
+ static bool a5touch_report_packet(const uint8_t packet[34], unsigned *lines);
+ static void a5touch_release_contacts(void);
+@@ -168,6 +168,57 @@
+ 		delay(1000);
+ 	}
+ 	return false;
++}
++
++/* GPU service runs before the early touch probe. Reuse this single HSI2C3
++ * implementation rather than racing a second controller owner. BUCK4's
++ * externally-controlled enable is left unchanged; only its voltage selector
++ * is set to the Linux-verified 900 mV OPP (400000 + 80 * 6250 uV).
++ */
++bool
++a5xelte_gpu_prepare_buck4(void)
++{
++	vm_offset_t pins, hsi;
++	uint32_t old_con, old_pud;
++	uint8_t id = 0xff, selector = 0xff, enable = 0xff, check = 0xff;
++	bool ok = false;
++	if (a5_touch_hsi) {
++		printf("A5XELTE G3D: PMIC already owned by touch; BUCK4 unchanged\n");
++		return false;
++	}
++	pins = ml_io_map(0x104e0000, 0x1000);
++	hsi = ml_io_map(0x104c0000, 0x2000);
++	if (!pins || !hsi)
++		return false;
++	old_con = a5touch_read(pins, 0);
++	old_pud = a5touch_read(pins, 8);
++	a5touch_write(pins, 8, (old_pud & ~0xfu) | 0xfu);
++	a5touch_write(pins, 0, (old_con & ~0xffu) | 0x22u);
++	delay(100);
++	a5pmic_bus_init(hsi);
++	if (!a5pmic_read(hsi, 0x00, &id) || id != 0x02 ||
++	    !a5pmic_read(hsi, 0x21, &selector) ||
++	    !a5pmic_read(hsi, 0x20, &enable)) {
++		printf("A5XELTE G3D: PMIC BUCK4 identity/read failed id=%#x\n", id);
++		goto out;
++	}
++	printf("A5XELTE G3D: BUCK4 selector=%#x (%u uV) enable=%#x\n",
++	    selector, 400000u + (unsigned)selector * 6250u, enable);
++	/* The reference regulator allows changing selector only. Do not touch
++	 * the external-enable bits or any other PMIC rail. */
++	if (selector != 0x50 && !a5pmic_write(hsi, 0x21, 0x50))
++		goto out;
++	if (!a5pmic_read(hsi, 0x21, &check) || check != 0x50) {
++		printf("A5XELTE G3D: BUCK4 900mV readback failed %#x\n", check);
++		goto out;
++	}
++	delay(1000);
++	printf("A5XELTE G3D: BUCK4 readback 900000 uV; enable unchanged\n");
++	ok = true;
++out:
++	a5touch_write(pins, 0, old_con);
++	a5touch_write(pins, 8, old_pud);
++	return ok;
+ }
+ 
+ static bool
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -23,6 +23,7 @@
+ extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size,
+     unsigned int flags);
+ extern "C" void ml_io_unmap(vm_offset_t addr, vm_size_t size);
++extern "C" bool a5xelte_gpu_prepare_buck4(void);
+ 
+ /* Passive probe of the already-powered GPU only. All offsets are from the
+  * native Exynos7580 Linux G3D clock/PMU driver. A powered-off GPU register
+@@ -65,13 +66,62 @@
+ static_assert(sizeof(A5G3DWriteValueJob) == 48, "Mali job descriptor size");
+ 
+ static bool
+-a5g3d_try_write_value(IOService *service, vm_offset_t gpu,
++a5g3d_power_cores(IOService *service, vm_offset_t gpu, vm_offset_t cmu)
++{
++    const uint32_t mux = a5g3d_read32(cmu, 0x208);
++    const uint32_t divider = a5g3d_read32(cmu, 0x600);
++    const uint32_t shader = a5g3d_read32(gpu, 0x100);
++    const uint32_t tiler = a5g3d_read32(gpu, 0x110);
++    const uint32_t l2 = a5g3d_read32(gpu, 0x120);
++    IOLog("A5XELTE G3D: core gate mux=%08x div=%08x present shader=%08x tiler=%08x l2=%08x\n",
++        mux, divider, shader, tiler, l2);
++    /* Native Linux's first verified OPP is TOP 400 MHz / 3, 900 mV.
++     * Refuse to run if firmware left a faster or unknown core clock.
++     */
++    if ((mux & 1) != 1 || (divider & 7) < 2 ||
++        !shader || !tiler || !l2 || (l2 & (l2 - 1))) {
++        service->setProperty("A5G3DJobResult", "clock-or-core-mask-unverified");
++        return false;
++    }
++    if (!a5xelte_gpu_prepare_buck4()) {
++        service->setProperty("A5G3DJobResult", "buck4-unverified");
++        return false;
++    }
++    /* Match panfrost_gpu_power_on: L2, shader, then tiler. The domain
++     * and CMU gates were verified in a5g3d_probe_existing_power().
++     */
++    const struct { uint32_t on, ready, mask, timeout_us; } steps[] = {
++        { 0x1a0, 0x160, l2, 20000 },
++        { 0x180, 0x140, shader, 20000 },
++        { 0x190, 0x150, tiler, 1000 },
++    };
++    for (const auto &step : steps) {
++        a5g3d_write32(gpu, step.on, step.mask);
++        uint32_t ready = 0;
++        for (unsigned us = 0; us < step.timeout_us; us += 10) {
++            ready = a5g3d_read32(gpu, step.ready);
++            if ((ready & step.mask) == step.mask)
++                break;
++            IODelay(10);
++        }
++        IOLog("A5XELTE G3D: core power on=%03x mask=%08x ready=%08x\n",
++            step.on, step.mask, ready);
++        if ((ready & step.mask) != step.mask) {
++            service->setProperty("A5G3DJobResult", "core-power-timeout");
++            return false;
++        }
++    }
++    return true;
++}
++
++static bool
++a5g3d_try_write_value(IOService *service, vm_offset_t gpu, vm_offset_t cmu,
+     IOBufferMemoryDescriptor *&storage)
+ {
+     /* Linux Panfrost's JS1 is the vertex/tiler queue, including WRITE_VALUE.
+      * Never disturb a running job or an active address space.
+      */
+-    const uint32_t shader = a5g3d_read32(gpu, 0x140);
++    uint32_t shader = a5g3d_read32(gpu, 0x140);
+     const uint32_t l2 = a5g3d_read32(gpu, 0x160);
+     const uint32_t addressSpaces = a5g3d_read32(gpu, 0x018);
+     const uint32_t jobSlots = a5g3d_read32(gpu, 0x01c);
+@@ -80,11 +130,19 @@
+     const uint32_t as0Transtab = a5g3d_read32(gpu, 0x2400);
+     IOLog("A5XELTE G3D: job gate shader=%08x l2=%08x as=%08x js=%08x pending=%08x as0=%08x ttbr=%08x\n",
+         shader, l2, addressSpaces, jobSlots, pending, as0Status, as0Transtab);
+-    if (!shader || !l2 || !(addressSpaces & 1) || !(jobSlots & 2) ||
++    if (!(addressSpaces & 1) || !(jobSlots & 2) ||
+         pending || (as0Status & 1) || as0Transtab) {
+         service->setProperty("A5G3DJobResult", "not-ready");
+         return false;
+     }
++    if ((!shader || !l2) && !a5g3d_power_cores(service, gpu, cmu))
++        return false;
++    shader = a5g3d_read32(gpu, 0x140);
++    if (!shader || !a5g3d_read32(gpu, 0x160)) {
++        service->setProperty("A5G3DJobResult", "cores-still-off");
++        return false;
++    }
++
+     storage = IOBufferMemoryDescriptor::withOptions(
+         kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+         kA5G3DTestBytes, kA5G3DTestBytes);
+@@ -242,7 +300,7 @@
+     IOLog("A5XELTE G3D: passive GPU_ID=%08x product=%04x (expected 0720); %s\n",
+         id, product, runJob ? "offscreen test requested" : "no GPU jobs");
+     if (runJob && product == 0x720)
+-        a5g3d_try_write_value(service, gpu, storage);
++        a5g3d_try_write_value(service, gpu, cmu, storage);
+     ml_io_unmap(gpu, gpuSize);
+     ml_io_unmap(cmu, 0x1000);
+     ml_io_unmap(pmu, 0x1000);

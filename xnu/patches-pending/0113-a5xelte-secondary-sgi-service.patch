@@ -1,0 +1,52 @@
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -23,6 +23,7 @@
+ #if defined(A5XELTE)
+ extern "C" void a5xelte_send_self_ipi(void);
+ extern "C" void a5xelte_send_ipi(unsigned int logical);
++extern "C" void a5xelte_gic_diagnostics(unsigned int logical, const char *stage);
+ #define CPU_PORT_NAME "A5XELTE"
+ #else
+ #define CPU_PORT_NAME "SWEET"
+@@ -219,6 +220,19 @@
+ 	 * Waiting here with DAIF.I set would deadlock every secondary. */
+ 	signalCPU(this);
+ 	setCPUState(kIOCPUStateRunning);
++#if defined(A5XELTE)
++	if (getCPUNumber() != 0) {
++		/* The secondary enters here at splsched with DAIF.I set.  On this
++		 * GICv2 platform, explicitly service the queued self-SGI before
++		 * returning to XNU's startup continuation.  Restore the caller's
++		 * interrupt mask, as cpu_machine_init() expects it unchanged. */
++		a5xelte_gic_diagnostics(getCPUNumber(), "before self-SGI");
++		boolean_t old_irq = ml_set_interrupts_enabled(TRUE);
++		__builtin_arm_isb(ISB_SY);
++		a5xelte_gic_diagnostics(getCPUNumber(), "after self-SGI");
++		ml_set_interrupts_enabled(old_irq);
++	}
++#endif
+ 	kprintf(CPU_PORT_NAME " CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u\n",
+ 	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
+ 	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -272,6 +272,19 @@
+ }
+ 
+ void
++a5xelte_gic_diagnostics(unsigned int logical, const char *stage)
++{
++	kprintf("A5XELTE GIC: CPU%u %s group=%08x enable=%08x pending=%08x "
++	    "cpu_ctl=%08x pmr=%08x hppir=%08x\n", logical, stage,
++	    a5_gic_read32(a5_gicd_base, 0x080),
++	    a5_gic_read32(a5_gicd_base, 0x100),
++	    a5_gic_read32(a5_gicd_base, 0x200),
++	    a5_gic_read32(a5_gicc_base, 0x000),
++	    a5_gic_read32(a5_gicc_base, 0x004),
++	    a5_gic_read32(a5_gicc_base, 0x018));
++}
++
++void
+ pe_init_fiq(void)
+ {
+ 	/* The boot CPU maps the controller before any secondary can start.

@@ -1,0 +1,192 @@
+--- a/pexpert/pexpert/arm64/A5XELTE.h
++++ b/pexpert/pexpert/arm64/A5XELTE.h
+@@ -8,7 +8,7 @@
+ #define A5XELTE                       1
+ /* Reuse donor's SoC-neutral early services until their guards are renamed. */
+ #define SWEET                         1
+-#define SWEET_SMP_MAX_CPUS            1
++#define SWEET_SMP_MAX_CPUS            2
+ 
+ #define ARM_ARCH_TIMER
+ #define __ARM_ARCH__                  8
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -1,7 +1,7 @@
+ /*
+  * Shared IOCPU bring-up from the SWEET donor. A5XELTE currently selects
+- * only its Cortex-A53 boot CPU and uses its own GICv2 self-IPI path.
+- * Donor secondary-CPU PSCI and suspend paths are not enabled on A5XELTE.
++ * its Cortex-A53 boot CPU and one same-cluster secondary via PSCI.
++ * GICv2 SGI routing is board-specific; suspend remains disabled.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -22,6 +22,7 @@
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ #if defined(A5XELTE)
+ extern "C" void a5xelte_send_self_ipi(void);
++extern "C" void a5xelte_send_ipi(unsigned int logical);
+ #define CPU_PORT_NAME "A5XELTE"
+ #else
+ #define CPU_PORT_NAME "SWEET"
+@@ -80,8 +81,8 @@
+ 		return false;
+ 	}
+ #if defined(A5XELTE)
+-	/* Only CPU0 is described and tested for the Exynos7580 port. */
+-	if (cpu->phys_id != 0 || topology->num_cpus != 1) {
++	/* Start with CPU0 and CPU1 of the first Cortex-A53 cluster. */
++	if (cpu->phys_id != cpu->cpu_id || topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic(CPU_PORT_NAME " CPU: unsupported topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
+@@ -162,7 +163,7 @@
+ 		}
+ 		IOSleep(1);
+ 	}
+-	/* Both current ADTs describe CPU0 as the boot CPU. */
++	/* The A5 ADT describes CPU0 as the boot CPU. */
+ 	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
+ 		panic(CPU_PORT_NAME " CPU: expected boot MPIDR 0 and logical CPU 0");
+ 	}
+@@ -228,10 +229,11 @@
+ SweetCPU::signalCPU(IOCPU *target)
+ {
+ #if defined(A5XELTE)
+-	if (target != this) {
+-		panic("a5xelte: secondary CPU signalling is not enabled");
+-	}
+-	a5xelte_send_self_ipi();
++	if (target == this) {
++		a5xelte_send_self_ipi();
++	} else {
++		a5xelte_send_ipi(target->getCPUNumber());
++	}
+ #else
+ 	const ml_topology_info_t *topology = ml_get_topology_info();
+ 	unsigned int logical = target->getCPUNumber();
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -227,6 +227,7 @@
+ /* Exynos7580 GIC-400: distributor and CPU interface, both non-secure Group 1. */
+ static vm_offset_t a5_gicd_base;
+ static vm_offset_t a5_gicc_base;
++static uint8_t a5_gic_cpu_masks[SWEET_SMP_MAX_CPUS];
+ 
+ static uint32_t
+ a5_gic_read32(vm_offset_t base, unsigned int offset)
+@@ -260,24 +261,46 @@
+ }
+ 
+ void
++a5xelte_send_ipi(unsigned int logical)
++{
++	if (logical >= SWEET_SMP_MAX_CPUS || a5_gic_cpu_masks[logical] == 0) {
++		panic("a5xelte: GICv2 target CPU%u unavailable", logical);
++	}
++	__builtin_arm_dsb(DSB_ISHST);
++	a5_gic_write32(a5_gicd_base, 0xf00,
++	    ((uint32_t)a5_gic_cpu_masks[logical] << 16) | 1U);
++}
++
++void
+ pe_init_fiq(void)
+ {
+-	DTEntry entry;
+-	const void *reg;
+-	unsigned int size;
+-	if (SecureDTLookupEntry(NULL, "/arm-io/gic", &entry) != kSuccess ||
+-	    SecureDTGetProperty(entry, "reg", &reg, &size) != kSuccess ||
+-	    size < 4 * sizeof(uint64_t)) {
+-		panic("a5xelte: missing GICv2 reg in ADT");
+-	}
+-	const uint64_t *r = reg;
+-	vm_offset_t soc = pe_arm_get_soc_base_phys();
+-	a5_gicd_base = ml_io_map(soc + r[0], r[1]);
+-	a5_gicc_base = ml_io_map(soc + r[2], r[3]);
++	/* The boot CPU maps the controller before any secondary can start.
++	 * SecureDT iterators are not safe to run concurrently on secondaries. */
++	if (!a5_gicd_base) {
++		DTEntry entry;
++		const void *reg;
++		unsigned int size;
++		if (SecureDTLookupEntry(NULL, "/arm-io/gic", &entry) != kSuccess ||
++		    SecureDTGetProperty(entry, "reg", &reg, &size) != kSuccess ||
++		    size < 4 * sizeof(uint64_t)) {
++			panic("a5xelte: missing GICv2 reg in ADT");
++		}
++		const uint64_t *r = reg;
++		vm_offset_t soc = pe_arm_get_soc_base_phys();
++		a5_gicd_base = ml_io_map(soc + r[0], r[1]);
++		a5_gicc_base = ml_io_map(soc + r[2], r[3]);
++	}
+ 	if (!a5_gicd_base || !a5_gicc_base) {
+ 		panic("a5xelte: cannot map GICv2");
+ 	}
+-	/* INTID 27 is the virtual timer PPI; SGI 1 is the local self signal. */
++	/* Banked ITARGETSR0 reveals this core's actual GIC CPU-interface bit. */
++	unsigned int logical = ml_get_cpu_number_local();
++	uint8_t mask = a5_gic_read32(a5_gicd_base, 0x800) & 0xff;
++	if (logical >= SWEET_SMP_MAX_CPUS || mask == 0 || (mask & (mask - 1)) != 0) {
++		panic("a5xelte: invalid GICv2 CPU%u target mask 0x%x", logical, mask);
++	}
++	a5_gic_cpu_masks[logical] = mask;
++	/* INTID 27 is the virtual timer PPI; SGI 1 carries CPU signals. */
+ 	a5_gic_write32(a5_gicd_base, 0x080,
+ 	    a5_gic_read32(a5_gicd_base, 0x080) | (1U << 27) | (1U << 1));
+ 	for (unsigned int i = 0; i < 32; i += 4) {
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -464,7 +464,10 @@
+ uint8_t
+ user_timebase_type(void)
+ {
+-#if HAS_ACNTVCT
++#if defined(A5XELTE)
++	/* CNTVCT has different firmware offsets across Exynos7580 CPUs. */
++	return USER_TIMEBASE_NONE;
++#elif HAS_ACNTVCT
+ 	return USER_TIMEBASE_NOSPEC_APPLE;
+ #elif __ARM_ARCH_8_6__
+ 	return USER_TIMEBASE_NOSPEC;
+@@ -2064,7 +2067,10 @@
+ static inline uint64_t
+ nonspeculative_timebase(void)
+ {
+-#if defined(HAS_ACNTVCT)
++#if defined(A5XELTE)
++	__builtin_arm_isb(ISB_SY);
++	return __builtin_arm_rsr64("CNTPCT_EL0");
++#elif defined(HAS_ACNTVCT)
+ 	return __builtin_arm_rsr64("S3_4_c15_c10_6");
+ #elif __ARM_ARCH_8_6__
+ 	return __builtin_arm_rsr64("CNTVCTSS_EL0");
+@@ -2145,7 +2151,11 @@
+ 	do {
+ 		timebase = getCpuDatap()->cpu_base_timebase;
+ 		os_compiler_barrier();
++		#if defined(A5XELTE)
++		clock = __builtin_arm_rsr64("CNTPCT_EL0");
++		#else
+ 		clock = __builtin_arm_rsr64("CNTVCT_EL0");
++		#endif
+ 
+ 		os_compiler_barrier();
+ 	} while (getCpuDatap()->cpu_base_timebase != timebase);
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -306,11 +306,13 @@
+ 	mov		x1, #3
+ 	msr		CNTHCTL_EL2, x1
+ 	msr		CNTVOFF_EL2, xzr
+-	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access. */
++	/* GICv2 on A5XELTE has no ICC_SRE system-register interface. */
++#if !defined(A5XELTE)
+ 	mrs		x1, ICC_SRE_EL2
+ 	orr		x1, x1, #1
+ 	orr		x1, x1, #8
+ 	msr		ICC_SRE_EL2, x1
++#endif
+ 	/* Known Armv8 SCTLR RES1 bits, M/C/I off, little endian. */
+ 	MOV64	x1, 0x30d00800
+ 	msr		SCTLR_EL1, x1

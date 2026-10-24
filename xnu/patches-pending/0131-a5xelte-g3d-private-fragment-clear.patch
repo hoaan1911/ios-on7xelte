@@ -1,0 +1,270 @@
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -1,9 +1,9 @@
+ /*
+  * Exynos7580 Mali-T720 resource service for Samsung a5xelte.
+  *
+- * Stage 1 registers a resource-only IOKit service (a5gpu=1). Stage 2 can
+- * passively probe the PMU/clock gates and, only if they are already on,
+- * read GPU_ID (a5gpu=2). It does not write registers or claim acceleration.
++ * a5gpu=1 registers resources, a5gpu=2 probes the existing GPU state,
++ * a5gpu=3 runs a private WRITE_VALUE job, and a5gpu=4 runs a private
++ * 16x16 fragment clear. None of these paths accelerates iOS graphics.
+  *
+  * The Exynos7580 G3D domain needs an ordered BUCK4/bus/PMU/CMU sequence.
+  * Reading GPU_ID while power-gated can abort. Active power-up and job
+@@ -42,13 +42,18 @@
+ }
+ 
+ /* Panfrost's Mali-LPAE format uses four 4-KiB levels even for a low IOVA.
+- * Keep the test's descriptor and two output pixels in a single mapped page.
++ * Keep the test's descriptors and output in four private mapped pages.
+  * No identity mapping or access to the display buffer is provided to Mali.
+  */
+ static const uint64_t kA5G3DTestVA = 0x02000000ULL;
+ static const uint32_t kA5G3DTestBytes = 0x10000;
+ static const uint32_t kA5G3DDataOffset = 0x4000;
+ static const uint32_t kA5G3DOutputOffset = 0x100;
++static const uint32_t kA5G3DFragmentFBOffset = 0x100;
++static const uint32_t kA5G3DPolygonListOffset = 0x300;
++static const uint32_t kA5G3DFragmentOutputOffset = 0x600;
++static const uint32_t kA5G3DFragmentPixels = 16 * 16;
++static const uint32_t kA5G3DFragmentRed = 0xff0000ff;
+ 
+ struct A5G3DWriteValueJob {
+     uint32_t exceptionStatus;
+@@ -147,23 +152,27 @@
+ }
+ 
+ static bool
+-a5g3d_try_write_value(IOService *service, vm_offset_t gpu, vm_offset_t cmu,
+-    IOBufferMemoryDescriptor *&storage)
+-{
+-    /* Linux Panfrost's JS1 is the vertex/tiler queue, including WRITE_VALUE.
++a5g3d_try_private_job(IOService *service, vm_offset_t gpu, vm_offset_t cmu,
++    IOBufferMemoryDescriptor *&storage, bool fragment)
++{
++    /* Linux Panfrost sends fragment jobs to JS0 and WRITE_VALUE to JS1.
+      * Never disturb a running job or an active address space.
+      */
++    const uint32_t slot = fragment ? 0 : 1;
++    const uint32_t slotBase = 0x1800 + slot * 0x80;
+     uint32_t shader = a5g3d_read32(gpu, 0x140);
+     const uint32_t l2 = a5g3d_read32(gpu, 0x160);
+     const uint32_t addressSpaces = a5g3d_read32(gpu, 0x018);
+     const uint32_t jobSlots = a5g3d_read32(gpu, 0x01c);
+-    const uint32_t pending = a5g3d_read32(gpu, 0x1880 + 0x60);
++    const uint32_t pending = a5g3d_read32(gpu, slotBase + 0x60);
++    const uint32_t slotStatus = a5g3d_read32(gpu, slotBase + 0x24);
+     const uint32_t as0Status = a5g3d_read32(gpu, 0x2400 + 0x28);
+     const uint32_t as0Transtab = a5g3d_read32(gpu, 0x2400);
+-    IOLog("A5XELTE G3D: job gate shader=%08x l2=%08x as=%08x js=%08x pending=%08x as0=%08x ttbr=%08x\n",
+-        shader, l2, addressSpaces, jobSlots, pending, as0Status, as0Transtab);
+-    if (!(addressSpaces & 1) || !(jobSlots & 2) ||
+-        pending || (as0Status & 1) || as0Transtab) {
++    IOLog("A5XELTE G3D: job gate slot=%u shader=%08x l2=%08x as=%08x js=%08x pending=%08x status=%08x as0=%08x ttbr=%08x\n",
++        slot, shader, l2, addressSpaces, jobSlots, pending, slotStatus,
++        as0Status, as0Transtab);
++    if (!(addressSpaces & 1) || !(jobSlots & (1u << slot)) ||
++        pending || slotStatus || (as0Status & 1) || as0Transtab) {
+         service->setProperty("A5G3DJobResult", "not-ready");
+         return false;
+     }
+@@ -205,15 +214,58 @@
+          */
+         l3[i] = (physical + kA5G3DDataOffset + i * 0x1000) | 0x2c1;
+     }
+-    A5G3DWriteValueJob *job = reinterpret_cast<A5G3DWriteValueJob *>(
+-        bytes + kA5G3DDataOffset);
+-    job->typeAndSize = 1 | (2 << 1);
+-    job->index = 1;
+-    job->outputVA = kA5G3DTestVA + kA5G3DOutputOffset;
+-    job->valueType = 3;
+-    uint64_t *output = reinterpret_cast<uint64_t *>(
+-        bytes + kA5G3DDataOffset + kA5G3DOutputOffset);
+-    *output = 0xa5a5a5a55a5a5a5aULL;
++    uint64_t *output = nullptr;
++    uint32_t *pixels = nullptr;
++    if (fragment) {
++        /* Mesa 26.2.4 Panfrost v4.xml: 48-byte FRAGMENT_JOB, 320-byte
++         * single-target FRAMEBUFFER, and the T720 no-hierarchy polygon
++         * list. Every Mali address points into the private mapped pages.
++         */
++        static_assert(kA5G3DFragmentFBOffset % 64 == 0, "SFBD alignment");
++        static_assert(kA5G3DPolygonListOffset % 64 == 0, "polygon list alignment");
++        static_assert(kA5G3DFragmentOutputOffset + 1024 < 0x4000,
++            "fragment fixture fits private map");
++        const uint64_t fbVA = kA5G3DTestVA + kA5G3DFragmentFBOffset;
++        const uint64_t polygonVA = kA5G3DTestVA + kA5G3DPolygonListOffset;
++        const uint64_t pixelsVA = kA5G3DTestVA + kA5G3DFragmentOutputOffset;
++        uint32_t *header = reinterpret_cast<uint32_t *>(
++            bytes + kA5G3DDataOffset);
++        header[4] = 0x00010013; /* is64b | FRAGMENT(9)<<1 | index 1<<16 */
++        reinterpret_cast<uint64_t *>(header)[5] = fbVA; /* payload +40 */
++        uint32_t *fb = reinterpret_cast<uint32_t *>(
++            bytes + kA5G3DDataOffset + kA5G3DFragmentFBOffset);
++        fb[1] = 31;           /* LOCAL_STORAGE: no workgroup memory */
++        fb[8] = 0xb84da201;   /* RGBA8, identity swizzle, linear, clear/write */
++        fb[9] = 0x00141000;   /* tie-break 2 and default ZS D24S8 */
++        fb[11] = 0x000f000f; /* max pixel coordinates 15,15 */
++        reinterpret_cast<uint64_t *>(fb)[10] = pixelsVA; /* RT base +80 */
++        fb[22] = 64;          /* RT row stride, 16 RGBA8 pixels */
++        for (unsigned i = 0; i < 4; ++i)
++            fb[32 + i] = kA5G3DFragmentRed; /* clear value +128 */
++        fb[48] = 516;         /* T720 polygon list: 512-byte header + 4 */
++        fb[49] = 4095;        /* user hierarchy, no hierarchical tiling */
++        reinterpret_cast<uint64_t *>(fb)[25] = polygonVA;
++        reinterpret_cast<uint64_t *>(fb)[26] = polygonVA + 512;
++        reinterpret_cast<uint64_t *>(fb)[27] = polygonVA;
++        reinterpret_cast<uint64_t *>(fb)[28] = polygonVA;
++        uint32_t *polygon = reinterpret_cast<uint32_t *>(
++            bytes + kA5G3DDataOffset + kA5G3DPolygonListOffset);
++        polygon[128] = 0xa0000000; /* Mesa T720 empty-list body magic */
++        pixels = reinterpret_cast<uint32_t *>(
++            bytes + kA5G3DDataOffset + kA5G3DFragmentOutputOffset);
++        for (unsigned i = 0; i < kA5G3DFragmentPixels; ++i)
++            pixels[i] = 0x5a5a5a5a;
++    } else {
++        A5G3DWriteValueJob *job = reinterpret_cast<A5G3DWriteValueJob *>(
++            bytes + kA5G3DDataOffset);
++        job->typeAndSize = 1 | (2 << 1);
++        job->index = 1;
++        job->outputVA = kA5G3DTestVA + kA5G3DOutputOffset;
++        job->valueType = 3;
++        output = reinterpret_cast<uint64_t *>(
++            bytes + kA5G3DDataOffset + kA5G3DOutputOffset);
++        *output = 0xa5a5a5a55a5a5a5aULL;
++    }
+     if (storage->performOperation(kIOMemoryIncoherentIOStore, 0,
+         kA5G3DTestBytes) != kIOReturnSuccess) {
+         service->setProperty("A5G3DJobResult", "cache-store-failed");
+@@ -222,11 +274,12 @@
+     __sync_synchronize();
+ 
+     /* Program the otherwise unused AS0 with only the private 16-KiB test
+-     * region, then submit exactly one WRITE_VALUE job to JS1. Poll with a
++     * region, then submit exactly one private job. Poll with a
+      * finite deadline. The allocation stays owned by the service on timeout.
+      */
+     a5g3d_write32(gpu, 0x2004, 0x00010001);
+-    a5g3d_write32(gpu, 0x1004, 0x00020002);
++    a5g3d_write32(gpu, 0x1004,
++        (1u << slot) | (1u << (slot + 16)));
+     const uint64_t transtab = physical | 0x7;
+     a5g3d_write32(gpu, 0x2400, static_cast<uint32_t>(transtab));
+     a5g3d_write32(gpu, 0x2404, static_cast<uint32_t>(transtab >> 32));
+@@ -239,36 +292,51 @@
+         service->setProperty("A5G3DJobResult", "mmu-update-timeout");
+         return false;
+     }
+-    a5g3d_write32(gpu, 0x18c0, static_cast<uint32_t>(kA5G3DTestVA));
+-    a5g3d_write32(gpu, 0x18c4, 0);
+-    a5g3d_write32(gpu, 0x18d0, shader);
+-    a5g3d_write32(gpu, 0x18d4, 0);
+-    a5g3d_write32(gpu, 0x18d8, (8 << 16) | (3 << 8) | (3 << 12));
++    a5g3d_write32(gpu, slotBase + 0x40, static_cast<uint32_t>(kA5G3DTestVA));
++    a5g3d_write32(gpu, slotBase + 0x44, 0);
++    a5g3d_write32(gpu, slotBase + 0x50, shader);
++    a5g3d_write32(gpu, slotBase + 0x54, 0);
++    a5g3d_write32(gpu, slotBase + 0x58, (8 << 16) | (3 << 8) | (3 << 12));
+     __sync_synchronize();
+-    a5g3d_write32(gpu, 0x18e0, 1); /* JS_COMMAND_NEXT(1) = START */
++    a5g3d_write32(gpu, slotBase + 0x60, 1); /* JS_COMMAND_NEXT = START */
+ 
+     uint32_t jobIRQ = 0, mmuIRQ = 0, gpuIRQ = 0;
+     for (unsigned i = 0; i < 20000; ++i) {
+         jobIRQ = a5g3d_read32(gpu, 0x1000);
+         mmuIRQ = a5g3d_read32(gpu, 0x2000);
+         gpuIRQ = a5g3d_read32(gpu, 0x20);
+-        if ((jobIRQ & (1u << 1)) || (jobIRQ & (1u << 17)) ||
++        if ((jobIRQ & (1u << slot)) || (jobIRQ & (1u << (slot + 16))) ||
+             mmuIRQ || (gpuIRQ & 0x81))
+             break;
+         IODelay(10);
+     }
++    const uint32_t resultOffset = fragment ? kA5G3DFragmentOutputOffset :
++        kA5G3DOutputOffset;
++    const uint32_t resultLength = fragment ? kA5G3DFragmentPixels * 4 :
++        sizeof(*output);
+     if (storage->performOperation(kIOMemoryIncoherentIOFlush,
+-        kA5G3DDataOffset + kA5G3DOutputOffset,
+-        sizeof(*output)) != kIOReturnSuccess) {
++        kA5G3DDataOffset + resultOffset, resultLength) != kIOReturnSuccess) {
+         service->setProperty("A5G3DJobResult", "cache-flush-failed");
+         return false;
+     }
+-    IOLog("A5XELTE G3D: write-value job irq=%08x mmu=%08x gpu=%08x js=%08x asfault=%08x output=%016llx\n",
+-        jobIRQ, mmuIRQ, gpuIRQ, a5g3d_read32(gpu, 0x18a4),
+-        a5g3d_read32(gpu, 0x241c), *output);
+-    const bool complete = (jobIRQ & (1u << 1)) && !mmuIRQ &&
+-        !(jobIRQ & (1u << 17)) && !(gpuIRQ & 0x81) && *output == 0;
+-    service->setProperty("A5G3DJobResult", complete ? "zero-written" : "failed-or-timeout");
++    bool validOutput = !fragment && *output == 0;
++    if (fragment) {
++        unsigned redPixels = 0;
++        for (unsigned i = 0; i < kA5G3DFragmentPixels; ++i)
++            redPixels += pixels[i] == kA5G3DFragmentRed;
++        validOutput = redPixels == kA5G3DFragmentPixels;
++        IOLog("A5XELTE G3D: fragment clear irq=%08x mmu=%08x gpu=%08x js=%08x asfault=%08x first=%08x last=%08x pixels=%u/256\n",
++            jobIRQ, mmuIRQ, gpuIRQ, a5g3d_read32(gpu, slotBase + 0x24),
++            a5g3d_read32(gpu, 0x241c), pixels[0], pixels[255], redPixels);
++    } else {
++        IOLog("A5XELTE G3D: write-value job irq=%08x mmu=%08x gpu=%08x js=%08x asfault=%08x output=%016llx\n",
++            jobIRQ, mmuIRQ, gpuIRQ, a5g3d_read32(gpu, slotBase + 0x24),
++            a5g3d_read32(gpu, 0x241c), *output);
++    }
++    const bool complete = (jobIRQ & (1u << slot)) && !mmuIRQ &&
++        !(jobIRQ & (1u << (slot + 16))) && !(gpuIRQ & 0x81) && validOutput;
++    service->setProperty("A5G3DJobResult", complete ?
++        (fragment ? "red-fragment-cleared" : "zero-written") : "failed-or-timeout");
+     if (jobIRQ)
+         a5g3d_write32(gpu, 0x1004, jobIRQ);
+     if (mmuIRQ)
+@@ -277,9 +345,10 @@
+ }
+ 
+ static void
+-a5g3d_probe_existing_power(IOService *service, bool runJob,
++a5g3d_probe_existing_power(IOService *service, int mode,
+     IOBufferMemoryDescriptor *&storage)
+ {
++    const bool runJob = mode >= 3;
+     vm_offset_t pmu = ml_io_map_unmappable(0x10464000, 0x1000, VM_WIMG_IO);
+     if (!pmu) {
+         service->setProperty("A5G3DProbeResult", "pmu-map-failed");
+@@ -332,7 +401,7 @@
+     IOLog("A5XELTE G3D: passive GPU_ID=%08x product=%04x (expected 0720); %s\n",
+         id, product, runJob ? "offscreen test requested" : "no GPU jobs");
+     if (runJob && product == 0x720)
+-        a5g3d_try_write_value(service, gpu, cmu, storage);
++        a5g3d_try_private_job(service, gpu, cmu, storage, mode == 4);
+     ml_io_unmap(gpu, gpuSize);
+     ml_io_unmap(cmu, 0x1000);
+     ml_io_unmap(pmu, 0x1000);
+@@ -355,7 +424,7 @@
+ {
+     int enabled = 0;
+     if (!PE_parse_boot_argn("a5gpu", &enabled, sizeof(enabled)) ||
+-        (enabled != 1 && enabled != 2 && enabled != 3)) {
++        (enabled != 1 && enabled != 2 && enabled != 3 && enabled != 4)) {
+         return false; /* a5gpu=0, the safe default */
+     }
+     if (!IOService::start(provider)) {
+@@ -375,12 +444,13 @@
+     setProperty("A5G3DJobSPI", 282ULL, 32);
+     setProperty("A5G3DMMUSPI", 283ULL, 32);
+     setProperty("A5G3DGpuSPI", 281ULL, 32);
+-    setProperty("A5G3DDriverStage", enabled == 3 ? "offscreen-write-value" :
+-        (enabled == 2 ? "passive-id-probe" : "resources-only"));
++    setProperty("A5G3DDriverStage", enabled == 4 ? "offscreen-fragment-clear" :
++        (enabled == 3 ? "offscreen-write-value" :
++        (enabled == 2 ? "passive-id-probe" : "resources-only")));
+     registerService();
+     IOLog("A5XELTE G3D: resource service registered; GPU power unchanged; CPU display active\n");
+     if (enabled >= 2) {
+-        a5g3d_probe_existing_power(this, enabled == 3, fTestMemory);
++        a5g3d_probe_existing_power(this, enabled, fTestMemory);
+     }
+     return true;
+ }

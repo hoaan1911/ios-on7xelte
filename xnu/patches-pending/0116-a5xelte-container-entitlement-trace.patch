@@ -1,0 +1,35 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -136,6 +136,10 @@
+ {
+ 	void *xml = NULL;
+ 	size_t xml_len = 0;
++	const char *identity = csblob_get_identity(code_signing_blob);
++	bool trace_container = identity != NULL &&
++	    (strcmp(identity, "com.apple.backboardd") == 0 ||
++	    strcmp(identity, "com.apple.containermanagerd") == 0);
+ 
+ 	if (csblob_get_entitlements(code_signing_blob, &xml, &xml_len) != 0) {
+ 		printf(PORT_NAME " AMFI: %s: entitlements do not match the code directory, granting none\n",
+@@ -143,6 +147,9 @@
+ 		return;
+ 	}
+ 	if (xml == NULL) {
++		if (trace_container) {
++			printf(PORT_NAME " container: %s has no XML entitlements\n", identity);
++		}
+ 		return;                 /* no XML entitlements */
+ 	}
+ 	void *ent = sweet_entitlements_create(xml, xml_len);
+@@ -151,6 +158,11 @@
+ 		    csblob_get_identity(code_signing_blob), xml_len);
+ 		return;
+ 	}
++	if (trace_container) {
++		printf(PORT_NAME " container: %s XML entitlements=%u system-container=%d\n",
++		    identity, sweet_entitlements_count(ent),
++		    sweet_entitlements_bool(ent, "com.apple.security.system-container"));
++	}
+ 	if (sweet_amfi_debug) {
+ 		/* The test keys only exist in tools/mkinit.py test signatures. */
+ 		printf(PORT_NAME " AMFI: %s: %u entitlements (test: bool %d string %d array %d)\n",

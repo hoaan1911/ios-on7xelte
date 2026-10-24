@@ -1,0 +1,76 @@
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -68,24 +68,56 @@
+ static bool
+ a5g3d_power_cores(IOService *service, vm_offset_t gpu, vm_offset_t cmu)
+ {
+-    const uint32_t mux = a5g3d_read32(cmu, 0x208);
+-    const uint32_t divider = a5g3d_read32(cmu, 0x600);
++    uint32_t mux = a5g3d_read32(cmu, 0x208);
++    uint32_t divider = a5g3d_read32(cmu, 0x600);
+     const uint32_t shader = a5g3d_read32(gpu, 0x100);
+     const uint32_t tiler = a5g3d_read32(gpu, 0x110);
+     const uint32_t l2 = a5g3d_read32(gpu, 0x120);
+     IOLog("A5XELTE G3D: core gate mux=%08x div=%08x present shader=%08x tiler=%08x l2=%08x\n",
+         mux, divider, shader, tiler, l2);
+-    /* Native Linux's first verified OPP is TOP 400 MHz / 3, 900 mV.
+-     * Refuse to run if firmware left a faster or unknown core clock.
+-     */
+-    if ((mux & 1) != 1 || (divider & 7) < 2 ||
+-        !shader || !tiler || !l2 || (l2 & (l2 - 1))) {
++    if (!shader || !tiler || !l2 || (l2 & (l2 - 1))) {
+         service->setProperty("A5G3DJobResult", "clock-or-core-mask-unverified");
+         return false;
+     }
+     if (!a5xelte_gpu_prepare_buck4()) {
+         service->setProperty("A5G3DJobResult", "buck4-unverified");
+         return false;
++    }
++    /* Mirror the native Exynos7580 CCF sequence at its first verified OPP:
++     * slow both dividers, switch to the inherited TOP 400 MHz parent, then
++     * select core /3 and peripheral /4. Never switch a running shader.
++     */
++    if ((mux & 1) != 1 || (divider & 7) != 2) {
++        if (a5g3d_read32(gpu, 0x140) || a5g3d_read32(gpu, 0x160)) {
++            service->setProperty("A5G3DJobResult", "active-cores-unknown-clock");
++            return false;
++        }
++        a5g3d_write32(cmu, 0x600, (divider & ~0x77u) | 0x77u);
++        unsigned us = 0;
++        for (; us < 10000 && (a5g3d_read32(cmu, 0x700) & 0x11u); ++us)
++            IODelay(1);
++        if (us == 10000) {
++            service->setProperty("A5G3DJobResult", "slow-divider-timeout");
++            return false;
++        }
++        a5g3d_write32(cmu, 0x208, mux | 1u);
++        for (us = 0; us < 10000 && (a5g3d_read32(cmu, 0x408) & 7u) != 2u; ++us)
++            IODelay(1);
++        if (us == 10000) {
++            service->setProperty("A5G3DJobResult", "top-mux-timeout");
++            return false;
++        }
++        a5g3d_write32(cmu, 0x600, (divider & ~0x77u) | 0x32u);
++        for (us = 0; us < 10000 && (a5g3d_read32(cmu, 0x700) & 0x11u); ++us)
++            IODelay(1);
++        mux = a5g3d_read32(cmu, 0x208);
++        divider = a5g3d_read32(cmu, 0x600);
++        IOLog("A5XELTE G3D: clock final mux=%08x div=%08x status=%08x/%08x\n",
++            mux, divider, a5g3d_read32(cmu, 0x408), a5g3d_read32(cmu, 0x700));
++        if (us == 10000 || (mux & 1) != 1 || (divider & 0x77u) != 0x32u) {
++            service->setProperty("A5G3DJobResult", "safe-clock-unverified");
++            return false;
++        }
+     }
+     /* Match panfrost_gpu_power_on: L2, shader, then tiler. The domain
+      * and CMU gates were verified in a5g3d_probe_existing_power().
+@@ -135,7 +167,7 @@
+         service->setProperty("A5G3DJobResult", "not-ready");
+         return false;
+     }
+-    if ((!shader || !l2) && !a5g3d_power_cores(service, gpu, cmu))
++    if (!a5g3d_power_cores(service, gpu, cmu))
+         return false;
+     shader = a5g3d_read32(gpu, 0x140);
+     if (!shader || !a5g3d_read32(gpu, 0x160)) {

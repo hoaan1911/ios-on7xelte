@@ -10,8 +10,8 @@ on:
         description: RELEASE / DEVELOPMENT / DEBUG
         default: DEVELOPMENT
       machine_config:
-        description: xnu MACHINE_CONFIG (HEROLTE = Galaxy S7, A5XELTE, SWEET)
-        default: HEROLTE
+        description: xnu MACHINE_CONFIG (A5XELTE = target configuration, HEROLTE = Galaxy S7, SWEET)
+        default: A5XELTE
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
@@ -33,7 +33,7 @@ env:
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
-  MACHINE_CONFIG: ${{ inputs.machine_config || 'HEROLTE' }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || 'A5XELTE' }}
 
 jobs:
   build:
@@ -46,42 +46,60 @@ jobs:
 
       - name: Fetch build script
         run: |
+          set -e
           git init -q dxb
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
-          # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
+
+          # Copy this repository's XNU patches into the pinned builder.
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
-          # libfirehose_kernel is built arm64e-only; these kernels are plain arm64.
-          # Cortex-A53 boards (A5XELTE, HEROLTE) also need it without ARMv8.1
-          # LSE atomics: same flags as tools/a5xelte-build-firehose.sh.
+
+          # libfirehose_kernel is built arm64e-only by default; these kernels
+          # use plain arm64. Cortex-A53 boards need flags without ARMv8.1 LSE.
           python3 - dxb/build.sh "$MACHINE_CONFIG" <<'PY'
           import sys
           from pathlib import Path
+
           path, config = Path(sys.argv[1]), sys.argv[2]
           old = 'ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"'
-          if config in ('A5XELTE', 'HEROLTE'):
-              new = ('ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-mkernel -nostdinc '
-                     '-Wno-packed -mcpu=cortex-a53 -march=armv8-a+crypto"')
+
+          if config in ("A5XELTE", "HEROLTE"):
+              new = (
+                  'ARCHS="arm64" VALID_ARCHS="arm64" '
+                  'OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed '
+                  '-mcpu=cortex-a53 -march=armv8-a+crypto"'
+              )
           else:
-              new = 'ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"'
+              new = (
+                  'ARCHS="x86_64 arm64e arm64" '
+                  'VALID_ARCHS="x86_64 arm64e arm64"'
+              )
+
           text = path.read_text()
-          assert text.count(old) == 1, 'darwin-xnu-build firehose line changed'
+          assert text.count(old) == 1, (
+              "darwin-xnu-build firehose line changed; refusing to edit it"
+          )
           path.write_text(text.replace(old, new))
-          print('firehose:', new)
+          print("firehose:", new)
           PY
+
           ls dxb/patches
 
       - name: Deps
         run: |
           brew install jq gum bash cmake ninja
-          # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 14
+
+          # build.sh checks for xcodes; Xcode is already installed on the runner.
           printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
           sudo chmod +x /usr/local/bin/xcodes
+
           sw_vers
           ls -d /Applications/Xcode*.app
-          # Prefer an Xcode 15.x (iig ABI above); otherwise the oldest one.
+
+          # Prefer Xcode 15.x for the expected iig ABI; otherwise use the oldest.
           XC=$(ls -d /Applications/Xcode_15*.app 2>/dev/null | sort -V | tail -1)
           [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           sudo xcode-select -s "$XC"
           xcodebuild -version
@@ -90,53 +108,83 @@ jobs:
       - name: Build
         working-directory: dxb
         env:
-          # keep going after errors so one run reports every compile failure
+          # Keep going after errors so one run reports more compile failures.
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: |
           set -o pipefail
           bash build.sh 2>&1 | tee ../build.log
 
-      # Logs need a GitHub sign-in to read; check-run annotations are public.
-      # Publish the first errors and the log tail so failures can be read
-      # through the API (repos/.../check-runs/<job>/annotations).
+      # Publish build errors as check-run annotations for easier diagnosis.
       - name: Report build errors as annotations
         if: always()
         run: |
           test -f build.log || exit 0
+
           kernel="dxb/fakeroot/System/Library/Kernels/kernel.$(echo "$KERNEL_CONFIG" | tr A-Z a-z).$(echo "$MACHINE_CONFIG" | tr A-Z a-z)"
-          if [ -f "$kernel" ]; then echo "kernel built: $kernel"; exit 0; fi
+          if [ -f "$kernel" ]; then
+            echo "kernel built: $kernel"
+            exit 0
+          fi
+
           python3 - build.log <<'PY'
-          import re, sys
-          lines = open(sys.argv[1], errors='replace').read().splitlines()
-          clean = [re.sub(r'\x1b\[[0-9;]*m', '', l) for l in lines]
-          pat = re.compile(r'(error:|fatal error|Error \d|\*\*\* |FAILED|Skipping patch|No such file|panic|❌)', re.I)
-          # Compiler/linker errors first: blacktop's known patch-skip lines
-          # come first in the log and used to fill every annotation.
-          cc = re.compile(r'(:\d+:\d+: (fatal )?error:|^ld: |Undefined symbols|clang: error)')
-          hits = [l for l in clean if cc.search(l)]
-          hits += [l for l in clean if pat.search(l) and l not in hits and 'Skipping patch' not in l
-                   and 'already exists in working directory' not in l and 'patch does not apply' not in l]
-          esc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
-          for l in hits[:9]:
-              print('::error title=build::' + esc(l[:900]))
-          tail = '\n'.join(l[:300] for l in clean[-60:])
-          print('::error title=build log tail::' + esc(tail[-30000:]))
+          import re
+          import sys
+
+          lines = open(sys.argv[1], errors="replace").read().splitlines()
+          clean = [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in lines]
+
+          pat = re.compile(
+              r"(error:|fatal error|Error \d|\*\*\* |FAILED|Skipping patch|"
+              r"No such file|panic|❌)",
+              re.I,
+          )
+          cc = re.compile(
+              r"(:\d+:\d+: (fatal )?error:|^ld: |Undefined symbols|clang: error)"
+          )
+
+          hits = [line for line in clean if cc.search(line)]
+          hits += [
+              line for line in clean
+              if pat.search(line)
+              and line not in hits
+              and "Skipping patch" not in line
+              and "already exists in working directory" not in line
+              and "patch does not apply" not in line
+          ]
+
+          esc = lambda s: s.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+
+          for line in hits[:9]:
+              print("::error title=build::" + esc(line[:900]))
+
+          tail = "\n".join(line[:300] for line in clean[-60:])
+          print("::error title=build log tail::" + esc(tail[-30000:]))
           PY
           exit 1
 
       - name: Package build tree for local compiles
         if: always()
         run: |
-          # Generated headers, config option headers, mig output and the patched
-          # source: enough to re-run any single compile command from the log locally.
+          if [ ! -d dxb ]; then
+            echo "Build directory dxb does not exist; skipping build-tree package."
+            exit 0
+          fi
+
           SDK=$(xcrun --sdk macosx --show-sdk-path)
           mkdir -p sdk-kernel-platform
           cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
+
           tar czf buildtree.tgz \
-            --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
-            --exclude='kernel.development.*' --exclude='.git' \
+            --exclude='*.o' \
+            --exclude='*.cpo' \
+            --exclude='*.a' \
+            --exclude='*.dSYM' \
+            --exclude='*.unstripped' \
+            --exclude='kernel.development.*' \
+            --exclude='.git' \
             -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
             -C .. sdk-kernel-platform
+
           ls -la buildtree.tgz
 
       - uses: actions/upload-artifact@v4
@@ -144,25 +192,33 @@ jobs:
         with:
           name: xnu-buildtree
           path: buildtree.tgz
+          if-no-files-found: warn
           retention-days: 7
 
       - name: Inspect closed KDK support libs
         if: always()
         run: |
           mkdir -p out/kdk-libs
+
           for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
+            [ -f "$lib" ] || continue
             b=$(basename "$lib" .a)
             ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
             nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
             lipo -info "$lib" >> out/kdk-libs/arch.txt 2>&1 || true
           done
+
           ls -la out/kdk-libs
 
       - name: Collect
         if: always()
         run: |
           mkdir -p out
-          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+
+          if [ -d dxb/fakeroot/System/Library/Kernels ]; then
+            cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          fi
+
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
@@ -178,29 +234,46 @@ jobs:
         run: |
           kernel="out/kernel.$(echo "$KERNEL_CONFIG" | tr A-Z a-z).$(echo "$MACHINE_CONFIG" | tr A-Z a-z)"
           test -f "$kernel"
+
           xcrun llvm-objdump -d --no-show-raw-insn "$kernel" > lse-scan.txt || {
-            echo "::error title=LSE check::llvm-objdump failed on $kernel"; exit 1; }
-          # Fails only on LSE inside code; constant tables in __TEXT that
-          # disassemble as LSE (K256, SHA-256 round constants) are data.
+            echo "::error title=LSE check::llvm-objdump failed on $kernel"
+            exit 1
+          }
+
+          # Ignore K256, a constant table that can disassemble as LSE instructions.
           python3 - lse-scan.txt "$kernel" <<'PY'
-          import re, sys
-          lse = re.compile(r'\s(cas|casp|ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|stadd|stclr|steor|stset|stsmax|stsmin|stumax|stumin|swp)[a-z]*\s')
-          data_symbols = {'K256'}
-          func, funcs, samples = '?', {}, []
-          for line in open(sys.argv[1], errors='replace'):
-              m = re.match(r'^[0-9a-f]+ <(.+)>:', line)
-              if m:
-                  func = m.group(1)
+          import re
+          import sys
+
+          lse = re.compile(
+              r"\s(cas|casp|ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|"
+              r"ldumax|ldumin|stadd|stclr|steor|stset|stsmax|stsmin|"
+              r"stumax|stumin|swp)[a-z]*\s"
+          )
+
+          data_symbols = {"K256"}
+          func, funcs, samples = "?", {}, []
+
+          for line in open(sys.argv[1], errors="replace"):
+              match = re.match(r"^[0-9a-f]+ <(.+)>:", line)
+              if match:
+                  func = match.group(1)
               elif lse.search(line) and func not in data_symbols:
                   funcs[func] = funcs.get(func, 0) + 1
                   if len(samples) < 8:
-                      samples.append(func + ': ' + line.strip())
+                      samples.append(func + ": " + line.strip())
+
           count = sum(funcs.values())
-          print(f'LSE instructions in code of {sys.argv[2]}: {count}')
+          print(f"LSE instructions in code of {sys.argv[2]}: {count}")
+
           if count:
-              top = sorted(funcs.items(), key=lambda kv: -kv[1])[:40]
-              msg = f'{count} LSE instructions in {len(funcs)} functions\n'
-              msg += '\n'.join(f'{n} {f}' for f, n in top) + '\n--\n' + '\n'.join(samples)
-              print('::error title=LSE in kernel::' + msg.replace('%', '%25').replace('\n', '%0A'))
+              top = sorted(funcs.items(), key=lambda item: -item[1])[:40]
+              msg = f"{count} LSE instructions in {len(funcs)} functions\n"
+              msg += "\n".join(f"{n} {f}" for f, n in top)
+              msg += "\n--\n" + "\n".join(samples)
+              print(
+                  "::error title=LSE in kernel::"
+                  + msg.replace("%", "%25").replace("\n", "%0A")
+              )
               sys.exit(1)
           PY

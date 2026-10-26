@@ -4,7 +4,7 @@
 Derived from mkadt_a5xelte.py (GPL-2.0). The J7 Prime shares the A5's 4+4 Cortex-A53
 layout, GICv2, 26 MHz timer, eMMC window and 1080x1920 scanout at 0x67000000; the GIC
 moves to 0x104e1000/0x104e2000 (on7xelte device tree, confirmed with the S-Boot probe).
-The A5-only G3D resource node is left out. It is not yet an iOS root/device tree.
+A Mali-T830 G3D resource node is included (inert unless j7gpu=1|2|3). It is not yet an iOS root/device tree.
 """
 import argparse
 import os
@@ -93,6 +93,19 @@ def build():
         ('compatible', mkadt.cstr('samsung,a5xelte-display')),
         ('canvas-width', mkadt.u32(1080)),
         ('canvas-height', mkadt.u32(1920)),
+    ]))
+    # Mali-T830 resource nub (Exynos7870 G3D). The 7580 compatible string is kept
+    # second so the existing A5XELTEGPU matching entry still starts the service;
+    # it stays off unless j7gpu=1|2|3 is on the boot command line. Addresses are
+    # relative to the arm-io range base 0x10000000. No interrupts property, as on
+    # the A5 (no GIC-backed handler exists yet).
+    arm_io.children.append(mkadt.node('gpu', [
+        ('device_type', mkadt.cstr('gpu')),
+        ('compatible', mkadt.cstr('samsung,exynos7870-mali') +
+         mkadt.cstr('samsung,exynos7580-mali')),
+        ('reg', mkadt.u64(0x01400000, 0x5000)),
+        ('cmu-reg', mkadt.u64(0x01460000, 0x1000)),
+        ('pmu-reg', mkadt.u64(0x00480000, 0x10000)),
     ]))
     root.children = [n for n in root.children if n.prop('name') not in
                      (mkadt.cstr('sweet-fbcon'), mkadt.cstr('sweet-ufs'))]

@@ -1,0 +1,138 @@
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+index 84e55e8..34eb0c9 100644
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -249,6 +249,113 @@ a5g3d_probe_existing_power(IOService *service, bool runJob,
+     ml_io_unmap(pmu, 0x1000);
+ }
+ 
++/*
++ * Samsung Galaxy J7 Prime (Exynos7870, Mali-T830), selected by boot-arg
++ * j7gpu=1|2|3.  Addresses and SPI numbers are from the mainline exynos7870.dtsi
++ * and the phone's own /proc/iomem and /proc/interrupts (GIC 313/314/315 are
++ * SPI 281 GPU, 282 JOB, 283 MMU).
++ *
++ *   j7gpu=1  resource-only service (publishes the numbers, touches nothing)
++ *   j7gpu=2  also reads the PMU G3D status; if the domain is on, logs the
++ *            non-zero registers of CMU_G3D.  The GPU aperture is never read.
++ *   j7gpu=3  as 2, then reads GPU_ID once if the PMU says the domain is on.
++ *            Reading an unclocked GPU can stall the bus; if the phone freezes,
++ *            hold Power for ten seconds.  Use 2 first.
++ *
++ * Nothing is written to any register and no job is submitted.  This is a
++ * diagnostic stage, not acceleration.
++ */
++#define J7G3D_PMU_PAGE   0x10484000ULL   /* PMU base 0x10480000 + 0x4000 */
++#define J7G3D_CMU_BASE   0x11460000ULL
++#define J7G3D_GPU_BASE   0x11400000ULL
++
++static void
++j7g3d_publish(IOService *service, int level)
++{
++    service->setProperty("J7G3DMMIOBase", J7G3D_GPU_BASE, 64);
++    service->setProperty("J7G3DMMIOSize", 0x5000ULL, 64);
++    service->setProperty("J7G3DCMUBase", J7G3D_CMU_BASE, 64);
++    service->setProperty("J7G3DPMUBase", 0x10480000ULL, 64);
++    service->setProperty("J7G3DJobSPI", 282ULL, 32);
++    service->setProperty("J7G3DMMUSPI", 283ULL, 32);
++    service->setProperty("J7G3DGpuSPI", 281ULL, 32);
++    service->setProperty("J7G3DDriverStage", level >= 3 ? "gpu-id-probe" :
++        (level == 2 ? "pmu-cmu-probe" : "resources-only"));
++}
++
++static void
++j7g3d_probe(IOService *service, int level)
++{
++    vm_offset_t pmu = ml_io_map_unmappable(J7G3D_PMU_PAGE, 0x1000, VM_WIMG_IO);
++    if (!pmu) {
++        service->setProperty("J7G3DProbeResult", "pmu-map-failed");
++        return;
++    }
++    for (vm_offset_t off = 0x40; off < 0x80; off += 4) {
++        uint32_t v = a5g3d_read32(pmu, off);
++        if (v) {
++            IOLog("J7 G3D: PMU+%04x=%08x\n", (unsigned)(0x4000 + off), v);
++        }
++    }
++    uint32_t config = a5g3d_read32(pmu, 0x60);
++    uint32_t status = a5g3d_read32(pmu, 0x64);
++    service->setProperty("J7G3DPMUConfig", static_cast<uint64_t>(config), 32);
++    service->setProperty("J7G3DPMUStatus", static_cast<uint64_t>(status), 32);
++    IOLog("J7 G3D: PMU G3D config=%08x status=%08x\n", config, status);
++    if ((status & 0xf) != 0xf) {
++        service->setProperty("J7G3DProbeResult", "power-off-or-unknown-status");
++        IOLog("J7 G3D: PMU status low nibble is not 0xf; CMU and GPU untouched\n");
++        ml_io_unmap(pmu, 0x1000);
++        return;
++    }
++
++    vm_offset_t cmu = ml_io_map_unmappable(J7G3D_CMU_BASE, 0x1000, VM_WIMG_IO);
++    if (!cmu) {
++        service->setProperty("J7G3DProbeResult", "cmu-map-failed");
++        ml_io_unmap(pmu, 0x1000);
++        return;
++    }
++    unsigned printed = 0;
++    for (vm_offset_t off = 0; off < 0x1000 && printed < 112; off += 4) {
++        uint32_t v = a5g3d_read32(cmu, off);
++        if (v) {
++            IOLog("J7 G3D: CMU+%03x=%08x\n", (unsigned)off, v);
++            printed++;
++        }
++    }
++    if (level < 3) {
++        service->setProperty("J7G3DProbeResult", "cmu-dumped");
++        IOLog("J7 G3D: CMU dump done (%u non-zero registers); GPU aperture untouched\n", printed);
++        ml_io_unmap(cmu, 0x1000);
++        ml_io_unmap(pmu, 0x1000);
++        return;
++    }
++
++    if ((a5g3d_read32(pmu, 0x64) & 0xf) != 0xf) {
++        service->setProperty("J7G3DProbeResult", "power-dropped");
++        ml_io_unmap(cmu, 0x1000);
++        ml_io_unmap(pmu, 0x1000);
++        return;
++    }
++    vm_offset_t gpu = ml_io_map_unmappable(J7G3D_GPU_BASE, 0x1000, VM_WIMG_IO);
++    if (!gpu) {
++        service->setProperty("J7G3DProbeResult", "gpu-map-failed");
++        ml_io_unmap(cmu, 0x1000);
++        ml_io_unmap(pmu, 0x1000);
++        return;
++    }
++    IOLog("J7 G3D: reading GPU_ID now\n");
++    uint32_t id = a5g3d_read32(gpu, 0);
++    uint32_t product = id >> 16;
++    service->setProperty("J7G3DGPUId", static_cast<uint64_t>(id), 32);
++    service->setProperty("J7G3DProduct", static_cast<uint64_t>(product), 32);
++    service->setProperty("J7G3DProbeResult", product == 0x830 ? "mali-t830" : "unexpected-id");
++    IOLog("J7 G3D: passive GPU_ID=%08x product=%04x (expected 0830); no GPU jobs\n", id, product);
++    ml_io_unmap(gpu, 0x1000);
++    ml_io_unmap(cmu, 0x1000);
++    ml_io_unmap(pmu, 0x1000);
++}
++
+ class A5XELTEGPU : public IOService {
+     OSDeclareDefaultStructors(A5XELTEGPU);
+ 
+@@ -265,6 +372,19 @@ bool
+ A5XELTEGPU::start(IOService *provider)
+ {
+     int enabled = 0;
++    int j7 = 0;
++    if (PE_parse_boot_argn("j7gpu", &j7, sizeof(j7)) && j7 >= 1 && j7 <= 3) {
++        if (!IOService::start(provider)) {
++            return false;
++        }
++        j7g3d_publish(this, j7);
++        registerService();
++        IOLog("J7 G3D: resource service registered (level %d); GPU power unchanged; CPU display active\n", j7);
++        if (j7 >= 2) {
++            j7g3d_probe(this, j7);
++        }
++        return true;
++    }
+     if (!PE_parse_boot_argn("a5gpu", &enabled, sizeof(enabled)) ||
+         (enabled != 1 && enabled != 2 && enabled != 3)) {
+         return false; /* a5gpu=0, the safe default */

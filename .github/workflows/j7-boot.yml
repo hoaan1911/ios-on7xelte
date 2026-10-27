@@ -7,8 +7,8 @@ on:
         description: "Run id of an xnu workflow run built with machine_config A5XELTE (the number in its URL)"
         required: true
       cmdline:
-        description: "XNU boot-args"
-        default: "debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress"
+        description: "XNU boot-args (cpus=8 needs the kernel built with 0304; cpus=4 = boot cluster only; add emmcfast=1 for 0305)"
+        default: "debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress"
 
 jobs:
   boot:

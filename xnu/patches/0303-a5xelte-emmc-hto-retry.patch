@@ -1,0 +1,74 @@
+From: j7 emmc fix
+Subject: a5xelte eMMC: HTO is not an error, retry failed reads
+
+The polled PIO loop got preempted, the controller set HTO (data starvation, clock stopped) and
+the driver treated it as a failed read: 348 CMD17 errors in one boot, each failing a pagein with
+KERN_MEMORY_ERROR, which is the SIGBUS crash loop of SpringBoard and others. Treat HTO as
+recoverable (acknowledge it and keep draining the FIFO) and retry real read errors.
+
+diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
+--- a/bsd/dev/a5xelte_emmc.c
++++ b/bsd/dev/a5xelte_emmc.c
+@@ -66,7 +66,10 @@
+ #define INT_CMD_DONE    (1u << 2)
+ #define INT_RXDR        (1u << 5)
+ #define INT_TXDR        (1u << 4)
+-#define INT_ERRORS      ((1u << 12) | (1u << 11) | (1u << 10) | (1u << 9) | \
++/* HTO (data starvation by host timeout): the controller stopped the card clock because this
++ * polled loop was slow to service the FIFO (it got preempted). Nothing is lost; keep going. */
++#define INT_HTO         (1u << 10)
++#define INT_ERRORS      ((1u << 12) | (1u << 11) | (1u << 9) | \
+                          (1u << 8) | (1u << 7) | (1u << 6) | (1u << 1))
+ 
+ static vm_offset_t emmc_regs;
+@@ -96,7 +99,7 @@
+ }
+ 
+ static int
+-emmc_read_sector(uint32_t lba, uint8_t *sector)
++emmc_read_sector_once(uint32_t lba, uint8_t *sector)
+ {
+ 	uint64_t data[64] = { 0 };
+ 	uint32_t hcon = emmc_rd(EMMC_HCON);
+@@ -155,6 +158,9 @@
+ 			error = EIO;
+ 			goto out;
+ 		}
++		if (pending & INT_HTO) {
++			emmc_wr(EMMC_RINTSTS, INT_HTO);
++		}
+ 		uint32_t fifo = (emmc_rd(EMMC_STATUS) >> 17) & 0x1fffu;
+ 		while (fifo && read_words < words) {
+ 			if (unit == 8) {
+@@ -195,6 +201,21 @@
+ 	return error;
+ }
+ 
++/* A failed block read fails the whole pagein, which kills the process with SIGBUS: retry first. */
++static int
++emmc_read_sector(uint32_t lba, uint8_t *sector)
++{
++	int error = 0;
++
++	for (unsigned attempt = 0; attempt < 4; attempt++) {
++		error = emmc_read_sector_once(lba, sector);
++		if (error != EIO && error != ETIMEDOUT) {
++			break;
++		}
++	}
++	return error;
++}
++
+ static int
+ emmc_write_sector(uint32_t lba, const uint8_t *sector)
+ {
+@@ -257,6 +278,9 @@
+ 			error = EIO;
+ 			goto out;
+ 		}
++		if (pending & INT_HTO) {
++			emmc_wr(EMMC_RINTSTS, INT_HTO);
++		}
+ 		uint32_t fifo = (emmc_rd(EMMC_STATUS) >> 17) & 0x1fffu;
+ 		while (fifo < EMMC_FIFO_DEPTH && written < words) {
+ 			if (unit == 8) {

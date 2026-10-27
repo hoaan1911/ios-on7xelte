@@ -49,9 +49,11 @@ def build():
     set_prop(cpu0, 'compatible', mkadt.cstr('arm,cortex-a53') + mkadt.cstr('ARM,v8'))
     set_prop(cpu0, 'reg', mkadt.u32(0))
     set_prop(cpu0, 'timebase-frequency', mkadt.u32(26000000))
-    # The working Exynos7580 Linux DT has two A53 clusters of four cores:
-    # MPIDR 0..3 in cluster 0 and 0x100..0x103 in cluster 1. The cpus=N
-    # boot argument still selects a prefix, so cpus=1 and cpus=2 remain valid.
+    # Two A53 clusters of four: logical 0..3 = MPIDR 0..3 (the boot cluster S-Boot starts on),
+    # logical 4..7 = MPIDR 0x100..0x103. XNU sees ONE homogeneous cluster (cluster-id and
+    # die-cluster-id 0, as in mkadt_herolte.py): describing the second cluster as a second XNU
+    # cluster panicked the A5 eight-core trial (ticket lock owned while registering it).
+    # The cpus=N boot argument selects a prefix: cpus=1, cpus=4 (boot cluster only), cpus=8.
     for logical in range(1, 8):
         cluster, core = divmod(logical, 4)
         mpidr = (cluster << 8) | core
@@ -60,10 +62,10 @@ def build():
             ('compatible', mkadt.cstr('arm,cortex-a53') + mkadt.cstr('ARM,v8')),
             ('reg', mkadt.u32(mpidr)),
             ('cpu-id', mkadt.u32(logical)),
-            ('cluster-id', mkadt.u32(cluster)),
+            ('cluster-id', mkadt.u32(0)),
             ('cluster-type', mkadt.u32(0)),
-            ('die-cluster-id', mkadt.u32(cluster)),
-            ('cluster-core-id', mkadt.u32(core)),
+            ('die-cluster-id', mkadt.u32(0)),
+            ('cluster-core-id', mkadt.u32(logical)),
             ('l2-cache-id', mkadt.u32(cluster)),
             ('l3-cache-id', mkadt.u32(0)),
             ('state', mkadt.cstr('stopped')),

@@ -1,0 +1,226 @@
+From: j7 emmc
+Subject: a5xelte eMMC: opt-in multi-block reads (boot-arg emmcfast=1)
+
+The root device read one 512-byte sector per CMD17, re-validating and reprogramming the
+controller each time. With emmcfast=1, runs of >= 2 sector-aligned sectors (up to 32 = 16 KiB) are
+read with one CMD18 using the controller's auto-stop, still polled PIO. Any CMD18 failure is
+retried once, the transfer is aborted with CMD12, and the run falls back to the existing
+single-sector path (with its HTO handling and retries), so the worst case equals today's
+behaviour. Off by default: without emmcfast=1 nothing changes.
+
+diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
+--- a/bsd/dev/a5xelte_emmc.c
++++ b/bsd/dev/a5xelte_emmc.c
+@@ -72,6 +72,12 @@
+ #define INT_ERRORS      ((1u << 12) | (1u << 11) | (1u << 9) | \
+                          (1u << 8) | (1u << 7) | (1u << 6) | (1u << 1))
+ 
++/* Opt-in fast path (boot-arg emmcfast=1): CMD18 multi-block reads with the controller's auto-stop. */
++#define CMD_SEND_STOP   (1u << 12) /* controller sends CMD12 itself at the end of the data phase */
++#define CMD_STOP_ABORT  (1u << 14) /* this command is a stop/abort (CMD12) */
++#define STATUS_BUSY     (1u << 9)  /* card data busy (DAT0 low) */
++#define EMMC_MAX_RUN    32u        /* sectors per CMD18: 16 KiB, bounds the polled time under the lock */
++
+ static vm_offset_t emmc_regs;
+ static uint64_t emmc_first_lba, emmc_nsectors;
+ static char emmc_partition_name[16] = "SYSTEM";
+@@ -216,6 +222,170 @@
+ 	return error;
+ }
+ 
++static bool emmc_fast;
++
++/* Wait for the card to leave busy (auto-stop's CMD12 is an R1b). */
++static int
++emmc_wait_not_busy(void)
++{
++	for (unsigned i = 0; i < 4000000; i++) {
++		if (!(emmc_rd(EMMC_STATUS) & STATUS_BUSY)) {
++			return 0;
++		}
++	}
++	return ETIMEDOUT;
++}
++
++/* Get the card and the FIFO back to a known state after a failed CMD18. */
++static void
++emmc_abort_transfer(void)
++{
++	uint32_t command = CMD_START | CMD_STOP_ABORT | CMD_RESP_CRC | CMD_RESP | 12u;
++
++	emmc_wr(EMMC_RINTSTS, 0xffffffffu);
++	emmc_wr(EMMC_CMDARG, 0);
++	if ((emmc_rd(EMMC_CLKSEL) >> 16) & 7u) {
++		command |= CMD_HOLD;
++	}
++	emmc_wr(EMMC_CMD, command);
++	for (unsigned i = 0; i < 1000000; i++) {
++		if (emmc_rd(EMMC_RINTSTS) & (INT_CMD_DONE | INT_ERRORS)) {
++			break;
++		}
++	}
++	(void)emmc_wait_not_busy();
++	emmc_wr(EMMC_CTRL, emmc_rd(EMMC_CTRL) | CTRL_FIFO_RESET);
++	for (unsigned i = 0; i < 1000000; i++) {
++		if (!(emmc_rd(EMMC_CTRL) & CTRL_FIFO_RESET)) {
++			break;
++		}
++	}
++	emmc_wr(EMMC_RINTSTS, 0xffffffffu);
++}
++
++static int
++emmc_read_sectors_once(uint32_t lba, uint32_t nsect, uint8_t *out)
++{
++	uint32_t hcon = emmc_rd(EMMC_HCON);
++	uint32_t width = (hcon >> 7) & 7u;
++	uint32_t ver = emmc_rd(EMMC_VERID) & 0xffffu;
++	uint32_t data_off = ver < 0x240au ? 0x100u : 0x200u;
++	uint32_t unit, words, read_words = 0;
++	uint32_t ctrl = emmc_rd(EMMC_CTRL);
++	uint32_t ints = emmc_rd(EMMC_INTMASK);
++	uint32_t limit;
++	int error = 0;
++
++	if (width > 2 || ver == 0 || ver == 0xffff || nsect == 0 || nsect > EMMC_MAX_RUN ||
++	    !(emmc_rd(EMMC_PWREN) & 1u) || !(emmc_rd(EMMC_CLKENA) & 1u)) {
++		return ENXIO;
++	}
++	unit = 2u << width;
++	words = nsect * 512u / unit;
++	limit = 2000000u + 500000u * nsect;
++	if (emmc_rd(EMMC_STATUS) & STATUS_BUSY) {
++		return EBUSY;
++	}
++
++	emmc_wr(EMMC_INTMASK, 0);
++	emmc_wr(EMMC_CTRL, (ctrl & ~(CTRL_INT_ENABLE | CTRL_DMA_ENABLE |
++	    CTRL_USE_IDMAC)) | CTRL_FIFO_RESET);
++	for (unsigned i = 0; i < 1000000; i++) {
++		if (!(emmc_rd(EMMC_CTRL) & CTRL_FIFO_RESET)) {
++			break;
++		}
++		if (i == 999999) {
++			error = ETIMEDOUT;
++			goto out;
++		}
++	}
++	emmc_wr(EMMC_TMOUT, 0x573177ffu);
++	emmc_wr(EMMC_BLKSIZ, 512);
++	emmc_wr(EMMC_BYTCNT, nsect * 512u);
++	emmc_wr(EMMC_RINTSTS, 0xffffffffu);
++	emmc_wr(EMMC_CMDARG, lba);
++	uint32_t command = CMD_START | CMD_WAIT_DATA | CMD_DATA | CMD_RESP_CRC |
++	    CMD_RESP | CMD_SEND_STOP | 18u;
++	if ((emmc_rd(EMMC_CLKSEL) >> 16) & 7u) {
++		command |= CMD_HOLD;
++	}
++	emmc_wr(EMMC_CMD, command);
++	for (unsigned i = 0; i < limit; i++) {
++		uint32_t pending = emmc_rd(EMMC_RINTSTS);
++		if (pending & INT_ERRORS) {
++			printf("A5XELTE eMMC: CMD18 error lba=%u n=%u rint=%x status=%x words=%u/%u\n",
++			    lba, nsect, pending, emmc_rd(EMMC_STATUS), read_words, words);
++			error = EIO;
++			goto out;
++		}
++		if (pending & INT_HTO) {
++			emmc_wr(EMMC_RINTSTS, INT_HTO);
++		}
++		uint32_t fifo = (emmc_rd(EMMC_STATUS) >> 17) & 0x1fffu;
++		while (fifo && read_words < words) {
++			if (unit == 8) {
++				uint32_t lo = emmc_rd(data_off);
++				uint32_t hi = emmc_rd(data_off + 4);
++				uint64_t v = (uint64_t)lo | ((uint64_t)hi << 32);
++				memcpy(out + (size_t)read_words * 8u, &v, 8);
++			} else if (unit == 4) {
++				uint32_t v = emmc_rd(data_off);
++				memcpy(out + (size_t)read_words * 4u, &v, 4);
++			} else {
++				uint16_t v = *(volatile uint16_t *)(emmc_regs + data_off);
++				memcpy(out + (size_t)read_words * 2u, &v, 2);
++			}
++			read_words++;
++			fifo--;
++		}
++		if (pending & INT_RXDR) {
++			emmc_wr(EMMC_RINTSTS, INT_RXDR);
++		}
++		if (read_words == words && (pending & INT_DATA_OVER) && (pending & INT_CMD_DONE)) {
++			/* The auto-stop CMD12 is still in flight (R1b): let it finish. */
++			error = emmc_wait_not_busy();
++			goto out;
++		}
++		if (i == limit - 1) {
++			printf("A5XELTE eMMC: CMD18 timeout lba=%u n=%u rint=%x words=%u/%u\n",
++			    lba, nsect, pending, read_words, words);
++			error = ETIMEDOUT;
++		}
++	}
++	if (!error && read_words != words) {
++		error = ETIMEDOUT;
++	}
++out:
++	emmc_wr(EMMC_RINTSTS, 0xffffffffu);
++	emmc_wr(EMMC_INTMASK, ints);
++	return error;
++}
++
++/* Read nsect (<= EMMC_MAX_RUN) consecutive sectors. Never worse than the single-sector path:
++ * with emmcfast off, or after any CMD18 failure, it falls back to it sector by sector. */
++static int
++emmc_read_sectors(uint32_t lba, uint32_t nsect, uint8_t *out)
++{
++	int error;
++
++	if (emmc_fast && nsect > 1) {
++		for (unsigned attempt = 0; attempt < 2; attempt++) {
++			error = emmc_read_sectors_once(lba, nsect, out);
++			if (!error) {
++				return 0;
++			}
++			emmc_abort_transfer();
++		}
++	}
++	for (uint32_t i = 0; i < nsect; i++) {
++		error = emmc_read_sector(lba + i, out + (size_t)i * 512u);
++		if (error) {
++			return error;
++		}
++	}
++	return 0;
++}
++
+ static int
+ emmc_write_sector(uint32_t lba, const uint8_t *sector)
+ {
+@@ -488,6 +658,11 @@
+ void
+ a5xelte_emmc_probe(void)
+ {
++	uint32_t fast = 0;
++
++	if (PE_parse_boot_argn("emmcfast", &fast, sizeof(fast)) && fast) {
++		emmc_fast = true;
++	}
+ 	if (!emmc_map_host()) {
+ 		(void)emmc_find_root_partition();
+ 	}
+@@ -542,6 +717,16 @@
+ 		uint32_t skip = pos & 511u;
+ 		uint32_t take = MIN(count - n, 512u - skip);
+ 		uint32_t lba = (uint32_t)(emmc_first_lba + pos / 512u);
++		if (emmc_fast && (buf_flags(bp) & B_READ) && skip == 0 && count - n >= 1024u) {
++			uint32_t run = MIN((count - n) / 512u, EMMC_MAX_RUN);
++			error = emmc_read_sectors(lba, run, (uint8_t *)vaddr + n);
++			if (error) {
++				break;
++			}
++			n += run * 512u;
++			buf_setresid(bp, count - n);
++			continue;
++		}
+ 		if (buf_flags(bp) & B_READ) {
+ 			error = emmc_read_sector(lba, emmc_bounce);
+ 			if (!error) {

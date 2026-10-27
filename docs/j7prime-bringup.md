@@ -28,3 +28,14 @@ PERSDATA (p18), STEADY (p19), RADIO, CARRIER, RECOVERY (TWRP). EFS and the modem
 and radio calibration: back them up first, from TWRP:
   for p in 3 4 5 6 7 9 17 18 19; do dd if=/dev/block/mmcblk0p$p of=/sdcard/mmcblk0p$p.img; done
 and copy them to the PC with adb pull. The stock firmware (Odin) can always bring Android back.
+
+## Cores and eMMC speed (patches 0304, 0305)
+The A5XELTE kernel used to be capped at ONE CPU (SWEET_SMP_MAX_CPUS 1, SweetCPU panic unless num_cpus == 1), and
+the boot args had cpus=1. 0304 shares the S7's working PSCI CPU_ON + GICv2 SGI bring-up (0208/0218/0219) with
+this board; the ADT (mkadt_j7prime.py) describes one XNU cluster of 8 (MPIDR 0..3, 0x100..0x103).
+Test order, one flash each: `cpus=4` (boot cluster; known to start on this SoC family), then `cpus=8`.
+Expected log lines: `A5XELTE CPU: cpu=N mpidr=0x... came alive; SGI1 OK`, `8/8 CPUs initialized`, and the
+timer test / vct_lag lines (lag should be < 1 ms and timers must wake on all 8). If cpu4..7 time out, PSCI for
+the second cluster (CPU_ON target 0x100..) is the suspect: report the `CPU_ON rc=` lines.
+0305 adds multi-block eMMC reads, off unless the boot args contain `emmcfast=1`; try it after cores work.
+Do not expect miracles from either: the UI is still software-rendered on the CPU (no GPU), so cores help most.

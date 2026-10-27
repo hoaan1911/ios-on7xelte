@@ -1,0 +1,138 @@
+From: j7 smp
+Subject: j7prime: start all eight Cortex-A53 cores (cpus=8)
+
+The A5XELTE build (Galaxy J7 Prime / A5 2016) was hard-capped at one CPU: SWEET_SMP_MAX_CPUS 1
+and SweetCPU::start() panicking unless num_cpus == 1. The PSCI CPU_ON + GICv2 SGI bring-up that
+already runs 8/8 cores on the S7 (0208, 0218, 0219) is guarded by HEROLTE only because that board
+was the first to need it. Share it through A5XELTE_SMP.
+
+Exynos7870 order: logical 0..3 = MPIDR 0..3 (boot cluster), 4..7 = MPIDR 0x100..0x103. The ADT
+must describe one XNU cluster (cluster-id/die-cluster-id 0, as mkadt_herolte.py does): the old
+two-cluster attempt (0115) panicked CPU0 on an owned ticket lock while registering cluster 2.
+Select the core count with the cpus=N boot-arg (cpus=4 = boot cluster only).
+
+diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
+--- a/pexpert/pexpert/arm64/A5XELTE.h
++++ b/pexpert/pexpert/arm64/A5XELTE.h
+@@ -8,6 +8,8 @@
+ #define A5XELTE                       1
+ /* Reuse donor's SoC-neutral early services until their guards are renamed. */
+ #define SWEET                         1
++/* Secondary-CPU bring-up (PSCI CPU_ON + GICv2 SGIs) shared by HEROLTE and the 4+4 A53 boards. */
++#define A5XELTE_SMP                   1
+ 
+ /* Firmware scanout buffer and the earliest XNU marker (physical). */
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+@@ -27,7 +29,8 @@
+ /* S-Boot starts on the Cortex-A53 "Apollo" cluster, Aff1 = 1. */
+ #define A5XELTE_BOOT_MPIDR            0x100
+ #else
+-#define SWEET_SMP_MAX_CPUS            1
++/* Exynos7870/7580: logical 0..3 = MPIDR 0..3 (boot cluster), 4..7 = MPIDR 0x100..0x103. */
++#define SWEET_SMP_MAX_CPUS            8
+ #define A5XELTE_FB_PA                 0x67000000
+ #define A5XELTE_FB_WIDTH              1080
+ #define A5XELTE_FB_HEIGHT             1920
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -20,7 +20,7 @@
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+-#if defined(HEROLTE)
++#if defined(A5XELTE_SMP)
+ /* kern/sched_prim.h declares it for MACH_KERNEL_PRIVATE only. */
+ extern "C" processor_t thread_bind(processor_t processor);
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -57,7 +57,7 @@
+ 	OSDeclareDefaultStructors(SweetCPU);
+ 	const OSSymbol *cpuName = NULL;
+ 	uint32_t initialized = 0; /* release/acquire publication after initCPU sends SGI */
+-#if defined(HEROLTE)
++#if defined(A5XELTE_SMP)
+ 	/* Read by this CPU in initCPU, before it publishes initialized. */
+ 	uint64_t initVct = 0, initPct = 0, initCtr = 0, initMidr = 0;
+ #endif
+@@ -91,11 +91,11 @@
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-#if defined(HEROLTE)
+-	/* Logical 0..3 = A53 MPIDR 0x100..0x103 (boot cluster), 4..7 = Mongoose
+-	 * MPIDR 0x0..0x3, the order of the ADT /cpus nodes (mkadt_herolte.py). */
++#if defined(A5XELTE_SMP)
++	/* Logical 0..3 = the boot cluster (MPIDR A5XELTE_BOOT_MPIDR + n), 4..7 = the other
++	 * cluster (Aff1 flipped): S7 0x100.. then 0x0.., J7 Prime/A5 0x0.. then 0x100.. */
+ 	uint32_t expected_mpidr = cpu->cpu_id < 4 ? A5XELTE_BOOT_MPIDR + cpu->cpu_id :
+-	    cpu->cpu_id - 4;
++	    (A5XELTE_BOOT_MPIDR ^ 0x100U) + cpu->cpu_id - 4;
+ 	if (cpu->phys_id != expected_mpidr || topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic(CPU_PORT_NAME " CPU: unsupported topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+@@ -217,7 +217,7 @@
+ 		}
+ 		IOLog(CPU_PORT_NAME " CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+ 		    i, topology->cpus[i].phys_id);
+-#if defined(HEROLTE)
++#if defined(A5XELTE_SMP)
+ 		/* Both clusters must see one counter: the boot CPU reads it just after
+ 		 * the secondary did, so vct_lag is small and positive unless the
+ 		 * firmware gave the cluster its own CNTVOFF. */
+@@ -237,7 +237,7 @@
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog(CPU_PORT_NAME " CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
+-#if defined(HEROLTE)
++#if defined(A5XELTE_SMP)
+ 	/* A CPU whose timer interrupt never fires still answers SGIs: sleep once
+ 	 * on each CPU. Boot does not wait for this thread, so a CPU that never
+ 	 * wakes leaves its "sleeping" line as the last one. */
+@@ -280,7 +280,7 @@
+ 	 * Waiting here with DAIF.I set would deadlock every secondary. */
+ 	signalCPU(this);
+ 	setCPUState(kIOCPUStateRunning);
+-#if defined(HEROLTE)
++#if defined(A5XELTE_SMP)
+ 	if (getCPUNumber() != 0) {
+ 		/* As on the A5 (GICv2): a secondary enters at splsched with DAIF.I
+ 		 * set; take the queued self-SGI here, then restore the mask that
+@@ -293,7 +293,7 @@
+ 	kprintf(CPU_PORT_NAME " CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u\n",
+ 	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
+ 	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
+-#if defined(HEROLTE)
++#if defined(A5XELTE_SMP)
+ 	initMidr = __builtin_arm_rsr64("MIDR_EL1");
+ 	initCtr = __builtin_arm_rsr64("CTR_EL0");
+ 	__builtin_arm_isb(ISB_SY);
+@@ -306,7 +306,7 @@
+ void
+ SweetCPU::signalCPU(IOCPU *target)
+ {
+-#if defined(HEROLTE)
++#if defined(A5XELTE_SMP)
+ 	if (target == this) {
+ 		a5xelte_send_self_ipi();
+ 	} else {
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -259,7 +259,7 @@
+ 	a5_gic_write32(a5_gicd_base, 0xf00, (2U << 24) | 1U);
+ }
+ 
+-#if defined(HEROLTE)
++#if defined(A5XELTE_SMP)
+ /* GIC CPU-interface bit of each logical CPU (banked ITARGETSR0). */
+ static uint8_t a5_gic_cpu_masks[SWEET_SMP_MAX_CPUS];
+ 
+@@ -297,7 +297,7 @@
+ 	if (!a5_gicd_base || !a5_gicc_base) {
+ 		panic("a5xelte: cannot map GICv2");
+ 	}
+-#if defined(HEROLTE)
++#if defined(A5XELTE_SMP)
+ 	unsigned int logical = ml_get_cpu_number_local();
+ 	uint8_t mask = a5_gic_read32(a5_gicd_base, 0x800) & 0xff;
+ 	if (logical >= SWEET_SMP_MAX_CPUS || mask == 0 || (mask & (mask - 1)) != 0) {

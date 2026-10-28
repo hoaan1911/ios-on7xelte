@@ -1,0 +1,558 @@
+From: j7 g3d
+Subject: j7prime: Mali-T830 user client (j7gpu=7) and a kernel-side client selftest
+
+j7gpu=6 passed on the phone. Layer on top: the kernel interface an app-side GL driver needs.
+With j7gpu=7 the driver keeps the GPU reset+powered, AS0 programmed and the page-table pool
+alive, and registers the user-client class J7MaliUserClient (property kIOUserClientClassKey)
+on the GPU service. Selectors: 0 map client memory (kernel wires it and maps it into AS0 at a
+kernel-chosen VA), 1 unmap, 2 submit a job chain (VA must lie in a mapping the client owns),
+3 wait (status 0 / -1 timeout / -2 job fault / -3 MMU fault, then GPU reset + repower +
+AS0 reprogram so the next call works), 4 info, 5 log a string into the kernel log (so a
+user-space test can report through the persistent log). Cache clean/flush around submit/wait is
+done by the kernel over all maps for now; AS0 is shared by all clients.
+
+Because no user-space binary can be put on the phone cheaply, j7gpu=7 also runs a
+kernel-side client at boot: it creates a J7MaliUserClient with kernel_task as the owning task
+and drives the real externalMethod() entry points: info, log, map, good job chain, a
+deliberate fault (checks the recovery), good chain again, a submit for an unowned VA (must be
+refused), unmap.
+
+Host-tested against a simulated Mali with incoherent caches (same code passes; with cache
+maintenance disabled the test fails). The IOUserClient plumbing mirrors the Pixel repo's
+proven SweetGPUUserClient but has NOT been compiled against this xnu: if the xnu build fails
+after adding this patch, drop 0311 and 0304-0310 still build.
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -15,6 +15,10 @@
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOMemoryDescriptor.h>
+ #include <pexpert/pexpert.h>
+ #include <vm/memory_types.h>
+ #include <arm/memory_types.h>
+@@ -279,7 +283,7 @@
+     service->setProperty("J7G3DJobSPI", 282ULL, 32);
+     service->setProperty("J7G3DMMUSPI", 283ULL, 32);
+     service->setProperty("J7G3DGpuSPI", 281ULL, 32);
+-    service->setProperty("J7G3DDriverStage", level >= 6 ? "job-manager-selftest" : level == 5 ? "write-value-job" : level == 4 ? "core-power-test" : level == 3 ? "gpu-id-probe" :
++    service->setProperty("J7G3DDriverStage", level >= 7 ? "user-client-service" : level == 6 ? "job-manager-selftest" : level == 5 ? "write-value-job" : level == 4 ? "core-power-test" : level == 3 ? "gpu-id-probe" :
+         (level == 2 ? "pmu-cmu-probe" : "resources-only"));
+ }
+ 
+@@ -306,8 +310,11 @@
+ #define J7M_JS(n)           (0x1800 + 0x80 * (n))
+ 
+ struct J7MaliBo {
+-    IOBufferMemoryDescriptor *md;
++    IOBufferMemoryDescriptor *md;   /* kernel-allocated BO, or NULL */
++    IOMemoryDescriptor *umd;        /* wired client memory, or NULL */
++    void *owner;                    /* the J7MaliUserClient that mapped umd */
+     uint64_t va;
++    uint64_t start;                 /* va + the client's offset into the first page */
+     uint64_t size;
+     bool used;
+ };
+@@ -574,7 +581,13 @@
+     }
+     j7m_pool_sync();
+     (void)j7m_mmu_flush(bo->va, bo->size);
+-    bo->md->release();
++    if (bo->md) {
++        bo->md->release();
++    }
++    if (bo->umd) {
++        bo->umd->complete();
++        bo->umd->release();
++    }
+     bzero(bo, sizeof(*bo));
+ }
+ 
+@@ -783,6 +796,443 @@
+     return ok;
+ }
+ 
++/* ===================================================================================
++ * j7gpu=7: serve the job manager to user space through an IOUserClient.
++ *
++ * The driver keeps the GPU powered, AS0 programmed and the page-table pool alive.  A client
++ * hands over ordinary memory it owns (selector 0); the kernel wires it and maps it into AS0 at
++ * a kernel-chosen GPU VA.  Clients submit a job chain by GPU VA (selector 2) and wait (3).
++ * Cache maintenance is done by the kernel around every submit/wait (whole maps for now).
++ * AS0 is shared: a client that crafts GPU addresses can reach other clients' mappings; fine
++ * for a single compositor, to be split into one AS per client later.
++ * =================================================================================== */
++static IOLock *gJ7MLock;
++static bool gJ7MServing;
++static uint32_t gJ7MGpuId, gJ7MShaderPresent, gJ7MTilerPresent, gJ7ML2Present;
++
++static bool
++j7m_power_wait(uint32_t on_reg, uint32_t ready_reg, uint32_t mask)
++{
++    a5g3d_write32(gJ7M.gpu, on_reg, mask);
++    for (unsigned us = 0; us < 50000; us += 10) {
++        if ((a5g3d_read32(gJ7M.gpu, ready_reg) & mask) == mask) {
++            return true;
++        }
++        IODelay(10);
++    }
++    return false;
++}
++
++/* L2, then shader, then tiler (the Panfrost order that passed on the phone). */
++static bool
++j7m_cores_on(void)
++{
++    a5g3d_write32(gJ7M.gpu, 0x24, 0xffffffffu);
++    const bool ok = j7m_power_wait(0x1a0, 0x160, gJ7ML2Present) &&
++        j7m_power_wait(0x180, 0x140, gJ7MShaderPresent) &&
++        j7m_power_wait(0x190, 0x150, gJ7MTilerPresent);
++    a5g3d_write32(gJ7M.gpu, 0x24, 0xffffffffu);
++    gJ7M.shader = a5g3d_read32(gJ7M.gpu, 0x140);
++    return ok;
++}
++
++/* After a fault or timeout: reset, repower, reprogram AS0.  Page tables and maps stay valid. */
++static bool
++j7m_recover(void)
++{
++    return j7m_gpu_reset() && j7m_cores_on() && j7m_mmu_enable();
++}
++
++/* Take over the GPU for user clients.  The GPU must be idle and unpowered, as the probe found it. */
++static bool
++j7m_serve_start(IOService *service, vm_offset_t gpu)
++{
++    bzero(&gJ7M, sizeof(gJ7M));
++    gJ7M.gpu = gpu;
++    gJ7MGpuId = a5g3d_read32(gpu, 0x000);
++    gJ7MShaderPresent = a5g3d_read32(gpu, 0x100);
++    gJ7MTilerPresent = a5g3d_read32(gpu, 0x110);
++    gJ7ML2Present = a5g3d_read32(gpu, 0x120);
++    if (a5g3d_read32(gpu, 0x140) || a5g3d_read32(gpu, 0x150) || a5g3d_read32(gpu, 0x160) ||
++        a5g3d_read32(gpu, 0x034) || !(a5g3d_read32(gpu, 0x018) & 1) || !(a5g3d_read32(gpu, 0x01c) & 2) ||
++        !gJ7MShaderPresent || !gJ7MTilerPresent || !gJ7ML2Present) {
++        IOLog("J7 G3D: serve: GPU not idle/unpowered or unexpected present masks\n");
++        service->setProperty("J7G3DServe", "gpu-not-idle");
++        return false;
++    }
++    gJ7MLock = IOLockAlloc();
++    if (!gJ7MLock || !j7m_gpu_reset() || !j7m_cores_on() || !j7m_pool_init()) {
++        IOLog("J7 G3D: serve: reset, core power or page-table pool failed\n");
++        service->setProperty("J7G3DServe", "bring-up-failed");
++        return false;
++    }
++    j7m_pool_sync();
++    if (!j7m_mmu_enable()) {
++        IOLog("J7 G3D: serve: AS0 enable failed\n");
++        service->setProperty("J7G3DServe", "mmu-failed");
++        return false;
++    }
++    service->setProperty(kIOUserClientClassKey, "J7MaliUserClient");
++    service->setProperty("J7G3DServe", "ready");
++    gJ7MServing = true;
++    IOLog("J7 G3D: serving user clients (gpu_id=%08x, cores on, AS0 up, page-table pool %u tables)\n",
++        gJ7MGpuId, gJ7M.poolTables);
++    return true;
++}
++
++/* Lock held.  Wire md and map its pages into AS0.  On success the slot owns the caller's
++ * reference to md; on failure the caller keeps it. */
++static struct J7MaliBo *
++j7m_map_user(IOMemoryDescriptor *md, void *owner)
++{
++    const uint64_t size = md->getLength();
++    if (size == 0 || size > (64ULL << 20) || (size & (J7M_PAGE - 1))) {
++        return NULL;
++    }
++    struct J7MaliBo *bo = NULL;
++    for (unsigned i = 0; i < J7M_MAX_BOS; i++) {
++        if (!gJ7M.bos[i].used) {
++            bo = &gJ7M.bos[i];
++            break;
++        }
++    }
++    if (!bo || md->prepare(kIODirectionInOut) != kIOReturnSuccess) {
++        return NULL;
++    }
++    const uint64_t va = j7m_va_alloc(size);
++    if (!va) {
++        md->complete();
++        return NULL;
++    }
++    uint64_t done = 0;
++    bool ok = true;
++    for (; done < size && ok; done += J7M_PAGE) {
++        IOByteCount seg = 0;
++        const uint64_t pa = md->getPhysicalSegment(done, &seg, kIOMemoryMapperNone);
++        ok = pa && !(pa & (J7M_PAGE - 1)) && seg >= J7M_PAGE && j7m_map_page(va + done, pa);
++    }
++    if (!ok) {
++        for (uint64_t u = 0; u < done; u += J7M_PAGE) {
++            j7m_unmap_page(va + u);
++        }
++        j7m_pool_sync();
++        md->complete();
++        return NULL;
++    }
++    j7m_pool_sync();
++    (void)j7m_mmu_flush(va, size);
++    bo->md = NULL;
++    bo->umd = md;
++    bo->owner = owner;
++    bo->va = va;
++    bo->start = va;
++    bo->size = size;
++    bo->used = true;
++    return bo;
++}
++
++/* Lock held. */
++static void
++j7m_cache(unsigned options)
++{
++    for (unsigned i = 0; i < J7M_MAX_BOS; i++) {
++        struct J7MaliBo &b = gJ7M.bos[i];
++        if (!b.used) {
++            continue;
++        }
++        IOMemoryDescriptor *d = b.umd ? b.umd : static_cast<IOMemoryDescriptor *>(b.md);
++        d->performOperation(options, 0, b.size);
++    }
++}
++
++class J7MaliUserClient : public IOUserClient {
++    OSDeclareDefaultStructors(J7MaliUserClient);
++
++public:
++    bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++    IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++    IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++        IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++    void freeMaps(void);
++
++private:
++    task_t fTask;
++    bool ownsRange(uint64_t va);
++};
++
++OSDefineMetaClassAndStructors(J7MaliUserClient, IOUserClient);
++
++bool
++J7MaliUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++    if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++        return false;
++    }
++    fTask = owningTask;
++    IOLog("J7 G3D: user client opened\n");
++    return true;
++}
++
++void
++J7MaliUserClient::freeMaps(void)
++{
++    if (!gJ7MLock) {
++        return;
++    }
++    IOLockLock(gJ7MLock);
++    for (unsigned i = 0; i < J7M_MAX_BOS; i++) {
++        if (gJ7M.bos[i].used && gJ7M.bos[i].owner == this) {
++            j7m_bo_free(&gJ7M.bos[i]);
++        }
++    }
++    IOLockUnlock(gJ7MLock);
++}
++
++IOReturn
++J7MaliUserClient::clientClose(void)
++{
++    freeMaps();
++    terminate();
++    return kIOReturnSuccess;
++}
++
++/* Lock held: does va lie inside a mapping this client owns? */
++bool
++J7MaliUserClient::ownsRange(uint64_t va)
++{
++    for (unsigned i = 0; i < J7M_MAX_BOS; i++) {
++        const struct J7MaliBo &b = gJ7M.bos[i];
++        if (b.used && b.owner == this && va >= b.va && va < b.va + b.size) {
++            return true;
++        }
++    }
++    return false;
++}
++
++IOReturn
++J7MaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference)
++{
++    (void)dispatch;
++    (void)target;
++    (void)reference;
++    if (!gJ7MServing) {
++        return kIOReturnNotReady;
++    }
++    IOReturn ret = kIOReturnBadArgument;
++    IOLockLock(gJ7MLock);
++    switch (selector) {
++    case 0:     /* map memory: in (addr, len) -> out (gpu va) */
++        if (args->scalarInputCount == 2 && args->scalarOutputCount >= 1) {
++            const uint64_t addr = args->scalarInput[0], len = args->scalarInput[1];
++            const uint64_t base = trunc_page_64(addr), end = round_page_64(addr + len);
++            if (len == 0 || end <= base || end - base > (64ULL << 20)) {
++                break;
++            }
++            IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(base, end - base,
++                kIODirectionInOut, fTask);
++            if (!md) {
++                ret = kIOReturnNoMemory;
++                break;
++            }
++            struct J7MaliBo *bo = j7m_map_user(md, this);
++            if (!bo) {
++                md->release();
++                ret = kIOReturnNoResources;
++                break;
++            }
++            bo->start = bo->va + (addr - base);
++            args->scalarOutput[0] = bo->start;
++            args->scalarOutputCount = 1;
++            ret = kIOReturnSuccess;
++        }
++        break;
++    case 1:     /* unmap: in (gpu va returned by selector 0) */
++        if (args->scalarInputCount == 1) {
++            ret = kIOReturnNotFound;
++            for (unsigned i = 0; i < J7M_MAX_BOS; i++) {
++                if (gJ7M.bos[i].used && gJ7M.bos[i].owner == this && gJ7M.bos[i].start == args->scalarInput[0]) {
++                    j7m_bo_free(&gJ7M.bos[i]);
++                    ret = kIOReturnSuccess;
++                    break;
++                }
++            }
++        }
++        break;
++    case 2:     /* submit: in (slot, job chain gpu va) -> out (seq) */
++        if (args->scalarInputCount == 2 && args->scalarOutputCount >= 1) {
++            const uint64_t slot = args->scalarInput[0], jc = args->scalarInput[1];
++            if (slot > 2 || !ownsRange(jc)) {
++                break;
++            }
++            uint32_t seq = 0;
++            j7m_cache(kIOMemoryIncoherentIOStore);
++            if (!j7m_submit(static_cast<uint32_t>(slot), jc, &seq)) {
++                ret = kIOReturnBusy;
++                break;
++            }
++            args->scalarOutput[0] = seq;
++            args->scalarOutputCount = 1;
++            ret = kIOReturnSuccess;
++        }
++        break;
++    case 3:     /* wait: in (timeout us) -> out (status 0/-1/-2/-3, js status) */
++        if (args->scalarInputCount == 1 && args->scalarOutputCount >= 2) {
++            const uint32_t slot = gJ7M.inflightSlot;
++            const bool wasInflight = gJ7M.inflight;
++            const unsigned timeout = static_cast<unsigned>(args->scalarInput[0] > 5000000 ? 5000000 : args->scalarInput[0]);
++            int rc = j7m_wait(timeout);
++            const uint32_t js = wasInflight ? a5g3d_read32(gJ7M.gpu, J7M_JS(slot) + 0x24) : 0;
++            j7m_cache(kIOMemoryIncoherentIOFlush);
++            if (rc != 0) {
++                /* Fault or hang: bring the GPU back so the next client call works. */
++                if (!j7m_recover()) {
++                    gJ7MServing = false;
++                    IOLog("J7 G3D: recovery failed; GPU service stopped\n");
++                }
++            }
++            args->scalarOutput[0] = static_cast<uint64_t>(static_cast<int64_t>(rc));
++            args->scalarOutput[1] = js;
++            args->scalarOutputCount = 2;
++            ret = kIOReturnSuccess;
++        }
++        break;
++    case 4:     /* info: out (gpu id, shader/tiler/L2 present, JS present, AS present) */
++        if (args->scalarOutputCount >= 6) {
++            args->scalarOutput[0] = gJ7MGpuId;
++            args->scalarOutput[1] = gJ7MShaderPresent;
++            args->scalarOutput[2] = gJ7MTilerPresent;
++            args->scalarOutput[3] = gJ7ML2Present;
++            args->scalarOutput[4] = a5g3d_read32(gJ7M.gpu, 0x01c);
++            args->scalarOutput[5] = a5g3d_read32(gJ7M.gpu, 0x018);
++            args->scalarOutputCount = 6;
++            ret = kIOReturnSuccess;
++        }
++        break;
++    case 5:     /* log: structure input = text, copied into the kernel log (reaches the persistent log) */
++        if (args->structureInput && args->structureInputSize > 0 && args->structureInputSize <= 160) {
++            char line[161];
++            memcpy(line, args->structureInput, args->structureInputSize);
++            line[args->structureInputSize] = '\0';
++            IOLog("J7 G3D client: %s\n", line);
++            ret = kIOReturnSuccess;
++        }
++        break;
++    default:
++        break;
++    }
++    IOLockUnlock(gJ7MLock);
++    return ret;
++}
++
++/* ---- kernel-side client: drives the real externalMethod() entry points with kernel_task as the
++ * "user" task, so the whole path (map user memory, submit, wait, fault, recovery, unmap) is checked
++ * from the boot log without any user-space binary on the phone. ---- */
++static IOReturn
++j7m_call(J7MaliUserClient *c, uint32_t sel, const uint64_t *in, uint32_t nin, uint64_t *out,
++    uint32_t nout, const void *sin = NULL, uint32_t sinsz = 0)
++{
++    IOExternalMethodArguments a;
++    bzero(&a, sizeof(a));
++    a.selector = sel;
++    a.scalarInput = in;
++    a.scalarInputCount = nin;
++    a.scalarOutput = out;
++    a.scalarOutputCount = nout;
++    a.structureInput = sin;
++    a.structureInputSize = sinsz;
++    return c->externalMethod(sel, &a, NULL, NULL, NULL);
++}
++
++static bool
++j7m_client_selftest(IOService *service)
++{
++    J7MaliUserClient *c = OSTypeAlloc(J7MaliUserClient);
++    if (!c || !c->initWithTask(kernel_task, NULL, 0)) {
++        IOLog("J7 G3D: client selftest: cannot create a client object\n");
++        service->setProperty("J7G3DClientTest", "no-client");
++        if (c) {
++            c->release();
++        }
++        return false;
++    }
++    const vm_size_t len = 0x10000;
++    uint8_t *mem = static_cast<uint8_t *>(IOMallocAligned(len, PAGE_SIZE));
++    if (!mem) {
++        c->release();
++        return false;
++    }
++    bzero(mem, len);
++    uint64_t in[3] = { 0 }, out[6] = { 0 };
++    bool ok = true;
++    IOReturn r = j7m_call(c, 4, in, 0, out, 6);
++    IOLog("J7 G3D: client info ret=%x gpu_id=%08llx shader=%llx tiler=%llx l2=%llx js=%llx as=%llx\n",
++        r, out[0], out[1], out[2], out[3], out[4], out[5]);
++    ok = ok && r == kIOReturnSuccess && (out[0] >> 16) == 0x830;
++    const char hello[] = "hello from the kernel-side client";
++    r = j7m_call(c, 5, NULL, 0, NULL, 0, hello, sizeof(hello) - 1);
++    ok = ok && r == kIOReturnSuccess;
++
++    uint64_t gva = 0;
++    in[0] = reinterpret_cast<uint64_t>(mem);
++    in[1] = len;
++    r = j7m_call(c, 0, in, 2, out, 1);
++    gva = out[0];
++    IOLog("J7 G3D: client map ret=%x gva=%llx (%lu bytes)\n", r, gva, static_cast<unsigned long>(len));
++    ok = ok && r == kIOReturnSuccess && gva != 0;
++
++    /* Job chain at +0, two outputs: +0x2008 (first 16 KiB page) and +0x9010 (a different one). */
++    for (unsigned round = 0; ok && round < 3; round++) {
++        const bool faulty = (round == 1);
++        bzero(mem, 0x200);
++        A5G3DWriteValueJob *j0 = reinterpret_cast<A5G3DWriteValueJob *>(mem);
++        A5G3DWriteValueJob *j1 = reinterpret_cast<A5G3DWriteValueJob *>(mem + 0x100);
++        *reinterpret_cast<uint64_t *>(mem + 0x2008) = 0xa5a5a5a55a5a5a5aULL;
++        *reinterpret_cast<uint64_t *>(mem + 0x9010) = 0xa5a5a5a55a5a5a5aULL;
++        j0->typeAndSize = 1 | (2 << 1);
++        j0->index = 1;
++        j0->next = faulty ? 0 : gva + 0x100;
++        j0->outputVA = faulty ? 0x7ff00000ULL : gva + 0x2008;     /* round 1: unmapped VA */
++        j0->valueType = 3;
++        j1->typeAndSize = 1 | (2 << 1);
++        j1->index = 2;
++        j1->outputVA = gva + 0x9010;
++        j1->valueType = 3;
++        in[0] = 1;
++        in[1] = gva;
++        r = j7m_call(c, 2, in, 2, out, 1);
++        const uint64_t seq = out[0];
++        in[0] = 200000;
++        IOReturn w = j7m_call(c, 3, in, 1, out, 2);
++        const int rc = static_cast<int>(static_cast<int64_t>(out[0]));
++        const uint64_t a = *reinterpret_cast<volatile uint64_t *>(mem + 0x2008);
++        const uint64_t b = *reinterpret_cast<volatile uint64_t *>(mem + 0x9010);
++        IOLog("J7 G3D: client round %u (%s) submit=%x seq=%llu wait=%x status=%d js=%08llx out2008=%016llx out9010=%016llx\n",
++            round, faulty ? "fault" : "good", r, seq, w, rc, out[1], a, b);
++        if (faulty) {
++            ok = r == kIOReturnSuccess && w == kIOReturnSuccess && (rc == -3 || rc == -2);
++        } else {
++            ok = r == kIOReturnSuccess && w == kIOReturnSuccess && rc == 0 && a == 0 && b == 0;
++        }
++    }
++    /* A submit for a VA this client never mapped must be refused. */
++    in[0] = 1;
++    in[1] = 0x7ff00000ULL;
++    r = j7m_call(c, 2, in, 2, out, 1);
++    IOLog("J7 G3D: client submit of an unowned VA -> %x (expect bad argument)\n", r);
++    ok = ok && r == kIOReturnBadArgument;
++    in[0] = gva;
++    r = j7m_call(c, 1, in, 1, out, 0);
++    IOLog("J7 G3D: client unmap ret=%x\n", r);
++    ok = ok && r == kIOReturnSuccess;
++    c->freeMaps();
++    c->release();
++    IOFreeAligned(mem, len);
++    IOLog("J7 G3D: client selftest %s\n", ok ? "PASSED" : "FAILED");
++    service->setProperty("J7G3DClientTest", ok ? "passed" : "failed");
++    return ok;
++}
++
+ /*
+  * j7gpu=4: reset the GPU, power L2 -> shader -> tiler (the Panfrost order), check READY, power them
+  * off again.  Only GPU_CONTROL registers below 0x230 are touched; no address space, no job slot,
+@@ -970,6 +1420,7 @@
+         ml_io_unmap(pmu, 0x1000);
+         return;
+     }
++    bool serving = false;
+     IOLog("J7 G3D: reading GPU_ID now\n");
+     uint32_t id = a5g3d_read32(gpu, 0);
+     uint32_t product = id >> 16;
+@@ -991,11 +1442,19 @@
+             uint32_t v = a5g3d_read32(gpu, regs[i].off);
+             IOLog("J7 G3D: %s(+%03x)=%08x\n", regs[i].name, regs[i].off, v);
+         }
+-        if (level >= 4) {
++        if (level >= 7) {
++            /* Keep the GPU mapped and powered: user clients use it from now on. */
++            serving = j7m_serve_start(service, gpu);
++            if (serving) {
++                (void)j7m_client_selftest(service);
++            }
++        } else if (level >= 4) {
+             j7g3d_power_test(service, gpu, level, storage);
+         }
+     }
+-    ml_io_unmap(gpu, gpuSize);
++    if (!serving) {
++        ml_io_unmap(gpu, gpuSize);
++    }
+     ml_io_unmap(cmu, 0x1000);
+     ml_io_unmap(pmu, 0x1000);
+ }
+@@ -1017,7 +1476,7 @@
+ {
+     int enabled = 0;
+     int j7 = 0;
+-    if (PE_parse_boot_argn("j7gpu", &j7, sizeof(j7)) && j7 >= 1 && j7 <= 6) {
++    if (PE_parse_boot_argn("j7gpu", &j7, sizeof(j7)) && j7 >= 1 && j7 <= 7) {
+         if (!IOService::start(provider)) {
+             return false;
+         }

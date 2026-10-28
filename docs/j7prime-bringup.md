@@ -46,6 +46,9 @@ registers (confirmed on hardware: GPU_ID 08300010, 3 job slots, 8 address spaces
 4 (0308, passed on hardware with cpus=8) also soft-reset the GPU and power-cycle L2/shader/tiler, no memory or jobs;
 5 (0309, passed on hardware) also runs one WRITE_VALUE job on JS1 through a private page table (the A5's test);
 6 (0310) runs the real job manager's selftest: page-table pool, BOs at kernel-chosen GPU VAs, chained jobs across BOs,
-free/re-create at the same VA (TLB flush), a deliberate MMU fault + reset. Look for `job manager selftest PASSED`.
+free/re-create at the same VA (TLB flush), a deliberate MMU fault + reset. Look for `job manager selftest PASSED` (passed on hardware).
+7 (0311) keeps the GPU powered and serves it to user space through the J7MaliUserClient IOUserClient (selectors: 0 map,
+1 unmap, 2 submit, 3 wait, 4 info, 5 log) and first drives it from a kernel-side client (kernel_task) at boot:
+look for `client selftest PASSED`. Drop 0311 if it does not compile; 0304-0310 stand alone.
 The PMU and CMU pages have holes that raise an external abort (fault_code 0x10): never sweep them, read named
 registers only (0306, 0307). Kernel log: SYSTEM is mmcblk0p21 on the J7 Prime (not p20 as on the A5).

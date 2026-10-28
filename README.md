@@ -3,6 +3,8 @@ this repo icludes 3 phones a5xelte, herolte and on7xelte in the works.
 as of right now i got j7 booted to the lock, home screen no gpu
 lags like hell, if you saw my reddit post and found out this when i havent relased it yet, congrats ig
 i am so sorry for making this a seperate repo i cant "fork" a branch, so sorry
+
+
 **Status, 2026-10-22:** Apple's XNU kernel boots on a flat Galaxy S7 and runs the
 unmodified **iPhone X iOS 16.7.16 userland** up to the **"Hello" setup screen**,
 with the **touchscreen and all four buttons working**. Very slow: there is no GPU

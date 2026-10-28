@@ -1,0 +1,61 @@
+From: j7 g3d
+Subject: j7prime: G3D probe must not sweep the CMU page; read Mali identity registers
+
+Second J7 trial (with 0306): PMU G3D config=0000000f status=0003000f (domain already on), then
+CMU+000=0000079e and a synchronous external abort (fault_code 0x10) on the next word, CMU+004.
+The CMU page has holes like the PMU. Read only CMU+000. With j7gpu=3, after GPU_ID, also log the
+standard read-only Midgard feature/present registers (shader/tiler/L2 present masks, JS/AS
+present, thread limits) that the next stage (reset, MMU, job submission) needs.
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -314,17 +314,16 @@
+         ml_io_unmap(pmu, 0x1000);
+         return;
+     }
+-    unsigned printed = 0;
+-    for (vm_offset_t off = 0; off < 0x1000 && printed < 112; off += 4) {
+-        uint32_t v = a5g3d_read32(cmu, off);
+-        if (v) {
+-            IOLog("J7 G3D: CMU+%03x=%08x\n", (unsigned)off, v);
+-            printed++;
+-        }
+-    }
++    /*
++     * The CMU page has holes too: the second J7 trial read CMU+000 fine (0x79e) and then
++     * panicked on CMU+004 (fault_code 0x10).  Read only that one known register.
++     */
++    uint32_t cmu0 = a5g3d_read32(cmu, 0);
++    service->setProperty("J7G3DCMUWord0", static_cast<uint64_t>(cmu0), 32);
++    IOLog("J7 G3D: CMU+000=%08x (page not swept)\n", cmu0);
+     if (level < 3) {
+-        service->setProperty("J7G3DProbeResult", "cmu-dumped");
+-        IOLog("J7 G3D: CMU dump done (%u non-zero registers); GPU aperture untouched\n", printed);
++        service->setProperty("J7G3DProbeResult", "pmu-on-cmu-word0");
++        IOLog("J7 G3D: PMU says G3D is on; GPU aperture untouched (use j7gpu=3 to read GPU_ID)\n");
+         ml_io_unmap(cmu, 0x1000);
+         ml_io_unmap(pmu, 0x1000);
+         return;
+@@ -350,6 +349,21 @@
+     service->setProperty("J7G3DProduct", static_cast<uint64_t>(product), 32);
+     service->setProperty("J7G3DProbeResult", product == 0x830 ? "mali-t830" : "unexpected-id");
+     IOLog("J7 G3D: passive GPU_ID=%08x product=%04x (expected 0830); no GPU jobs\n", id, product);
++    if (product == 0x830) {
++        /* Standard Midgard read-only identity/feature registers (all implemented, no holes). */
++        static const struct { uint32_t off; const char *name; } regs[] = {
++            { 0x004, "L2_FEATURES" }, { 0x00c, "TILER_FEATURES" }, { 0x010, "MEM_FEATURES" },
++            { 0x014, "MMU_FEATURES" }, { 0x018, "AS_PRESENT" }, { 0x01c, "JS_PRESENT" },
++            { 0x034, "GPU_STATUS" }, { 0x0a0, "THREAD_MAX_THREADS" }, { 0x0ac, "THREAD_FEATURES" },
++            { 0x0b0, "TEXTURE_FEATURES_0" }, { 0x0c0, "JS0_FEATURES" },
++            { 0x100, "SHADER_PRESENT_LO" }, { 0x110, "TILER_PRESENT_LO" }, { 0x120, "L2_PRESENT_LO" },
++            { 0x140, "SHADER_READY_LO" }, { 0x160, "L2_READY_LO" },
++        };
++        for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++            uint32_t v = a5g3d_read32(gpu, regs[i].off);
++            IOLog("J7 G3D: %s(+%03x)=%08x\n", regs[i].name, regs[i].off, v);
++        }
++    }
+     ml_io_unmap(gpu, 0x1000);
+     ml_io_unmap(cmu, 0x1000);
+     ml_io_unmap(pmu, 0x1000);

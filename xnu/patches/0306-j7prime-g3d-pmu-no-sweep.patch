@@ -1,0 +1,29 @@
+From: j7 g3d
+Subject: j7prime: G3D probe must not sweep the PMU page
+
+j7gpu=2|3 (0302) printed every non-zero word of PMU+0x4040..0x407c. On the phone it read
+PMU+4040/4044/4048 fine and then panicked on PMU+404c: "Unclassified kernel abort
+(fault_code=0x10)", esr 0x96000210, far = mapping base + 0x4c. That is a synchronous external
+abort from a hole in the PMU register file. Read only G3D config (+0x60) and status (+0x64).
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -291,12 +291,11 @@
+         service->setProperty("J7G3DProbeResult", "pmu-map-failed");
+         return;
+     }
+-    for (vm_offset_t off = 0x40; off < 0x80; off += 4) {
+-        uint32_t v = a5g3d_read32(pmu, off);
+-        if (v) {
+-            IOLog("J7 G3D: PMU+%04x=%08x\n", (unsigned)(0x4000 + off), v);
+-        }
+-    }
++    /*
++     * Do NOT sweep this page: the PMU has holes that raise a synchronous external abort
++     * (the first J7 trial panicked reading PMU+404c, fault_code 0x10, far = page + 0x4c).
++     * Read only the two registers this probe needs.
++     */
+     uint32_t config = a5g3d_read32(pmu, 0x60);
+     uint32_t status = a5g3d_read32(pmu, 0x64);
+     service->setProperty("J7G3DPMUConfig", static_cast<uint64_t>(config), 32);

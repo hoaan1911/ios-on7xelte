@@ -1,0 +1,580 @@
+From: j7 g3d
+Subject: j7prime: Mali-T830 job manager core + j7gpu=6 kernel selftest
+
+j7gpu=5 passed on the phone (job irq 0x2, MMU/GPU clean, output zeroed). This is the next layer,
+the part a user-space driver will sit on, exercised from the kernel first so it can be verified
+from the boot log alone:
+
+- page tables: four-level Mali-LPAE carved from a 2 MiB physically contiguous pool, same
+  descriptor formats the A5 test proved (table|3, leaf pa|0x2c1, TRANSTAB root|7, memattr 0x888d88)
+- BOs: IOBufferMemoryDescriptor pages (scattered is fine) mapped 4 KiB at a time at first-fit GPU
+  VAs below 2 GiB (MMU_FEATURES 0x2821 = 33 VA bits), one guard page after each BO
+- MMU: AS0 UPDATE, LOCK + FLUSH_PT over the exact range after map/unmap (Panfrost's sequence)
+- jobs: JS_HEAD/AFFINITY/CONFIG/COMMAND_NEXT on a chosen slot, completion from JOB_IRQ_RAWSTAT,
+  MMU faults reported, GPU soft reset recovery
+- selftest (j7gpu=6): two chained WRITE_VALUE jobs writing across two BOs, free + re-create the
+  BO at the same VA on different pages and run again (needs a correct flush), then a deliberate
+  write to an unmapped VA that must fault cleanly, reset, free everything
+
+Tested on the host against a simulated Mali with scattered physical pages, incoherent caches and
+a stale-TLB model (the same code passes; with FLUSH_PT disabled the second chain is caught).
+Not yet run on hardware.
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -279,10 +279,510 @@
+     service->setProperty("J7G3DJobSPI", 282ULL, 32);
+     service->setProperty("J7G3DMMUSPI", 283ULL, 32);
+     service->setProperty("J7G3DGpuSPI", 281ULL, 32);
+-    service->setProperty("J7G3DDriverStage", level >= 5 ? "write-value-job" : level == 4 ? "core-power-test" : level == 3 ? "gpu-id-probe" :
++    service->setProperty("J7G3DDriverStage", level >= 6 ? "job-manager-selftest" : level == 5 ? "write-value-job" : level == 4 ? "core-power-test" : level == 3 ? "gpu-id-probe" :
+         (level == 2 ? "pmu-cmu-probe" : "resources-only"));
+ }
+ 
++/* ===================================================================================
++ * Mali-T830 job manager core (j7gpu=6 selftest now; the user client builds on this).
++ *
++ * One address space (AS0), four-level Mali-LPAE page tables carved from a physically
++ * contiguous pool, buffer objects mapped at kernel-chosen GPU VAs below 2 GiB, jobs
++ * submitted by GPU VA of the job chain head, completion polled from JOB_IRQ_RAWSTAT.
++ * Register layout and descriptor formats are the ones the A5 test already proved on
++ * this GPU family (write-value job, 0x2c1 leaves, memattr 0x888d88).
++ * =================================================================================== */
++#define J7M_MAX_BOS     64
++#define J7M_VA_LO       0x01000000ULL
++#define J7M_VA_HI       0x80000000ULL   /* MMU_FEATURES 0x2821: 33 VA bits; stay well below */
++#define J7M_PT_BYTES    (2u * 1024 * 1024)
++#define J7M_PAGE        0x1000ULL        /* the GPU's page size, whatever the CPU's is */
++
++#define J7M_JOB_IRQ_RAWSTAT 0x1000
++#define J7M_JOB_IRQ_CLEAR   0x1004
++#define J7M_MMU_IRQ_RAWSTAT 0x2000
++#define J7M_MMU_IRQ_CLEAR   0x2004
++#define J7M_AS0             0x2400
++#define J7M_JS(n)           (0x1800 + 0x80 * (n))
++
++struct J7MaliBo {
++    IOBufferMemoryDescriptor *md;
++    uint64_t va;
++    uint64_t size;
++    bool used;
++};
++
++static struct {
++    vm_offset_t gpu;
++    IOBufferMemoryDescriptor *pool;
++    uint8_t *poolVA;
++    uint64_t poolPA;
++    uint32_t poolTables;
++    uint32_t poolUsed;
++    uint64_t root;
++    uint32_t shader;
++    bool mmuLive;
++    uint32_t seq;
++    bool inflight;
++    uint32_t inflightSlot;
++    struct J7MaliBo bos[J7M_MAX_BOS];
++} gJ7M;
++
++static uint64_t *
++j7m_table(uint64_t pa)
++{
++    return reinterpret_cast<uint64_t *>(gJ7M.poolVA + (pa - gJ7M.poolPA));
++}
++
++/* PA of a new zeroed 4 KiB table, or 0. */
++static uint64_t
++j7m_table_new(void)
++{
++    if (gJ7M.poolUsed >= gJ7M.poolTables) {
++        return 0;
++    }
++    uint64_t pa = gJ7M.poolPA + (uint64_t)gJ7M.poolUsed * J7M_PAGE;
++    gJ7M.poolUsed++;
++    bzero(j7m_table(pa), J7M_PAGE);
++    return pa;
++}
++
++static bool
++j7m_pool_init(void)
++{
++    bzero(&gJ7M.bos, sizeof(gJ7M.bos));
++    gJ7M.poolUsed = 0;
++    gJ7M.pool = IOBufferMemoryDescriptor::withOptions(
++        kIODirectionInOut | kIOMemoryPhysicallyContiguous, J7M_PT_BYTES, J7M_PAGE);
++    if (!gJ7M.pool || !gJ7M.pool->getBytesNoCopy()) {
++        return false;
++    }
++    IOByteCount seg = 0;
++    gJ7M.poolPA = gJ7M.pool->getPhysicalSegment(0, &seg, kIOMemoryMapperNone);
++    if (!gJ7M.poolPA || seg < J7M_PT_BYTES || (gJ7M.poolPA & (J7M_PAGE - 1))) {
++        return false;
++    }
++    gJ7M.poolVA = static_cast<uint8_t *>(gJ7M.pool->getBytesNoCopy());
++    gJ7M.poolTables = J7M_PT_BYTES / J7M_PAGE;
++    bzero(gJ7M.poolVA, J7M_PT_BYTES);
++    gJ7M.root = j7m_table_new();
++    return gJ7M.root != 0;
++}
++
++/* Push table writes to memory before the GPU's walker can read them. */
++static void
++j7m_pool_sync(void)
++{
++    gJ7M.pool->performOperation(kIOMemoryIncoherentIOStore, 0, J7M_PT_BYTES);
++    __sync_synchronize();
++}
++
++static bool
++j7m_map_page(uint64_t va, uint64_t pa)
++{
++    uint64_t table = gJ7M.root;
++    const unsigned shifts[3] = { 39, 30, 21 };
++    for (unsigned level = 0; level < 3; level++) {
++        uint64_t *t = j7m_table(table);
++        uint64_t &e = t[(va >> shifts[level]) & 0x1ff];
++        if (!(e & 3)) {
++            uint64_t next = j7m_table_new();
++            if (!next) {
++                return false;
++            }
++            e = next | 3;
++        }
++        table = e & 0x0000fffffffff000ULL;
++    }
++    uint64_t &leaf = j7m_table(table)[(va >> 12) & 0x1ff];
++    if (leaf & 3) {
++        return false;                /* already mapped: allocator bug */
++    }
++    /* Mali-LPAE leaf: read/write, outer-shareable, attribute index 0, type 1 (as the A5 test). */
++    leaf = pa | 0x2c1;
++    return true;
++}
++
++static void
++j7m_unmap_page(uint64_t va)
++{
++    uint64_t table = gJ7M.root;
++    const unsigned shifts[3] = { 39, 30, 21 };
++    for (unsigned level = 0; level < 3; level++) {
++        uint64_t e = j7m_table(table)[(va >> shifts[level]) & 0x1ff];
++        if (!(e & 3)) {
++            return;
++        }
++        table = e & 0x0000fffffffff000ULL;
++    }
++    j7m_table(table)[(va >> 12) & 0x1ff] = 0;
++}
++
++static bool
++j7m_mmu_wait_idle(void)
++{
++    for (unsigned i = 0; i < 10000; i++) {
++        if (!(a5g3d_read32(gJ7M.gpu, J7M_AS0 + 0x28) & 1)) {
++            return true;
++        }
++        IODelay(10);
++    }
++    return false;
++}
++
++static bool
++j7m_mmu_cmd(uint32_t cmd)
++{
++    if (!j7m_mmu_wait_idle()) {
++        return false;
++    }
++    a5g3d_write32(gJ7M.gpu, J7M_AS0 + 0x18, cmd);
++    return j7m_mmu_wait_idle();
++}
++
++/* Program AS0 with the page-table root (also valid after a GPU reset). */
++static bool
++j7m_mmu_enable(void)
++{
++    a5g3d_write32(gJ7M.gpu, J7M_MMU_IRQ_CLEAR, 0xffffffffu);
++    a5g3d_write32(gJ7M.gpu, J7M_JOB_IRQ_CLEAR, 0xffffffffu);
++    const uint64_t transtab = gJ7M.root | 0x7;
++    a5g3d_write32(gJ7M.gpu, J7M_AS0 + 0x00, static_cast<uint32_t>(transtab));
++    a5g3d_write32(gJ7M.gpu, J7M_AS0 + 0x04, static_cast<uint32_t>(transtab >> 32));
++    a5g3d_write32(gJ7M.gpu, J7M_AS0 + 0x08, 0x888d88);
++    a5g3d_write32(gJ7M.gpu, J7M_AS0 + 0x0c, 0);
++    gJ7M.mmuLive = j7m_mmu_cmd(1);   /* AS_COMMAND_UPDATE */
++    return gJ7M.mmuLive;
++}
++
++/* Lock + flush the page-table caches for [va, va+len) (Panfrost's sequence). */
++static bool
++j7m_mmu_flush(uint64_t va, uint64_t len)
++{
++    if (!gJ7M.mmuLive) {
++        return true;            /* AS0 not programmed (or reset): nothing cached to flush */
++    }
++    uint64_t size = J7M_PAGE;
++    while (size < len || (va & ~(size - 1)) != ((va + len - 1) & ~(size - 1))) {
++        size <<= 1;
++    }
++    unsigned width = 0;
++    while ((1ULL << (width + 1)) < size) {
++        width++;
++    }
++    /* region_width = log2(size) - 1 */
++    const uint64_t lockaddr = (va & ~(size - 1)) | width;
++    if (!j7m_mmu_wait_idle()) {
++        return false;
++    }
++    a5g3d_write32(gJ7M.gpu, J7M_AS0 + 0x10, static_cast<uint32_t>(lockaddr));
++    a5g3d_write32(gJ7M.gpu, J7M_AS0 + 0x14, static_cast<uint32_t>(lockaddr >> 32));
++    return j7m_mmu_cmd(2) && j7m_mmu_cmd(4);   /* LOCK, FLUSH_PT */
++}
++
++/* First-fit GPU VA for a new BO, one guard page after every BO. 0 if none. */
++static uint64_t
++j7m_va_alloc(uint64_t size)
++{
++    uint64_t cand = J7M_VA_LO;
++    for (;;) {
++        bool clash = false;
++        for (unsigned i = 0; i < J7M_MAX_BOS; i++) {
++            const struct J7MaliBo &b = gJ7M.bos[i];
++            if (!b.used) {
++                continue;
++            }
++            const uint64_t b_end = b.va + b.size + J7M_PAGE;
++            if (cand < b_end && cand + size + J7M_PAGE > b.va) {
++                cand = b_end;          /* overlaps: restart after this BO */
++                clash = true;
++                break;
++            }
++        }
++        if (clash) {
++            continue;
++        }
++        if (cand + size + J7M_PAGE > J7M_VA_HI) {
++            return 0;
++        }
++        return cand;
++    }
++}
++
++/* Create a zeroed BO, map every 4 KiB of it into AS0. Returns the BO or NULL. */
++static struct J7MaliBo *
++j7m_bo_new(uint64_t size)
++{
++    size = (size + J7M_PAGE - 1) & ~(J7M_PAGE - 1);
++    if (size == 0 || size > (64ULL << 20)) {
++        return NULL;
++    }
++    struct J7MaliBo *bo = NULL;
++    for (unsigned i = 0; i < J7M_MAX_BOS; i++) {
++        if (!gJ7M.bos[i].used) {
++            bo = &gJ7M.bos[i];
++            break;
++        }
++    }
++    if (!bo) {
++        return NULL;
++    }
++    IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::withOptions(
++        kIODirectionInOut, size, PAGE_SIZE);
++    if (!md || !md->getBytesNoCopy()) {
++        if (md) {
++            md->release();
++        }
++        return NULL;
++    }
++    bzero(md->getBytesNoCopy(), size);
++    md->performOperation(kIOMemoryIncoherentIOStore, 0, size);
++    const uint64_t va = j7m_va_alloc(size);
++    if (!va) {
++        md->release();
++        return NULL;
++    }
++    uint64_t done = 0;
++    bool ok = true;
++    for (; done < size && ok; done += J7M_PAGE) {
++        IOByteCount seg = 0;
++        const uint64_t pa = md->getPhysicalSegment(done, &seg, kIOMemoryMapperNone);
++        ok = pa && !(pa & (J7M_PAGE - 1)) && seg >= J7M_PAGE && j7m_map_page(va + done, pa);
++    }
++    if (!ok) {
++        for (uint64_t u = 0; u < done; u += J7M_PAGE) {
++            j7m_unmap_page(va + u);
++        }
++        j7m_pool_sync();
++        md->release();
++        return NULL;
++    }
++    j7m_pool_sync();
++    (void)j7m_mmu_flush(va, size);
++    bo->md = md;
++    bo->va = va;
++    bo->size = size;
++    bo->used = true;
++    return bo;
++}
++
++static void
++j7m_bo_free(struct J7MaliBo *bo)
++{
++    for (uint64_t u = 0; u < bo->size; u += J7M_PAGE) {
++        j7m_unmap_page(bo->va + u);
++    }
++    j7m_pool_sync();
++    (void)j7m_mmu_flush(bo->va, bo->size);
++    bo->md->release();
++    bzero(bo, sizeof(*bo));
++}
++
++/* Start one job chain on slot (0 = fragment, 1 = vertex/tiler, 2 = compute). */
++static bool
++j7m_submit(uint32_t slot, uint64_t jc_va, uint32_t *seq)
++{
++    const uint32_t js = J7M_JS(slot);
++    if (gJ7M.inflight || slot > 2 || (a5g3d_read32(gJ7M.gpu, js + 0x60) & 1)) {
++        return false;
++    }
++    a5g3d_write32(gJ7M.gpu, J7M_JOB_IRQ_CLEAR, 0xffffffffu);
++    a5g3d_write32(gJ7M.gpu, js + 0x40, static_cast<uint32_t>(jc_va));
++    a5g3d_write32(gJ7M.gpu, js + 0x44, static_cast<uint32_t>(jc_va >> 32));
++    a5g3d_write32(gJ7M.gpu, js + 0x50, gJ7M.shader);
++    a5g3d_write32(gJ7M.gpu, js + 0x54, 0);
++    /* AS0 | start/end clean+invalidate flushes | thread priority 8 (Panfrost's JS_CONFIG). */
++    a5g3d_write32(gJ7M.gpu, js + 0x58, (8u << 16) | (3u << 8) | (3u << 12));
++    __sync_synchronize();
++    a5g3d_write32(gJ7M.gpu, js + 0x60, 1);   /* JS_COMMAND_NEXT = START */
++    gJ7M.inflight = true;
++    gJ7M.inflightSlot = slot;
++    *seq = ++gJ7M.seq;
++    return true;
++}
++
++/* Poll for completion. 0 = done OK, -1 = timeout, -2 = job fault, -3 = MMU fault. */
++static int
++j7m_wait(unsigned timeout_us)
++{
++    if (!gJ7M.inflight) {
++        return 0;
++    }
++    const uint32_t slot = gJ7M.inflightSlot;
++    uint32_t jobIRQ = 0, mmuIRQ = 0;
++    for (unsigned us = 0; us < timeout_us; us += 10) {
++        jobIRQ = a5g3d_read32(gJ7M.gpu, J7M_JOB_IRQ_RAWSTAT);
++        mmuIRQ = a5g3d_read32(gJ7M.gpu, J7M_MMU_IRQ_RAWSTAT);
++        if ((jobIRQ & ((1u << slot) | (1u << (slot + 16)))) || mmuIRQ) {
++            break;
++        }
++        IODelay(10);
++    }
++    int rc = 0;
++    if (mmuIRQ) {
++        rc = -3;
++    } else if (jobIRQ & (1u << (slot + 16))) {
++        rc = -2;
++    } else if (!(jobIRQ & (1u << slot))) {
++        rc = -1;
++    }
++    if (rc != -1) {
++        a5g3d_write32(gJ7M.gpu, J7M_JOB_IRQ_CLEAR, jobIRQ);
++        a5g3d_write32(gJ7M.gpu, J7M_MMU_IRQ_CLEAR, mmuIRQ);
++        gJ7M.inflight = false;
++    }
++    return rc;
++}
++
++/* GPU soft reset: stops everything, clears AS0 and the job slots. */
++static bool
++j7m_gpu_reset(void)
++{
++    a5g3d_write32(gJ7M.gpu, 0x28, 0);
++    a5g3d_write32(gJ7M.gpu, 0x24, 0xffffffffu);
++    a5g3d_write32(gJ7M.gpu, 0x30, 1);
++    for (unsigned us = 0; us < 100000; us += 10) {
++        if (a5g3d_read32(gJ7M.gpu, 0x20) & (1u << 8)) {
++            a5g3d_write32(gJ7M.gpu, 0x24, 0xffffffffu);
++            gJ7M.inflight = false;
++            gJ7M.mmuLive = false;
++            return true;
++        }
++        IODelay(10);
++    }
++    return false;
++}
++
++
++/* ---- j7gpu=6: exercise the job manager end to end from the kernel, no user space needed ---- */
++static uint64_t
++j7m_word(struct J7MaliBo *bo, uint32_t off)
++{
++    bo->md->performOperation(kIOMemoryIncoherentIOFlush, 0, bo->size);
++    return *reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(bo->md->getBytesNoCopy()) + off);
++}
++
++static void
++j7m_seed(struct J7MaliBo *bo, uint32_t off)
++{
++    *reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(bo->md->getBytesNoCopy()) + off) =
++        0xa5a5a5a55a5a5a5aULL;
++    bo->md->performOperation(kIOMemoryIncoherentIOStore, 0, bo->size);
++}
++
++/* Two chained WRITE_VALUE(zero) jobs: out+0x0 and out+0x1008 (second 4 KiB page). */
++static bool
++j7m_run_chain(struct J7MaliBo *jobs, struct J7MaliBo *out, const char *what)
++{
++    j7m_seed(out, 0x0);
++    j7m_seed(out, 0x8);
++    j7m_seed(out, 0x1008);
++    uint8_t *base = static_cast<uint8_t *>(jobs->md->getBytesNoCopy());
++    bzero(base, 0x200);
++    A5G3DWriteValueJob *j0 = reinterpret_cast<A5G3DWriteValueJob *>(base);
++    A5G3DWriteValueJob *j1 = reinterpret_cast<A5G3DWriteValueJob *>(base + 0x100);
++    j0->typeAndSize = 1 | (2 << 1);
++    j0->index = 1;
++    j0->next = jobs->va + 0x100;
++    j0->outputVA = out->va + 0x0;
++    j0->valueType = 3;
++    j1->typeAndSize = 1 | (2 << 1);
++    j1->index = 2;
++    j1->next = 0;
++    j1->outputVA = out->va + 0x1008;
++    j1->valueType = 3;
++    jobs->md->performOperation(kIOMemoryIncoherentIOStore, 0, jobs->size);
++    __sync_synchronize();
++    uint32_t seq = 0;
++    if (!j7m_submit(1, jobs->va, &seq)) {
++        IOLog("J7 G3D: [%s] submit refused\n", what);
++        return false;
++    }
++    const int rc = j7m_wait(200000);
++    const uint64_t w0 = j7m_word(out, 0x0), w1 = j7m_word(out, 0x8), w2 = j7m_word(out, 0x1008);
++    IOLog("J7 G3D: [%s] seq=%u wait=%d out0=%016llx out8=%016llx out1008=%016llx js1_status=%08x\n",
++        what, seq, rc, w0, w1, w2, a5g3d_read32(gJ7M.gpu, J7M_JS(1) + 0x24));
++    return rc == 0 && w0 == 0 && w2 == 0 && w1 == 0xa5a5a5a55a5a5a5aULL;
++}
++
++static bool
++j7m_selftest(IOService *service, vm_offset_t gpu)
++{
++    bzero(&gJ7M, sizeof(gJ7M));
++    gJ7M.gpu = gpu;
++    gJ7M.shader = a5g3d_read32(gpu, 0x140);
++    if (!gJ7M.shader || !(a5g3d_read32(gpu, 0x018) & 1) || !(a5g3d_read32(gpu, 0x01c) & 2)) {
++        IOLog("J7 G3D: job manager: cores not ready\n");
++        service->setProperty("J7G3DJobMgr", "cores-not-ready");
++        return false;
++    }
++    if (!j7m_pool_init()) {
++        IOLog("J7 G3D: job manager: page-table pool allocation failed\n");
++        service->setProperty("J7G3DJobMgr", "pool-failed");
++        return false;
++    }
++    IOLog("J7 G3D: job manager: page-table pool pa=%016llx %u tables, root=%016llx\n",
++        gJ7M.poolPA, gJ7M.poolTables, gJ7M.root);
++    j7m_pool_sync();
++    bool ok = j7m_mmu_enable();
++    struct J7MaliBo *jobs = ok ? j7m_bo_new(0x1000) : NULL;
++    struct J7MaliBo *out = jobs ? j7m_bo_new(0x2000) : NULL;
++    struct J7MaliBo *pad = out ? j7m_bo_new(0x10000) : NULL;
++    ok = ok && jobs && out && pad;
++    if (ok) {
++        IOLog("J7 G3D: job manager: BO jobs va=%llx out va=%llx pad va=%llx\n", jobs->va, out->va, pad->va);
++        ok = j7m_run_chain(jobs, out, "chain 1");
++    } else {
++        IOLog("J7 G3D: job manager: MMU enable or BO allocation failed\n");
++    }
++    if (ok) {
++        /* Allocator + unmap + remap: free the middle BO, take the same hole again, run again. */
++        const uint64_t oldVA = out->va;
++        j7m_bo_free(out);
++        out = j7m_bo_new(0x2000);
++        ok = out != NULL;
++        if (ok) {
++            IOLog("J7 G3D: job manager: BO out re-created at va=%llx (was %llx)\n", out->va, oldVA);
++            /* the job chain still names the old VA; rebuild it for the new one */
++            ok = j7m_run_chain(jobs, out, "chain 2");
++        }
++    }
++    if (ok && out) {
++        /* Deliberate fault: a chain that writes to an unmapped VA must fail cleanly (MMU IRQ). */
++        uint8_t *base = static_cast<uint8_t *>(jobs->md->getBytesNoCopy());
++        A5G3DWriteValueJob *j0 = reinterpret_cast<A5G3DWriteValueJob *>(base);
++        bzero(base, 0x200);
++        j0->typeAndSize = 1 | (2 << 1);
++        j0->index = 1;
++        j0->outputVA = 0x7ff00000ULL;     /* inside J7M_VA range, never mapped */
++        j0->valueType = 3;
++        jobs->md->performOperation(kIOMemoryIncoherentIOStore, 0, jobs->size);
++        uint32_t seq = 0;
++        if (j7m_submit(1, jobs->va, &seq)) {
++            const int rc = j7m_wait(200000);
++            IOLog("J7 G3D: [fault test] seq=%u wait=%d (expect -3 MMU fault or -2 job fault) mmu=%08x\n",
++                seq, rc, a5g3d_read32(gpu, J7M_MMU_IRQ_RAWSTAT));
++            ok = (rc == -3 || rc == -2);
++            /* recover: reset clears AS0 and the faulted slot; reprogram the MMU */
++            ok = j7m_gpu_reset() && ok;
++        } else {
++            ok = false;
++        }
++    }
++    /* Teardown. A hung GPU may still touch these pages: only free after a good reset. */
++    const bool reset = j7m_gpu_reset();
++    if (reset) {
++        if (pad) { j7m_bo_free(pad); }
++        if (out) { j7m_bo_free(out); }
++        if (jobs) { j7m_bo_free(jobs); }
++        gJ7M.pool->release();
++        gJ7M.pool = NULL;
++    }
++    IOLog("J7 G3D: job manager selftest %s%s\n", ok ? "PASSED" : "FAILED", reset ? "" : " (GPU did not reset; memory kept)");
++    service->setProperty("J7G3DJobMgr", ok ? "selftest-passed" : "selftest-failed");
++    return ok;
++}
++
+ /*
+  * j7gpu=4: reset the GPU, power L2 -> shader -> tiler (the Panfrost order), check READY, power them
+  * off again.  Only GPU_CONTROL registers below 0x230 are touched; no address space, no job slot,
+@@ -306,7 +806,7 @@
+ }
+ 
+ static void
+-j7g3d_power_test(IOService *service, vm_offset_t gpu, bool runJob,
++j7g3d_power_test(IOService *service, vm_offset_t gpu, int level,
+     IOBufferMemoryDescriptor *&storage)
+ {
+     const uint32_t shader = a5g3d_read32(gpu, 0x100);
+@@ -365,11 +865,14 @@
+      * did not complete cleanly.
+      */
+     bool jobAttempted = false, jobOK = false;
+-    if (ok && runJob) {
++    if (ok && level == 5) {
+         jobAttempted = true;
+         IOLog("J7 G3D: running one WRITE_VALUE job on JS1 (AS0, private 16 KiB page table)\n");
+         jobOK = a5g3d_try_write_value(service, gpu, storage);
+         IOLog("J7 G3D: write-value job %s\n", jobOK ? "COMPLETED, output zeroed" : "FAILED or timed out");
++    } else if (ok && level >= 6) {
++        jobAttempted = true;
++        jobOK = j7m_selftest(service, gpu);
+     }
+ 
+     /* Always try to leave the cores off again, shader first, L2 last. */
+@@ -489,7 +992,7 @@
+             IOLog("J7 G3D: %s(+%03x)=%08x\n", regs[i].name, regs[i].off, v);
+         }
+         if (level >= 4) {
+-            j7g3d_power_test(service, gpu, level >= 5, storage);
++            j7g3d_power_test(service, gpu, level, storage);
+         }
+     }
+     ml_io_unmap(gpu, gpuSize);
+@@ -514,7 +1017,7 @@
+ {
+     int enabled = 0;
+     int j7 = 0;
+-    if (PE_parse_boot_argn("j7gpu", &j7, sizeof(j7)) && j7 >= 1 && j7 <= 5) {
++    if (PE_parse_boot_argn("j7gpu", &j7, sizeof(j7)) && j7 >= 1 && j7 <= 6) {
+         if (!IOService::start(provider)) {
+             return false;
+         }

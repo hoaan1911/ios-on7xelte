@@ -1,0 +1,138 @@
+From: j7 g3d
+Subject: j7prime: j7gpu=4 resets the Mali-T830 and power-cycles L2/shader/tiler
+
+The j7gpu=3 trial (log from SYSTEM p21) confirmed GPU_ID 08300010 (Mali-T830), JS_PRESENT 7,
+AS_PRESENT ff, SHADER/TILER/L2 present 1/1/1, MMU_FEATURES 2821, JS0_FEATURES 20e, with every
+core still unpowered (READY registers 0). Next stage, still without memory or jobs: mask GPU
+IRQs, GPU_COMMAND soft reset, wait RESET_COMPLETED, power L2 -> shader -> tiler (Panfrost order)
+and require READY, then power them off again (shader, tiler, L2). Skipped unless the GPU is idle
+and all READY registers are zero beforehand.
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -279,10 +279,104 @@
+     service->setProperty("J7G3DJobSPI", 282ULL, 32);
+     service->setProperty("J7G3DMMUSPI", 283ULL, 32);
+     service->setProperty("J7G3DGpuSPI", 281ULL, 32);
+-    service->setProperty("J7G3DDriverStage", level >= 3 ? "gpu-id-probe" :
++    service->setProperty("J7G3DDriverStage", level >= 4 ? "core-power-test" : level == 3 ? "gpu-id-probe" :
+         (level == 2 ? "pmu-cmu-probe" : "resources-only"));
+ }
+ 
++/*
++ * j7gpu=4: reset the GPU, power L2 -> shader -> tiler (the Panfrost order), check READY, power them
++ * off again.  Only GPU_CONTROL registers below 0x230 are touched; no address space, no job slot,
++ * no memory is programmed and every GPU interrupt stays masked.
++ */
++static bool
++j7g3d_wait_ready(vm_offset_t gpu, uint32_t ready_reg, uint32_t mask, bool want_on,
++    unsigned timeout_us, uint32_t *last)
++{
++    uint32_t ready = 0;
++    for (unsigned us = 0; us < timeout_us; us += 10) {
++        ready = a5g3d_read32(gpu, ready_reg);
++        if (want_on ? ((ready & mask) == mask) : ((ready & mask) == 0)) {
++            *last = ready;
++            return true;
++        }
++        IODelay(10);
++    }
++    *last = ready;
++    return false;
++}
++
++static void
++j7g3d_power_test(IOService *service, vm_offset_t gpu)
++{
++    const uint32_t shader = a5g3d_read32(gpu, 0x100);
++    const uint32_t tiler = a5g3d_read32(gpu, 0x110);
++    const uint32_t l2 = a5g3d_read32(gpu, 0x120);
++    if (a5g3d_read32(gpu, 0x140) || a5g3d_read32(gpu, 0x150) || a5g3d_read32(gpu, 0x160) ||
++        a5g3d_read32(gpu, 0x034)) {
++        service->setProperty("J7G3DPowerResult", "not-idle-before-reset");
++        IOLog("J7 G3D: GPU not idle/off before reset; power test skipped\n");
++        return;
++    }
++    a5g3d_write32(gpu, 0x28, 0);            /* GPU_IRQ_MASK: nothing enabled */
++    a5g3d_write32(gpu, 0x24, 0xffffffffu);  /* GPU_IRQ_CLEAR */
++    a5g3d_write32(gpu, 0x30, 1);            /* GPU_COMMAND_SOFT_RESET */
++    uint32_t raw = 0;
++    unsigned us = 0;
++    for (; us < 100000; us += 10) {
++        raw = a5g3d_read32(gpu, 0x20);      /* GPU_IRQ_RAWSTAT */
++        if (raw & (1u << 8)) {              /* RESET_COMPLETED */
++            break;
++        }
++        IODelay(10);
++    }
++    IOLog("J7 G3D: soft reset rawstat=%08x after %u us (bit8 = reset completed)\n", raw, us);
++    if (!(raw & (1u << 8))) {
++        service->setProperty("J7G3DPowerResult", "reset-timeout");
++        return;
++    }
++    a5g3d_write32(gpu, 0x24, 0xffffffffu);
++
++    const struct { const char *name; uint32_t on, ready, mask; unsigned timeout_us; } up[] = {
++        { "L2", 0x1a0, 0x160, l2, 20000 },
++        { "shader", 0x180, 0x140, shader, 20000 },
++        { "tiler", 0x190, 0x150, tiler, 20000 },
++    };
++    bool ok = true;
++    for (const auto &step : up) {
++        uint32_t ready = 0;
++        a5g3d_write32(gpu, step.on, step.mask);
++        bool on = j7g3d_wait_ready(gpu, step.ready, step.mask, true, step.timeout_us, &ready);
++        IOLog("J7 G3D: power on %s mask=%08x ready=%08x %s\n", step.name, step.mask, ready,
++            on ? "OK" : "TIMEOUT");
++        if (!on) {
++            ok = false;
++            break;
++        }
++    }
++    IOLog("J7 G3D: after power on: GPU_STATUS=%08x IRQ_RAWSTAT=%08x\n",
++        a5g3d_read32(gpu, 0x34), a5g3d_read32(gpu, 0x20));
++    a5g3d_write32(gpu, 0x24, 0xffffffffu);
++
++    /* Always try to leave the cores off again, shader first, L2 last. */
++    const struct { const char *name; uint32_t off, ready, mask; } down[] = {
++        { "shader", 0x1c0, 0x140, shader },
++        { "tiler", 0x1d0, 0x150, tiler },
++        { "L2", 0x1e0, 0x160, l2 },
++    };
++    bool off_ok = true;
++    for (const auto &step : down) {
++        uint32_t ready = 0;
++        a5g3d_write32(gpu, step.off, step.mask);
++        bool off = j7g3d_wait_ready(gpu, step.ready, step.mask, false, 20000, &ready);
++        IOLog("J7 G3D: power off %s ready=%08x %s\n", step.name, ready, off ? "OK" : "TIMEOUT");
++        off_ok = off_ok && off;
++    }
++    a5g3d_write32(gpu, 0x24, 0xffffffffu);
++    service->setProperty("J7G3DPowerResult", ok ? (off_ok ? "power-cycle-ok" : "powered-on-off-timeout") :
++        "power-on-timeout");
++    IOLog("J7 G3D: core power test %s\n", ok ? (off_ok ? "PASSED" : "on OK, off timed out") : "FAILED");
++}
++
+ static void
+ j7g3d_probe(IOService *service, int level)
+ {
+@@ -363,6 +457,9 @@
+             uint32_t v = a5g3d_read32(gpu, regs[i].off);
+             IOLog("J7 G3D: %s(+%03x)=%08x\n", regs[i].name, regs[i].off, v);
+         }
++        if (level >= 4) {
++            j7g3d_power_test(service, gpu);
++        }
+     }
+     ml_io_unmap(gpu, 0x1000);
+     ml_io_unmap(cmu, 0x1000);
+@@ -386,7 +483,7 @@
+ {
+     int enabled = 0;
+     int j7 = 0;
+-    if (PE_parse_boot_argn("j7gpu", &j7, sizeof(j7)) && j7 >= 1 && j7 <= 3) {
++    if (PE_parse_boot_argn("j7gpu", &j7, sizeof(j7)) && j7 >= 1 && j7 <= 4) {
+         if (!IOService::start(provider)) {
+             return false;
+         }

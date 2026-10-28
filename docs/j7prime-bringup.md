@@ -39,3 +39,10 @@ timer test / vct_lag lines (lag should be < 1 ms and timers must wake on all 8).
 the second cluster (CPU_ON target 0x100..) is the suspect: report the `CPU_ON rc=` lines.
 0305 adds multi-block eMMC reads, off unless the boot args contain `emmcfast=1`; try it after cores work.
 Do not expect miracles from either: the UI is still software-rendered on the CPU (no GPU), so cores help most.
+
+## GPU bring-up stages (boot-arg j7gpu=N, Mali-T830 MP1)
+1 publish resources only; 2 also read PMU G3D status + CMU+000; 3 also read GPU_ID and the Midgard identity
+registers (confirmed on hardware: GPU_ID 08300010, 3 job slots, 8 address spaces, shader/tiler/L2 mask 1);
+4 (0308) also soft-reset the GPU and power-cycle L2/shader/tiler, no memory or jobs.
+The PMU and CMU pages have holes that raise an external abort (fault_code 0x10): never sweep them, read named
+registers only (0306, 0307). Kernel log: SYSTEM is mmcblk0p21 on the J7 Prime (not p20 as on the A5).

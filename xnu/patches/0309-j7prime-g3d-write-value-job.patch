@@ -1,0 +1,126 @@
+From: j7 g3d
+Subject: j7prime: j7gpu=5 runs one WRITE_VALUE job on the Mali-T830
+
+The j7gpu=4 trial passed on the phone (8/8 CPUs; GPU soft reset completed immediately; L2, shader
+and tiler powered on and off with READY following; IRQ_RAWSTAT 0x600 = power-changed). Stage 5
+reuses the A5's job test (a5g3d_try_write_value): with the cores powered, build a private
+4-level Mali-LPAE page table in one 16 KiB physically contiguous allocation, program AS0, submit
+one WRITE_VALUE job on JS1 that must zero a 64-bit word seeded with 0xa5a5a5a55a5a5a5a, poll
+JOB/MMU/GPU raw status with a deadline, then power the cores off. A job that does not complete
+cleanly is followed by a GPU soft reset. The allocation stays owned by the service (fTestMemory).
+The GPU aperture is mapped up to +0x2fff only at j7gpu=5. No access to RAM or the display.
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -279,7 +279,7 @@
+     service->setProperty("J7G3DJobSPI", 282ULL, 32);
+     service->setProperty("J7G3DMMUSPI", 283ULL, 32);
+     service->setProperty("J7G3DGpuSPI", 281ULL, 32);
+-    service->setProperty("J7G3DDriverStage", level >= 4 ? "core-power-test" : level == 3 ? "gpu-id-probe" :
++    service->setProperty("J7G3DDriverStage", level >= 5 ? "write-value-job" : level == 4 ? "core-power-test" : level == 3 ? "gpu-id-probe" :
+         (level == 2 ? "pmu-cmu-probe" : "resources-only"));
+ }
+ 
+@@ -306,7 +306,8 @@
+ }
+ 
+ static void
+-j7g3d_power_test(IOService *service, vm_offset_t gpu)
++j7g3d_power_test(IOService *service, vm_offset_t gpu, bool runJob,
++    IOBufferMemoryDescriptor *&storage)
+ {
+     const uint32_t shader = a5g3d_read32(gpu, 0x100);
+     const uint32_t tiler = a5g3d_read32(gpu, 0x110);
+@@ -357,6 +358,20 @@
+         a5g3d_read32(gpu, 0x34), a5g3d_read32(gpu, 0x20));
+     a5g3d_write32(gpu, 0x24, 0xffffffffu);
+ 
++    /*
++     * j7gpu=5: the A5's proven private-page test, now on the T830: one WRITE_VALUE job on JS1 through
++     * a private 4-level page table in AS0 (16 KiB, no access to RAM or the display).  The job must
++     * zero a 64-bit word that starts as 0xa5a5a5a55a5a5a5a.  Always resets the GPU afterwards if it
++     * did not complete cleanly.
++     */
++    bool jobAttempted = false, jobOK = false;
++    if (ok && runJob) {
++        jobAttempted = true;
++        IOLog("J7 G3D: running one WRITE_VALUE job on JS1 (AS0, private 16 KiB page table)\n");
++        jobOK = a5g3d_try_write_value(service, gpu, storage);
++        IOLog("J7 G3D: write-value job %s\n", jobOK ? "COMPLETED, output zeroed" : "FAILED or timed out");
++    }
++
+     /* Always try to leave the cores off again, shader first, L2 last. */
+     const struct { const char *name; uint32_t off, ready, mask; } down[] = {
+         { "shader", 0x1c0, 0x140, shader },
+@@ -372,13 +387,27 @@
+         off_ok = off_ok && off;
+     }
+     a5g3d_write32(gpu, 0x24, 0xffffffffu);
++    if (jobAttempted && !jobOK) {
++        /* Clear AS0 and any stuck job slot before leaving the GPU alone. */
++        a5g3d_write32(gpu, 0x30, 1);
++        uint32_t rr = 0;
++        for (unsigned t = 0; t < 100000; t += 10) {
++            rr = a5g3d_read32(gpu, 0x20);
++            if (rr & (1u << 8)) {
++                break;
++            }
++            IODelay(10);
++        }
++        IOLog("J7 G3D: cleanup soft reset rawstat=%08x\n", rr);
++        a5g3d_write32(gpu, 0x24, 0xffffffffu);
++    }
+     service->setProperty("J7G3DPowerResult", ok ? (off_ok ? "power-cycle-ok" : "powered-on-off-timeout") :
+         "power-on-timeout");
+     IOLog("J7 G3D: core power test %s\n", ok ? (off_ok ? "PASSED" : "on OK, off timed out") : "FAILED");
+ }
+ 
+ static void
+-j7g3d_probe(IOService *service, int level)
++j7g3d_probe(IOService *service, int level, IOBufferMemoryDescriptor *&storage)
+ {
+     vm_offset_t pmu = ml_io_map_unmappable(J7G3D_PMU_PAGE, 0x1000, VM_WIMG_IO);
+     if (!pmu) {
+@@ -429,7 +458,9 @@
+         ml_io_unmap(pmu, 0x1000);
+         return;
+     }
+-    vm_offset_t gpu = ml_io_map_unmappable(J7G3D_GPU_BASE, 0x1000, VM_WIMG_IO);
++    /* Job and MMU registers live at +0x1000..+0x2fff: map up to +0x2fff only for j7gpu=5. */
++    const vm_size_t gpuSize = level >= 5 ? 0x3000 : 0x1000;
++    vm_offset_t gpu = ml_io_map_unmappable(J7G3D_GPU_BASE, gpuSize, VM_WIMG_IO);
+     if (!gpu) {
+         service->setProperty("J7G3DProbeResult", "gpu-map-failed");
+         ml_io_unmap(cmu, 0x1000);
+@@ -458,10 +489,10 @@
+             IOLog("J7 G3D: %s(+%03x)=%08x\n", regs[i].name, regs[i].off, v);
+         }
+         if (level >= 4) {
+-            j7g3d_power_test(service, gpu);
++            j7g3d_power_test(service, gpu, level >= 5, storage);
+         }
+     }
+-    ml_io_unmap(gpu, 0x1000);
++    ml_io_unmap(gpu, gpuSize);
+     ml_io_unmap(cmu, 0x1000);
+     ml_io_unmap(pmu, 0x1000);
+ }
+@@ -483,7 +514,7 @@
+ {
+     int enabled = 0;
+     int j7 = 0;
+-    if (PE_parse_boot_argn("j7gpu", &j7, sizeof(j7)) && j7 >= 1 && j7 <= 4) {
++    if (PE_parse_boot_argn("j7gpu", &j7, sizeof(j7)) && j7 >= 1 && j7 <= 5) {
+         if (!IOService::start(provider)) {
+             return false;
+         }
+@@ -491,7 +522,7 @@
+         registerService();
+         IOLog("J7 G3D: resource service registered (level %d); GPU power unchanged; CPU display active\n", j7);
+         if (j7 >= 2) {
+-            j7g3d_probe(this, j7);
++            j7g3d_probe(this, j7, fTestMemory);
+         }
+         return true;
+     }

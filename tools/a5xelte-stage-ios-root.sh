@@ -85,14 +85,23 @@ if [[ -d $staged ]]; then
 else
     echo "no private/var/staged_system_apps in this OS image"
 fi
-# GPU delivery: /usr/lib/sweetgl.dylib is reserved as a real 64 MiB file (a marker, then zeros) so a
+# GPU delivery: /usr/lib/sweetgl.dylib is reserved as a real 64 MiB file (a marker and block number in every 4 KiB block) so a
 # library built later can be written over its own blocks from TWRP (tools/j7-push-lib.py, extents from
 # tools/hfs-file-extents.py). Loaded into backboardd only when the boot args say so (sweetenv=...); a
 # placeholder that dyld cannot load is skipped (the AMFI policy allows failed insertions).
 lib="$root/usr/lib/sweetgl.dylib"
 if [[ ! -e $lib ]]; then
-    /bin/dd if=/dev/zero of="$lib" bs=1048576 count=64 2>/dev/null
-    printf 'J7GLHOLD' | /bin/dd of="$lib" conv=notrunc 2>/dev/null
+    # Every 4096-byte block starts with the marker and its own block number, so tools/hfs-file-extents.py
+    # can prove, block by block, that the extents it reports are this file's.
+    python3 - "$lib" <<'PY'
+import sys
+with open(sys.argv[1], 'wb') as f:
+    for i in range(16384):
+        block = bytearray(4096)
+        block[0:8] = b'J7GLHOLD'
+        block[8:16] = i.to_bytes(8, 'little')
+        f.write(block)
+PY
     chmod 755 "$lib"
     chown 0:0 "$lib" 2>/dev/null || true
     echo "Reserved $lib (64 MiB placeholder)"

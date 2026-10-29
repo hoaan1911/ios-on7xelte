@@ -94,6 +94,12 @@ jobs:
           sudo env STAGE_ALL_APPS=1 bash tools/a5xelte-stage-ios-root.sh "$os" "$sys" "$app" "$root"
           build=$(/usr/libexec/PlistBuddy -c 'Print :ProductBuildVersion' ipsw/BuildManifest.plist)
           sudo bash tools/herolte-tune-ios-root.sh "$root" "$build"
+          # Where the GPU library placeholder lives on the volume (read back from the raw device and
+          # checked against the file, so a wrong map is never published).
+          dev=$(df "$root" | awk 'NR==2 {print $1}')
+          echo "volume device $dev"
+          sudo python3 tools/hfs-file-extents.py "$root/usr/lib/sweetgl.dylib" "/dev/r${dev#/dev/}" > sweetgl-extents.txt
+          cat sweetgl-extents.txt
           hdiutil detach "$root"; hdiutil detach "$os"; hdiutil detach "$sys"; hdiutil detach "$app"
           rm -f ipsw/os.dmg ipsw/systemos.dmg ipsw/appos.dmg
           df -h /
@@ -110,12 +116,12 @@ jobs:
           ls -l root.img.gz
           split -b 1900m -d -a 2 root.img.gz root.img.gz.part
           rm root.img.gz
-          shasum -a 256 root.img.gz.part* "${{ inputs.board || 'd21ap' }}.adt" | tee SHA256SUMS
+          shasum -a 256 root.img.gz.part* "${{ inputs.board || 'd21ap' }}.adt" sweetgl-extents.txt | tee SHA256SUMS
 
       - name: Publish as a private release
         run: |
           set -euo pipefail
           tag="ios-root-${{ inputs.ios_version || '16.7.16' }}-${{ github.run_id }}"
-          gh release create "$tag" root.img.gz.part* "${{ inputs.board || 'd21ap' }}.adt" SHA256SUMS \
+          gh release create "$tag" root.img.gz.part* "${{ inputs.board || 'd21ap' }}.adt" sweetgl-extents.txt SHA256SUMS \
             --title "iOS ${{ inputs.ios_version || '16.7.16' }} root for herolte (${{ inputs.size_mb || '20480' }} MiB)" \
             --notes "Apple software for personal use on the owner's device. Do not make this repository or release public."

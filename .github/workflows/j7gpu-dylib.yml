@@ -1,0 +1,46 @@
+name: j7gpu-dylib
+
+# Builds /usr/lib/sweetgl.dylib (the library injected into backboardd) for iOS 16 arm64 on a GitHub
+# macOS runner and pads it to 64 MiB, the size of the placeholder the root image reserves
+# (tools/a5xelte-stage-ios-root.sh), so tools/j7-push-lib.py can rewrite it in place.
+# Today it is tools/j7gpu/j7gputest.c; Mesa's Panfrost driver replaces it later, same file name.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode
+        run: |
+          set -euo pipefail
+          ls /Applications | grep -i '^Xcode' || true
+          # Xcode 15.x like the kernel build; fall back to whatever is selected.
+          x=$(ls -d /Applications/Xcode_15*.app 2>/dev/null | sort -V | tail -1 || true)
+          [ -z "$x" ] || sudo xcode-select -s "$x/Contents/Developer"
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos clang --version | head -1
+      - name: Build and ad-hoc sign
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -Wall -fvisibility=hidden \
+            -dynamiclib -install_name /usr/lib/sweetgl.dylib \
+            -framework IOKit -framework CoreFoundation \
+            tools/j7gpu/j7gputest.c -o out/sweetgl-unpadded.dylib
+          codesign -f -s - out/sweetgl-unpadded.dylib
+          lipo -info out/sweetgl-unpadded.dylib
+          size=$(stat -f %z out/sweetgl-unpadded.dylib)
+          [ "$size" -le 67108864 ] || { echo "dylib is $size bytes, over 64 MiB"; exit 1; }
+          cp out/sweetgl-unpadded.dylib out/sweetgl.dylib
+          # Pad after signing: the signature stays where the load command says, the rest is ignored.
+          python3 -c "open('out/sweetgl.dylib','r+b').truncate(67108864)"
+          ls -l out
+          shasum -a 256 out/sweetgl.dylib | tee out/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweetgl-dylib
+          path: out/sweetgl.dylib
+          compression-level: 9
+          retention-days: 14

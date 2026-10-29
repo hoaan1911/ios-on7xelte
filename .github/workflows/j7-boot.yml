@@ -9,6 +9,14 @@ on:
       cmdline:
         description: "XNU boot-args (cpus=8 needs the kernel built with 0304; cpus=4 = boot cluster only; add emmcfast=1 for 0305)"
         default: "debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress"
+      board:
+        description: "iPhone identity of the iOS root this boot image goes with (must match the ios-root run you flashed)"
+        type: choice
+        options: [d21ap, d22ap]
+        default: d21ap
+      ios_version:
+        description: "iOS version of the IPSW the device tree /product node is taken from"
+        default: "16.7.16"
 
 jobs:
   boot:
@@ -30,12 +38,45 @@ jobs:
         run: |
           CC=aarch64-linux-gnu-gcc LD=aarch64-linux-gnu-ld OBJCOPY=aarch64-linux-gnu-objcopy \
             sh shim/j7prime/build-xnu-boot.sh
+      - name: Fetch the iPhone device tree (the ADT /product node)
+        run: |
+          set -euo pipefail
+          # MobileGestalt reads the model name, device class and artwork from /product. Without it
+          # Settings says "iPad" and General > About shows a blank model.
+          # The node is Apple data and ends up in the uploaded ADT: only do it in a private repo.
+          if [ "${{ github.event.repository.private }}" != "true" ]; then
+            echo "::warning::public repository: not fetching Apple's /product node (blank model name in Settings)"
+            exit 0
+          fi
+          board="${{ inputs.board || 'd21ap' }}"
+          case "$board" in d21ap) dev='iPhone10,2';; d22ap) dev='iPhone10,3';; *) echo "unknown board $board"; exit 1;; esac
+          mkdir -p research/ipsw-x ipsw
+          url=$(curl -sf "https://api.ipsw.me/v4/device/$dev?type=ipsw" | python3 -c "
+          import json, sys
+          fw = [f for f in json.load(sys.stdin)['firmwares'] if f['version'] == '${{ inputs.ios_version || '16.7.16' }}']
+          print(fw[0]['url'])")
+          echo "IPSW: $url"
+          python3 tools/remotezip.py "$url" BuildManifest.plist ipsw
+          path=$(python3 - ipsw/BuildManifest.plist "$board" <<'PY'
+          import plistlib, sys
+          m = plistlib.load(open(sys.argv[1], 'rb'))
+          ident = next(i for i in m['BuildIdentities']
+                       if i['Info']['DeviceClass'].lower() == sys.argv[2]
+                       and 'Erase' in i['Info'].get('Variant', ''))
+          print(ident['Manifest']['DeviceTree']['Info']['Path'])
+          PY
+          )
+          python3 tools/remotezip.py "$url" "$path" ipsw
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet pyimg4
+          "$RUNNER_TEMP/venv/bin/pyimg4" im4p extract -i "ipsw/$path" -o "research/ipsw-x/$board.adt"
+          ls -l "research/ipsw-x/$board.adt"
       - name: ADT, embedded payload and boot image
         run: |
           set -euxo pipefail
           mkdir -p out
           ls -l kernel
-          python3 tools/mkadt_j7prime.py out/j7prime.adt
+          python3 tools/mkadt_j7prime.py out/j7prime.adt --board "${{ inputs.board || 'd21ap' }}"
           python3 tools/mkpayload.py kernel/kernel.development.a5xelte out/j7prime.adt out/payload.bin --cmdline "${{ inputs.cmdline }}"
           python3 tools/mkembeddedkernel.py shim/j7prime/outxnu/Image out/payload.bin out/embedded-kernel.Image
           python3 tools/mkdtbh.py -o out/dt.img device/on7xelte.dtb

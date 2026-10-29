@@ -1,7 +1,7 @@
 name: ios-root
 
 # Build the iOS 16 root volume for herolte (HFSX, partition-less) from the
-# iPhone X IPSW (iPhone10,3 / D22AP, the donor's tested identity) and
+# iPhone 8 Plus IPSW (iPhone10,2 / D21AP by default; iPhone X D22AP still selectable) and
 # publish it as assets of a release in THIS repository.
 # The image contains Apple software: the job refuses to run in a public
 # repository, and the release must stay private to its owner.
@@ -14,8 +14,11 @@ on:
         description: HFSX volume size in MiB (must fit USERDATA, 21566 MiB on SM-G930F)
         default: "20480"
       ipsw_device:
-        description: ipsw.me identifier of the userland source
-        default: "iPhone10,3"
+        description: ipsw.me identifier of the userland source (iPhone10,2 = iPhone 8 Plus, iPhone10,3 = iPhone X)
+        default: "iPhone10,2"
+      board:
+        description: BuildManifest board of that device (d21ap = iPhone 8 Plus, d22ap = iPhone X); must match ipsw_device and the board of the j7-boot run
+        default: "d21ap"
       ios_version:
         description: iOS version
         default: "16.7.16"
@@ -43,7 +46,7 @@ jobs:
       - name: Fetch IPSW members
         run: |
           set -euo pipefail
-          url=$(curl -sf "https://api.ipsw.me/v4/device/${{ inputs.ipsw_device || 'iPhone10,3' }}?type=ipsw" | python3 -c "
+          url=$(curl -sf "https://api.ipsw.me/v4/device/${{ inputs.ipsw_device || 'iPhone10,2' }}?type=ipsw" | python3 -c "
           import json, sys
           fw = [f for f in json.load(sys.stdin)['firmwares'] if f['version'] == '${{ inputs.ios_version || '16.7.16' }}']
           print(fw[0]['url'])")
@@ -54,7 +57,7 @@ jobs:
           import plistlib, sys
           m = plistlib.load(open(sys.argv[1], 'rb'))
           ident = next(i for i in m['BuildIdentities']
-                       if i['Info']['DeviceClass'].lower() == 'd22ap'
+                       if i['Info']['DeviceClass'].lower() == '${{ inputs.board || 'd21ap' }}'
                        and 'Erase' in i['Info'].get('Variant', ''))
           want = {'OS': 'os', 'Cryptex1,SystemOS': 'systemos', 'Cryptex1,AppOS': 'appos',
                   'DeviceTree': 'devicetree'}
@@ -69,14 +72,14 @@ jobs:
           ls -la ipsw
           df -h /
 
-      - name: Extract the D22AP device tree (for the ADT /product node)
+      - name: Extract the device tree (for the ADT /product node)
         run: |
           set -euo pipefail
           # Homebrew's Python is externally managed (PEP 668): use a venv.
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet pyimg4
-          "$RUNNER_TEMP/venv/bin/pyimg4" im4p extract -i ipsw/devicetree.im4p -o d22ap.adt
-          ls -l d22ap.adt
+          "$RUNNER_TEMP/venv/bin/pyimg4" im4p extract -i ipsw/devicetree.im4p -o "${{ inputs.board || 'd21ap' }}.adt"
+          ls -l "${{ inputs.board || 'd21ap' }}.adt"
 
       - name: Stage the root volume
         run: |
@@ -107,12 +110,12 @@ jobs:
           ls -l root.img.gz
           split -b 1900m -d -a 2 root.img.gz root.img.gz.part
           rm root.img.gz
-          shasum -a 256 root.img.gz.part* d22ap.adt | tee SHA256SUMS
+          shasum -a 256 root.img.gz.part* "${{ inputs.board || 'd21ap' }}.adt" | tee SHA256SUMS
 
       - name: Publish as a private release
         run: |
           set -euo pipefail
           tag="ios-root-${{ inputs.ios_version || '16.7.16' }}-${{ github.run_id }}"
-          gh release create "$tag" root.img.gz.part* d22ap.adt SHA256SUMS \
+          gh release create "$tag" root.img.gz.part* "${{ inputs.board || 'd21ap' }}.adt" SHA256SUMS \
             --title "iOS ${{ inputs.ios_version || '16.7.16' }} root for herolte (${{ inputs.size_mb || '20480' }} MiB)" \
             --notes "Apple software for personal use on the owner's device. Do not make this repository or release public."

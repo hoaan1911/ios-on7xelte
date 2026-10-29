@@ -65,3 +65,16 @@ artwork look up `<board>.plist` and the `/product` node of exactly that device.
   General > About had a blank model name.
 - Always flash a root and a boot image of the SAME board together. A D21AP boot image on an iPhone X root (or the
   reverse) misses the board's plists.
+
+## GPU in user space: delivery path (0312, j7gpu-dylib, j7-push-lib)
+No SSH and an HFS+ root mean a library cannot just be copied to the phone, so (as in the Pixel repo) the root image
+reserves `/usr/lib/sweetgl.dylib` as a real 64 MiB file (marker `J7GLHOLD`, then zeros) and its on-disk extents are
+published with the ios-root release as `sweetgl-extents.txt`.
+1. Build the library: Actions > `j7gpu-dylib` (macOS runner) > artifact `sweetgl-dylib` (a 64 MiB padded, ad-hoc signed
+   `sweetgl.dylib`). Today it is `tools/j7gpu/j7gputest.c`; Mesa's Panfrost driver replaces it later under the same name.
+2. In TWRP, from the folder with adb: `python j7-push-lib.py sweetgl.dylib sweetgl-extents.txt` (only that file's blocks are
+   written, then read back and compared). No root reflash is needed for later library versions.
+3. Boot with `j7gpu=7 sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib` (kernel patch 0312 injects the
+   variable and answers dyld's AMFI policy question so it honours it). A placeholder that cannot be loaded is skipped.
+4. The library runs the checks of the kernel-side client selftest from inside backboardd and writes them to the kernel
+   log: look for `J7 G3D client: dylib: ... j7gputest PASSED`.

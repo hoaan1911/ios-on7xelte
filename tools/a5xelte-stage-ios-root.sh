@@ -85,6 +85,18 @@ if [[ -d $staged ]]; then
 else
     echo "no private/var/staged_system_apps in this OS image"
 fi
+# GPU delivery: /usr/lib/sweetgl.dylib is reserved as a real 64 MiB file (a marker, then zeros) so a
+# library built later can be written over its own blocks from TWRP (tools/j7-push-lib.py, extents from
+# tools/hfs-file-extents.py). Loaded into backboardd only when the boot args say so (sweetenv=...); a
+# placeholder that dyld cannot load is skipped (the AMFI policy allows failed insertions).
+lib="$root/usr/lib/sweetgl.dylib"
+if [[ ! -e $lib ]]; then
+    /bin/dd if=/dev/zero of="$lib" bs=1048576 count=64 2>/dev/null
+    printf 'J7GLHOLD' | /bin/dd of="$lib" conv=notrunc 2>/dev/null
+    chmod 755 "$lib"
+    chown 0:0 "$lib" 2>/dev/null || true
+    echo "Reserved $lib (64 MiB placeholder)"
+fi
 echo "Copying SystemOS and AppOS cryptexes"
 mkdir -p "$root/private/preboot/Cryptexes/OS" "$root/private/preboot/Cryptexes/App"
 /usr/bin/rsync -aH --numeric-ids --extended-attributes "$sysos/" "$root/private/preboot/Cryptexes/OS/"

@@ -52,3 +52,16 @@ free/re-create at the same VA (TLB flush), a deliberate MMU fault + reset. Look 
 look for `client selftest PASSED`. Drop 0311 if it does not compile; 0304-0310 stand alone.
 The PMU and CMU pages have holes that raise an external abort (fault_code 0x10): never sweep them, read named
 registers only (0306, 0307). Kernel log: SYSTEM is mmcblk0p21 on the J7 Prime (not p20 as on the A5).
+
+## iPhone 8 Plus root and identity (boards d21ap / d22ap)
+The iOS root is built from one iPhone's IPSW and the ADT must claim the same board: SpringBoard, MobileGestalt and the
+artwork look up `<board>.plist` and the `/product` node of exactly that device.
+- `ios-root` now defaults to iPhone10,2 (iPhone 8 Plus, board d21ap; 1080x1920 with a Home button, the closest match to
+  the J7 panel). `ipsw_device`/`board` can still select iPhone X (iPhone10,3 / d22ap). `tools/a5xelte-stage-ios-root.sh`
+  also moves the stock apps iOS parks in `/private/var/staged_system_apps` (Mail, Maps, Calendar, ...) into
+  `/Applications`, because iOS's own first-boot install of them fails here.
+- `j7-boot` takes `board` (default d21ap) and, in a private repository, downloads that IPSW's device tree and grafts its
+  real `/product` node into the ADT (`tools/mkadt_j7prime.py --board d21ap`). Without `/product`, Settings said "iPad" and
+  General > About had a blank model name.
+- Always flash a root and a boot image of the SAME board together. A D21AP boot image on an iPhone X root (or the
+  reverse) misses the board's plists.

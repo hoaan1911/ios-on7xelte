@@ -64,6 +64,27 @@ omit=(
 )
 echo "Copying selected OS files"
 /usr/bin/rsync -aH --numeric-ids --extended-attributes "${app_filters[@]}" "${omit[@]}" "$os/" "$root/"
+# iOS 16 parks the removable stock apps (Mail, Maps, Calendar, Notes, Camera, Music, Weather, ...) in
+# /private/var/staged_system_apps and installs them into data containers on first boot. That install
+# fails here (code signing), so those apps would simply be missing. Move them into /Applications, where
+# iOS loads system apps in place, same volume so it is a rename.
+staged="$root/private/var/staged_system_apps"
+if [[ -d $staged ]]; then
+    moved=0
+    for bundle in "$staged"/*.app; do
+        [[ -d $bundle ]] || continue
+        name=${bundle##*/}
+        if [[ -e "$root/Applications/$name" ]]; then
+            echo "already in /Applications: $name"
+        else
+            mv "$bundle" "$root/Applications/$name"
+            moved=$((moved + 1))
+        fi
+    done
+    echo "Moved $moved stock apps from staged_system_apps into /Applications"
+else
+    echo "no private/var/staged_system_apps in this OS image"
+fi
 echo "Copying SystemOS and AppOS cryptexes"
 mkdir -p "$root/private/preboot/Cryptexes/OS" "$root/private/preboot/Cryptexes/App"
 /usr/bin/rsync -aH --numeric-ids --extended-attributes "$sysos/" "$root/private/preboot/Cryptexes/OS/"

@@ -8,6 +8,7 @@ A Mali-T830 G3D resource node is included (inert unless j7gpu=1|2|3). It is not 
 """
 import argparse
 import os
+import sys
 from pathlib import Path
 
 import adt
@@ -29,14 +30,46 @@ def child(node, name):
     raise ValueError(f'missing donor ADT node {name}')
 
 
-def build():
-    root = mkadt.build(seed=os.urandom(64), qemu=True)
-    # 'samsung,a5xelte' stays first: the A5XELTE kernel's platform expert matches on it.
+# Userland identity.  The iOS root comes from the IPSW of this device, so the ADT must
+# claim the same board: SpringBoard, MobileGestalt and the artwork all look up
+# <board>.plist / the /product node of that exact device.  iPhone 8 Plus (1080x1920, Home
+# button) is the closest match to the J7 Prime panel; iPhone X is kept for old roots.
+IDENTITIES = {
+    'd21ap': {'model': 'iPhone10,2', 'type': 'D21', 'board': 'D21AP', 'home_button': 0},
+    'd22ap': {'model': 'iPhone10,3', 'type': 'D22', 'board': 'D22AP', 'home_button': 2},
+}
+RESEARCH = Path(__file__).resolve().parent.parent / 'research' / 'ipsw-x'
+
+
+def apply_identity(root, ident, product_adt):
+    """Claim the iPhone's identity and graft the real device tree's /product node."""
     set_prop(root, 'compatible', mkadt.cstr('samsung,a5xelte') + mkadt.cstr('samsung,on7xelte') +
-             mkadt.cstr('samsung,exynos7870') + mkadt.cstr('AppleARM'))
+             mkadt.cstr('samsung,exynos7870') + mkadt.cstr(ident['board']) +
+             mkadt.cstr(ident['model']) + mkadt.cstr('AppleARM'))
+    set_prop(root, 'model', mkadt.cstr(ident['model']))
+    set_prop(root, 'target-type', mkadt.cstr(ident['type']))
+    set_prop(root, 'target-sub-type', mkadt.cstr(ident['board']))
+    # mkadt.build() may already have added the iPhone X /product when research/ipsw-x/d22ap.adt
+    # exists; the one that goes in must belong to this identity.
+    root.children = [c for c in root.children if c.prop('name') != mkadt.cstr('product')]
+    if product_adt and Path(product_adt).exists():
+        props = mkadt.d22ap_product(str(product_adt))
+        root.children.append(mkadt.node('product', [('AAPL,phandle', mkadt.u32(0x300))] + props))
+        print(f'/product node from {product_adt} ({len(props)} properties)', file=sys.stderr)
+    else:
+        print(f'warning: {product_adt} missing: no /product node, so Settings/About show a blank '
+              f'model name and iPad wording', file=sys.stderr)
+
+
+def build(board='d21ap', product_adt=None):
+    root = mkadt.build(seed=os.urandom(64), qemu=True)
+    # 'samsung,a5xelte' stays first (apply_identity): the A5XELTE kernel's platform expert matches on it.
+    ident = IDENTITIES[board]
     chosen = child(root, 'chosen')
     buttons = child(root, 'buttons')
     # Samsung's GPA2-5 mechanical key is the iOS Home (Menu) button.
+    # The J7 Prime has a mechanical Home key: always a Home-button device (0), whatever the
+    # donor board was; iPhone 8 Plus is one too.
     set_prop(buttons, 'home-button-type', mkadt.u32(0))
     set_prop(buttons, 'button-names', b''.join(mkadt.cstr(name) for name in
                                        ('volup', 'voldown', 'hold', 'home')))
@@ -120,13 +153,18 @@ def build():
     root.children.append(mkadt.node('a5xelte-emmc', [
         ('reg', mkadt.u64(0x13540000, 0x2000)),
     ]))
+    apply_identity(root, ident, product_adt)
     return root
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
+    parser.add_argument('--board', choices=sorted(IDENTITIES), default='d21ap',
+                        help='iPhone identity of the iOS root (d21ap = iPhone 8 Plus, d22ap = iPhone X)')
+    parser.add_argument('--product-adt', type=Path, default=None,
+                        help='real <board>.adt from the IPSW (default: research/ipsw-x/<board>.adt)')
     args = parser.parse_args()
-    blob = adt.serialize(build())
+    blob = adt.serialize(build(args.board, args.product_adt or RESEARCH / f'{args.board}.adt'))
     args.output.write_bytes(blob)
     print(f'{args.output}: {len(blob)} bytes')

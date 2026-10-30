@@ -1,0 +1,57 @@
+name: mesa-survey
+
+# First step of the Panfrost (Mesa) port for the Mali-T830: no build, only a read-out of the Mesa tag,
+# collected into one small artifact so the port can be written against the real source: the DRM
+# calls Panfrost makes, its BO mmap sites, the meson libdrm dependencies, the Midgard/T830 support
+# and the kernel uapi header. Ubuntu runner, a minute or two.
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_ref:
+        description: "Mesa git tag or branch to survey"
+        default: "mesa-24.3.4"
+
+jobs:
+  survey:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Clone Mesa
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ inputs.mesa_ref || 'mesa-24.3.4' }}" https://gitlab.freedesktop.org/mesa/mesa.git mesa
+          git -C mesa log -1 --format='%H %cs %s' | tee survey-head.txt
+      - name: Collect
+        run: |
+          set -uo pipefail
+          out="$PWD/survey"; mkdir -p "$out"; cp survey-head.txt "$out/"
+          cd mesa
+          # what the kernel uapi looks like
+          cp include/drm-uapi/panfrost_drm.h "$out/" || true
+          # every place Panfrost talks to the kernel or maps memory
+          grep -rnE "ioctl|drmIoctl|drmPrime|drmCommand|DRM_IOCTL|mmap\(|os_mmap|munmap|xf86drm|drm_fourcc|DRM_FORMAT|drmGetVersion|drmSyncobj" \
+            src/panfrost src/gallium/drivers/panfrost src/gallium/winsys/panfrost > "$out/drm-calls.txt" || true
+          # libdrm and platform dependencies in the build files
+          grep -rn "libdrm\|dep_libdrm\|with_gallium_panfrost\|system_has_kms_drm" --include=meson.build --include=meson.options \
+            meson.build meson.options src/meson.build src/gallium src/panfrost src/util 2>/dev/null > "$out/meson-deps.txt" || true
+          # the files a port has to read in full
+          mkdir -p "$out/files"
+          for f in src/panfrost/lib/pan_props.c src/panfrost/lib/pan_bo.c src/panfrost/lib/pan_bo.h \
+                   src/panfrost/lib/pan_device.h src/panfrost/lib/meson.build src/panfrost/meson.build \
+                   src/gallium/drivers/panfrost/meson.build src/gallium/drivers/panfrost/pan_job.c \
+                   src/gallium/drivers/panfrost/pan_screen.c src/gallium/drivers/panfrost/pan_fence.c \
+                   src/gallium/winsys/panfrost/drm/panfrost_drm_winsys.c src/gallium/winsys/panfrost/drm/panfrost_drm_public.h \
+                   src/gallium/winsys/panfrost/drm/meson.build src/gallium/meson.build; do
+            [ -f "$f" ] && cp "$f" "$out/files/$(echo "$f" | tr / _)" || echo "missing: $f" >> "$out/missing.txt"
+          done
+          # Midgard / T830 support and the GL level Midgard reaches
+          grep -rniE "t830|0x830|0x0830" src/panfrost > "$out/t830.txt" || true
+          grep -rniE "midgard|pan_is_bifrost|arch >= 6" src/gallium/drivers/panfrost/pan_screen.c > "$out/gl-level.txt" || true
+          ls src/panfrost src/panfrost/lib src/gallium/winsys/panfrost/drm > "$out/tree.txt" 2>&1 || true
+          cd ..
+          zip -rq mesa-survey.zip survey
+          ls -l mesa-survey.zip; wc -c survey/*.txt | tail -8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mesa-survey
+          path: mesa-survey.zip
+          retention-days: 14

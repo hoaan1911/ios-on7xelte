@@ -65,26 +65,48 @@ def main():
                      'wrong extents file for the flashed root. Nothing was written.')
         print(f'first extent holds {"the placeholder" if magic == b"J7GLHOLD" else "a library"}: ok')
 
+        # Plain dd only: the recovery's dd has conv= disabled (and a partition is never truncated anyway).
+        # Each extent is read back into its own file, so no dd ever needs to seek inside a regular file.
         write, read, off = [], [], 0
-        for start, count in ext:
+        for i, (start, count) in enumerate(ext):
             write.append(f'dd if=/tmp/sweetgl.dylib of={dev} bs={BLOCK} skip={off} seek={start} '
-                         f'count={count} conv=notrunc 2>/dev/null || exit 1')
-            read.append(f'dd if={dev} of=/tmp/j7back bs={BLOCK} skip={start} seek={off} '
-                        f'count={count} conv=notrunc 2>/dev/null || exit 1')
+                         f'count={count} || exit 1')
+            read.append(f'dd if={dev} of=/tmp/j7back{i} bs={BLOCK} skip={start} count={count} || exit 1')
             off += count
-        for name, lines in (('j7write.sh', write), ('j7read.sh', ['rm -f /tmp/j7back', 'touch /tmp/j7back'] + read)):
+        for name, lines in (('j7write.sh', write), ('j7read.sh', ['rm -f /tmp/j7back*'] + read)):
             path = os.path.join(tmp, name)
             with open(path, 'w', newline='\n') as f:
                 f.write('\n'.join(lines) + '\n')
             adb('push', path, f'/tmp/{name}')
         print('pushing the library (64 MiB)...')
         adb('push', args.lib, '/tmp/sweetgl.dylib')
-        adb('shell', 'sh /tmp/j7write.sh && sync && echo 3 > /proc/sys/vm/drop_caches')
-        adb('shell', 'sh /tmp/j7read.sh')
-        back = os.path.join(tmp, 'back')
-        adb('pull', '/tmp/j7back', back)
-        got = hashlib.sha256(open(back, 'rb').read()).hexdigest()
-        adb('shell', 'rm -f /tmp/sweetgl.dylib /tmp/j7back /tmp/j7probe /tmp/j7write.sh /tmp/j7read.sh', check=False)
+        pushed = adb('shell', 'wc -c < /tmp/sweetgl.dylib', check=False).strip().split()
+        if not pushed or not pushed[0].isdigit() or int(pushed[0]) != SIZE:
+            sys.exit(f'the library did not arrive in full in the recovery /tmp ({pushed}); free space there: '
+                     + adb('shell', 'df /tmp', check=False).strip().replace('\n', ' | '))
+
+        def on_phone(script):
+            """Run a pushed script; show everything it printed, fail on its exit status."""
+            r = subprocess.run([args.adb, 'shell', f'sh /tmp/{script}; echo RC=$?'], capture_output=True, text=True)
+            lines = (r.stdout + r.stderr).strip().splitlines()
+            rc = next((l for l in reversed(lines) if l.startswith('RC=')), 'RC=?')
+            if rc != 'RC=0':
+                sys.exit(f'{script} failed ({rc}). Output from the phone:\n' + '\n'.join(lines[-12:]))
+
+        on_phone('j7write.sh')
+        adb('shell', 'sync', check=False)
+        # Best effort only: some recoveries refuse this write. The read-back below is what decides.
+        if subprocess.run([args.adb, 'shell', 'echo 3 > /proc/sys/vm/drop_caches'],
+                          capture_output=True, text=True).returncode != 0:
+            print('note: could not drop caches (recovery refused); verifying anyway')
+        on_phone('j7read.sh')
+        h = hashlib.sha256()
+        for i in range(len(ext)):
+            part = os.path.join(tmp, f'back{i}')
+            adb('pull', f'/tmp/j7back{i}', part)
+            h.update(open(part, 'rb').read())
+        got = h.hexdigest()
+        adb('shell', 'rm -f /tmp/sweetgl.dylib /tmp/j7back* /tmp/j7probe /tmp/j7write.sh /tmp/j7read.sh', check=False)
         if got != sha:
             sys.exit(f'READ-BACK MISMATCH: wrote {sha[:16]}, device returns {got[:16]}')
         print(f'VERIFY OK: {sha[:16]} is on the phone')

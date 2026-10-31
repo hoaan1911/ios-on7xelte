@@ -78,3 +78,14 @@ published with the ios-root release as `sweetgl-extents.txt`.
    variable and answers dyld's AMFI policy question so it honours it). A placeholder that cannot be loaded is skipped.
 4. The library runs the checks of the kernel-side client selftest from inside backboardd and writes them to the kernel
    log: look for `J7 G3D client: dylib: ... j7gputest PASSED`.
+
+## Mesa Panfrost on iOS (tools/sweetgl-mali), first steps
+- `sweet_drm_mali.c` + `include/xf86drm.h`: libdrm and the Panfrost DRM ioctls in user space over the kernel's
+  J7MaliUserClient (CREATE_BO maps user memory into the GPU, SUBMIT = selectors 2+3 run to completion, GET_PARAM
+  from the identity registers through selector 6 / patch 0314). `sh tools/sweetgl-mali/test/run.sh` runs it against
+  a fake kernel client with sanitizers (passes).
+- `patch-mesa.py` (two asserted edits: BO mmap -> sweet_drm_bo_map, BO munmap -> no-op) and the `mesa-build` workflow
+  (macOS runner, Mesa 24.3.4, `-Dgallium-drivers=panfrost`, static libs, `ninja -k 0` so one run lists every error).
+  Not yet built: send the uploaded `mesa-build-logs` artifact (or the `error:` lines) and fix from there.
+- Patches 0312 (AMFI answers dyld, policy renamed "AMFI") and 0313 (sweetenv) are independent: if the xnu build
+  skips one ("Skipping patch" in its log), the other still applies. 0314 adds selector 6.

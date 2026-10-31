@@ -1,0 +1,66 @@
+From: j7 g3d
+Subject: j7prime: user client selector 6 reads the GPU's identity registers
+
+Panfrost's GET_PARAMs (thread limits, texture/JS features, present masks) come from read-only
+GPU_CONTROL registers. Selector 6 returns one of a fixed list of them (named offsets only: the
+SoC's PMU/CMU pages abort on holes, and nothing here reads by range). The kernel-side client
+selftest checks selector 6 against selector 4 and that a non-ID offset (GPU_STATUS) is refused.
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -945,6 +945,22 @@
+     }
+ }
+ 
++/* Read-only Midgard GPU_CONTROL identity registers a client may read (Panfrost's GET_PARAMs):
++ * GPU_ID to JS_PRESENT, the THREAD, TEXTURE and JS feature registers, and SHADER, TILER and L2 PRESENT
++ * (low and high words). Named offsets only: the PMU and CMU pages of this SoC fault on holes, so nothing
++ * is read by range. */
++static bool
++j7m_id_reg_ok(uint64_t off)
++{
++    if (off & 3) {
++        return false;
++    }
++    if (off <= 0x01c || (off >= 0x0a0 && off <= 0x0fc)) {
++        return true;
++    }
++    return off == 0x100 || off == 0x104 || off == 0x110 || off == 0x114 || off == 0x120 || off == 0x124;
++}
++
+ class J7MaliUserClient : public IOUserClient {
+     OSDeclareDefaultStructors(J7MaliUserClient);
+ 
+@@ -1118,6 +1134,13 @@
+             ret = kIOReturnSuccess;
+         }
+         break;
++    case 6:     /* identity register: in (byte offset) -> out (value). Read-only GPU_CONTROL ID registers only. */
++        if (args->scalarInputCount == 1 && args->scalarOutputCount >= 1 && j7m_id_reg_ok(args->scalarInput[0])) {
++            args->scalarOutput[0] = a5g3d_read32(gJ7M.gpu, static_cast<vm_offset_t>(args->scalarInput[0]));
++            args->scalarOutputCount = 1;
++            ret = kIOReturnSuccess;
++        }
++        break;
+     default:
+         break;
+     }
+@@ -1169,6 +1192,17 @@
+     IOLog("J7 G3D: client info ret=%x gpu_id=%08llx shader=%llx tiler=%llx l2=%llx js=%llx as=%llx\n",
+         r, out[0], out[1], out[2], out[3], out[4], out[5]);
+     ok = ok && r == kIOReturnSuccess && (out[0] >> 16) == 0x830;
++    const uint64_t gpuIdFromInfo = out[0];
++    in[0] = 0x000;
++    r = j7m_call(c, 6, in, 1, out, 1);
++    ok = ok && r == kIOReturnSuccess && out[0] == gpuIdFromInfo;
++    in[0] = 0x34;       /* GPU_STATUS is not an ID register */
++    IOReturn refused = j7m_call(c, 6, in, 1, out, 1);
++    in[0] = 0x0c0;
++    IOReturn js0 = j7m_call(c, 6, in, 1, out, 1);
++    IOLog("J7 G3D: client id registers: gpu_id via selector 6 ret=%x, GPU_STATUS refused ret=%x, JS0_FEATURES=%08llx ret=%x\n",
++        r, refused, out[0], js0);
++    ok = ok && refused == kIOReturnBadArgument && js0 == kIOReturnSuccess;
+     const char hello[] = "hello from the kernel-side client";
+     r = j7m_call(c, 5, NULL, 0, NULL, 0, hello, sizeof(hello) - 1);
+     ok = ok && r == kIOReturnSuccess;

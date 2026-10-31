@@ -1,0 +1,18 @@
+[binaries]
+c = ['@CLANG@', '-arch', 'arm64', '-isysroot', '@SDK@', '-miphoneos-version-min=16.0']
+cpp = ['@CLANGXX@', '-arch', 'arm64', '-isysroot', '@SDK@', '-miphoneos-version-min=16.0']
+objc = ['@CLANG@', '-arch', 'arm64', '-isysroot', '@SDK@', '-miphoneos-version-min=16.0']
+ar = '@AR@'
+strip = '@STRIP@'
+pkg-config = 'false'
+
+[built-in options]
+c_args = ['-I@INC@']
+cpp_args = ['-I@INC@']
+
+[host_machine]
+system = 'darwin'
+subsystem = 'ios'
+cpu_family = 'aarch64'
+cpu = 'arm64'
+endian = 'little'

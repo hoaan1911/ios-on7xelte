@@ -1,0 +1,105 @@
+From: j7 userland
+Subject: j7prime: sweetenv boot-arg (inject environment variables into a daemon)
+
+sweetenv=NAME:VAR=VAL[,VAR=VAL];NAME2:... appends the variables to the environment of every
+executable whose file name is NAME (kern_exec.c, A5XELTE/HEROLTE boards). Example:
+sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib
+Logs "SWEET ENV: <name> += ..." when it fires. Port of the Pixel repo's 0104 + 0163. Independent of
+0312: if one of them fails to apply in the xnu build, the other still builds.
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -445,6 +445,78 @@
+ 	return error;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(ARM64_BOARD_CONFIG_HEROLTE)
++/*
++ * Boot-arg sweetenv=NAME:VAR=VAL[,VAR=VAL...] appends VAR=VAL to the
++ * environment of every executable whose file name is NAME, e.g.
++ * sweetenv=backboardd:CA_DISABLE_BACKDROP_CACHE=1 (CoreAnimation knobs
++ * without editing launchd.plist on the phone). Several NAME:... entries
++ * are separated by ';'.
++ */
++static int
++sweet_exec_env(struct image_params *imgp, int ptr_size)
++{
++	static char spec[512];
++	static int state;       /* 0 not parsed, 1 none, 2 set */
++	if (state == 0) {
++		state = PE_parse_boot_argn("sweetenv", spec, sizeof(spec)) && spec[0] ? 2 : 1;
++	}
++	if (state != 2) {
++		return 0;
++	}
++	const char *path = imgp->ip_strings + strlen("executable_path="), *base = path;
++	for (const char *c = path; *c; c++) {
++		if (*c == '/') {
++			base = c + 1;
++		}
++	}
++	const char *entry = spec;
++	for (;;) {
++		size_t n = 0;
++		while (entry[n] && entry[n] != ':' && entry[n] != ';') {
++			n++;
++		}
++		if (entry[n] == ':' && strlen(base) == n && strncmp(base, entry, n) == 0) {
++			break;
++		}
++		while (*entry && *entry != ';') {
++			entry++;
++		}
++		if (*entry == '\0') {
++			return 0;
++		}
++		entry++;
++	}
++	const char *p = strchr(entry, ':') + 1;
++	while (*p && *p != ';') {
++		char var[128];
++		size_t len = 0;
++		while (p[len] && p[len] != ',' && p[len] != ';') {
++			len++;
++		}
++		if (len > 0 && len < sizeof(var)) {
++			memcpy(var, p, len);
++			var[len] = '\0';
++			int error = exec_add_user_string(imgp, CAST_USER_ADDR_T(var), UIO_SYSSPACE, TRUE);
++			if (error) {
++				return error;
++			}
++			if (imgp->ip_argspace < ptr_size) {
++				return E2BIG;
++			}
++			imgp->ip_argspace -= ptr_size;
++			imgp->ip_envc++;
++			printf("SWEET ENV: %s += %s\n", base, var);
++		}
++		p += len;
++		if (*p == ',') {
++			p++;
++		}
++	}
++	return 0;
++}
++#endif
++
+ /*
+  * dyld is now passed the executable path as a getenv-like variable
+ /* filler */
+@@ -5741,6 +5813,13 @@
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(ARM64_BOARD_CONFIG_HEROLTE)
++	error = sweet_exec_env(imgp, new_ptr_size);
++	if (error) {
++		goto bad;
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ /* filler */

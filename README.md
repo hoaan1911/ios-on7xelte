@@ -1,3 +1,6 @@
+STILL UNFINISHED!, GPU IS STILL IN DEVELOPMENT AND OTHER STUFF!
+ONCE GPU IS FINISHED ILL MAKE A DEMO AND A HOW-TO FLASH THIS ONTO
+                   YOUR J7 PRIME!
 # iOS 16 on the Samsung Galaxy J7 Prime (SM-G610F, Exynos 7870) — `on7xelte`
 this repo icludes 3 phones a5xelte, herolte and on7xelte in the works.
 as of right now i got j7 booted to the lock, home screen no gpu

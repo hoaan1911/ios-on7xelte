@@ -556,3 +556,52 @@ drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points, unsigned num
     (void)points;
     return drmSyncobjWait(fd, handles, num_handles, timeout_nsec, flags, first_signaled);
 }
+
+/* Valhall's CSF path (v10) and panthor use these; the serialized Midgard path never reaches them, but the
+ * whole driver is linked, so they exist and do the honest thing for always-signalled objects. */
+int
+drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t handle_count)
+{
+    (void)fd;
+    pthread_mutex_lock(&lock);
+    for (uint32_t i = 0; i < handle_count; i++) {
+        if (handles[i] >= 1 && handles[i] <= MAX_SYNCOBJ) {
+            syncobj_signaled[handles[i] - 1] = 1;
+        }
+    }
+    pthread_mutex_unlock(&lock);
+    return 0;
+}
+
+int
+drmSyncobjTimelineSignal(int fd, const uint32_t *handles, uint64_t *points, uint32_t handle_count)
+{
+    (void)points;
+    return drmSyncobjSignal(fd, handles, handle_count);
+}
+
+int
+drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points, uint32_t handle_count)
+{
+    (void)fd; (void)handles;
+    for (uint32_t i = 0; i < handle_count; i++) {
+        points[i] = 1;       /* every point already reached */
+    }
+    return 0;
+}
+
+int
+drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point, uint32_t src_handle,
+    uint64_t src_point, uint32_t flags)
+{
+    (void)fd; (void)dst_point; (void)src_point; (void)flags;
+    int ret = -ENOENT;
+    pthread_mutex_lock(&lock);
+    if (dst_handle >= 1 && dst_handle <= MAX_SYNCOBJ && syncobj_used[dst_handle - 1] &&
+        src_handle >= 1 && src_handle <= MAX_SYNCOBJ && syncobj_used[src_handle - 1]) {
+        syncobj_signaled[dst_handle - 1] = syncobj_signaled[src_handle - 1];
+        ret = 0;
+    }
+    pthread_mutex_unlock(&lock);
+    return ret;
+}

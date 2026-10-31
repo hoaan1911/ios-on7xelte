@@ -89,3 +89,10 @@ published with the ios-root release as `sweetgl-extents.txt`.
   Not yet built: send the uploaded `mesa-build-logs` artifact (or the `error:` lines) and fix from there.
 - Patches 0312 (AMFI answers dyld, policy renamed "AMFI") and 0313 (sweetenv) are independent: if the xnu build
   skips one ("Skipping patch" in its log), the other still applies. 0314 adds selector 6.
+- mesa-build, second round: the first run built 213 of 214 steps; the one failure was `drmSyncobjTransfer` missing
+  from the libdrm stand-in (Valhall's CSF code), now added together with the other sync functions. The core libraries
+  (state tracker, gallium auxiliary, NIR, GLSL) were never requested because nothing consumes them without an
+  EGL/DRI target, so the workflow now asks ninja for every library by name and then links all objects into a
+  throwaway dylib with `-undefined error`: `link.log` lists every symbol still missing.
+- 0313 (sweetenv) was rewritten against the real kern_exec.c from the xnu-peek artifact: exec_add_user_string takes an
+  int segment here and the first attempt's context did not match.

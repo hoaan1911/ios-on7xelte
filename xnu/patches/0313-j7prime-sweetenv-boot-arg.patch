@@ -1,12 +1,3 @@
-From: j7 userland
-Subject: j7prime: sweetenv boot-arg (inject environment variables into a daemon)
-
-sweetenv=NAME:VAR=VAL[,VAR=VAL];NAME2:... appends the variables to the environment of every
-executable whose file name is NAME (kern_exec.c, A5XELTE/HEROLTE boards). Example:
-sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib
-Logs "SWEET ENV: <name> += ..." when it fires. Port of the Pixel repo's 0104 + 0163. Independent of
-0312: if one of them fails to apply in the xnu build, the other still builds.
-
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
@@ -88,7 +79,7 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +
  /*
   * dyld is now passed the executable path as a getenv-like variable
- /* filler */
+  * in the same fashion as the stack_guard and malloc_entropy keys.
 @@ -5741,6 +5813,13 @@
  		imgp->ip_envc++;
  	}
@@ -102,4 +93,4 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +
  	/* Save space for envv[] NULL terminator */
  	if (imgp->ip_argspace < new_ptr_size) {
- /* filler */
+ 		error = E2BIG;

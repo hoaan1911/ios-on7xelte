@@ -1,0 +1,83 @@
+name: mesa-build
+
+# Cross-builds Mesa's Panfrost gallium driver (Mali Midgard, GLES) as static libraries for iOS 16
+# arm64 on a GitHub macOS runner, with the Panfrost DRM emulation (tools/sweetgl-mali) compiled
+# alongside. First attempt: expect a few rounds; every run uploads the logs either way (ninja -k 0
+# collects every compile error in one go). The next step links it into /usr/lib/sweetgl.dylib.
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_ref:
+        description: "Mesa git tag (the survey was taken on mesa-24.3.4)"
+        default: "mesa-24.3.4"
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode and tools
+        run: |
+          set -euo pipefail
+          x=$(ls -d /Applications/Xcode_15*.app 2>/dev/null | sort -V | tail -1 || true)
+          [ -z "$x" ] || sudo xcode-select -s "$x/Contents/Developer"
+          xcrun --sdk iphoneos --show-sdk-path
+          brew install ninja bison flex
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet meson mako pyyaml packaging
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+      - name: Clone and patch Mesa
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ inputs.mesa_ref || 'mesa-24.3.4' }}" https://gitlab.freedesktop.org/mesa/mesa.git mesa
+          python3 tools/sweetgl-mali/patch-mesa.py mesa
+      - name: Configure
+        run: |
+          set -euo pipefail
+          sdk=$(xcrun --sdk iphoneos --show-sdk-path)
+          bin=$(dirname "$(xcrun --sdk iphoneos -f clang)")
+          sed -e "s#@CLANG@#$(xcrun --sdk iphoneos -f clang)#" -e "s#@CLANGXX@#$(xcrun --sdk iphoneos -f clang++)#" \
+              -e "s#@SDK@#$sdk#g" -e "s#@AR@#$bin/ar#" -e "s#@STRIP@#$bin/strip#" \
+              -e "s#@INC@#$PWD/tools/sweetgl-mali/include#g" tools/sweetgl-mali/ios-cross.txt.in > ios-cross.txt
+          cat ios-cross.txt
+          cd mesa
+          meson setup ../build --cross-file ../ios-cross.txt \
+            --buildtype=release -Db_ndebug=true -Ddefault_library=static \
+            -Dplatforms= -Degl=disabled -Dglx=disabled -Dgbm=disabled \
+            -Dgallium-drivers=panfrost -Dvulkan-drivers= \
+            -Dllvm=disabled -Dgles1=disabled -Dgles2=enabled -Dopengl=true \
+            -Dzstd=disabled -Dzlib=disabled -Dexpat=disabled -Dxmlconfig=disabled \
+            -Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled \
+            -Dbuild-tests=false -Dshader-cache=disabled -Dperfetto=false \
+            -Dgallium-va=disabled -Dgallium-rusticl=false -Dtools= \
+            -Dhtml-docs=disabled -Ddisplay-info=disabled -Dteflon=false
+      - name: Build Mesa (every error, not just the first)
+        run: |
+          set -o pipefail
+          ninja -C build -k 0 2>&1 | tee ninja.log | tail -40
+      - name: Compile the Panfrost DRM emulation for iOS
+        if: always()
+        run: |
+          set -euo pipefail
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -Wall -Wextra -Wno-unused-parameter \
+            -I tools/sweetgl-mali/include -I tools/sweetgl-mali -I mesa/include \
+            -c tools/sweetgl-mali/sweet_drm_mali.c -o sweet_drm_mali.o
+          ls -l sweet_drm_mali.o
+      - name: Summary
+        if: always()
+        run: |
+          grep -E "error:|FAILED:" ninja.log | head -40 || true
+          find build -name '*.a' -exec ls -l {} \; | sort -k5 -n | tail -30 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mesa-build-logs
+          path: |
+            ninja.log
+            build/meson-logs/meson-log.txt
+            ios-cross.txt
+            sweet_drm_mali.o
+          retention-days: 14

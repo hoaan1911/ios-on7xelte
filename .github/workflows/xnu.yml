@@ -162,6 +162,23 @@ jobs:
           PY
           exit 1
 
+      - name: Peek at the patched sources (small artifact for writing the next patches)
+        if: always()
+        run: |
+          mkdir -p peek
+          for f in bsd/kern/kern_exec.c bsd/kern/sweet_amfi.c iokit/Kernel/arm/A5XELTEGPU.cpp; do
+            [ -f "dxb/xnu/$f" ] && cp "dxb/xnu/$f" "peek/$(basename "$f")" || echo "missing: $f"
+          done
+          grep -n "Skipping patch" build.log | cut -c1-260 > peek/skipped-patches.txt || true
+          ls -l peek
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-peek
+          path: peek/
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Package build tree for local compiles
         if: always()
         run: |

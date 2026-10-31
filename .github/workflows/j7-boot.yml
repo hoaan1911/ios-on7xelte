@@ -18,6 +18,12 @@ on:
         description: "iOS version of the IPSW the device tree /product node is taken from"
         default: "16.7.16"
 
+# Downloading the xnu run's artifact (run-id) uses the workflow token; in a private repository that
+# needs actions: read (the repository's default token permissions do not include it).
+permissions:
+  actions: read
+  contents: read
+
 jobs:
   boot:
     runs-on: ubuntu-24.04

@@ -44,8 +44,7 @@ jobs:
               -e "s#@INC@#$PWD/tools/sweetgl-mali/include#g" tools/sweetgl-mali/ios-cross.txt.in > ios-cross.txt
           cat ios-cross.txt
           cd mesa
-          meson setup ../build --cross-file ../ios-cross.txt \
-            --buildtype=release -Db_ndebug=true -Ddefault_library=static \
+          opts=$(python3 ../tools/sweetgl-mali/mesa-opts.py . \
             -Dplatforms= -Degl=disabled -Dglx=disabled -Dgbm=disabled \
             -Dgallium-drivers=panfrost -Dvulkan-drivers= \
             -Dllvm=disabled -Dgles1=disabled -Dgles2=enabled -Dopengl=true \
@@ -53,7 +52,10 @@ jobs:
             -Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled \
             -Dbuild-tests=false -Dshader-cache=disabled -Dperfetto=false \
             -Dgallium-va=disabled -Dgallium-rusticl=false -Dtools= \
-            -Dhtml-docs=disabled -Ddisplay-info=disabled -Dteflon=false
+            -Dhtml-docs=disabled -Ddisplay-info=disabled -Dteflon=false)
+          echo "$opts"
+          meson setup ../build --cross-file ../ios-cross.txt \
+            --buildtype=release -Db_ndebug=true -Ddefault_library=static $opts
       - name: Build Mesa (every error, not just the first)
         run: |
           set -o pipefail

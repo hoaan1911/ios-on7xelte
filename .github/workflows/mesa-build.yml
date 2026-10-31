@@ -56,10 +56,14 @@ jobs:
           echo "$opts"
           meson setup ../build --cross-file ../ios-cross.txt \
             --buildtype=release -Db_ndebug=true -Ddefault_library=static $opts
-      - name: Build Mesa (every error, not just the first)
+      - name: Build every Mesa library
         run: |
           set -o pipefail
-          ninja -C build -k 0 2>&1 | tee ninja.log | tail -40
+          # no EGL/DRI target exists, so the state tracker, gallium auxiliary and compiler libraries are
+          # not part of "all": ask for every static/shared library meson knows about.
+          meson introspect build --targets | python3 tools/sweetgl-mali/lib-targets.py > targets.txt
+          wc -w targets.txt
+          ninja -C build -k 0 $(cat targets.txt) 2>&1 | tee ninja.log | tail -40
       - name: Compile the Panfrost DRM emulation for iOS
         if: always()
         run: |
@@ -68,6 +72,18 @@ jobs:
             -I tools/sweetgl-mali/include -I tools/sweetgl-mali -I mesa/include \
             -c tools/sweetgl-mali/sweet_drm_mali.c -o sweet_drm_mali.o
           ls -l sweet_drm_mali.o
+      - name: Link check (every object, so every missing symbol is listed)
+        if: always()
+        run: |
+          set +e
+          libs=$(find build -name '*.a' | sort)
+          echo "$libs" | wc -l
+          xcrun --sdk iphoneos clang++ -arch arm64 -miphoneos-version-min=16.0 -dynamiclib -Wl,-all_load \
+            -Wl,-undefined,error -Wl,-dead_strip_dylibs \
+            $libs sweet_drm_mali.o -framework IOKit -framework CoreFoundation -lc++ -lz \
+            -o link-check.dylib 2>&1 | tee link.log | head -5
+          grep -c "Undefined symbols\|duplicate symbol" link.log || true
+          ls -l link-check.dylib || true
       - name: Summary
         if: always()
         run: |
@@ -79,6 +95,8 @@ jobs:
           name: mesa-build-logs
           path: |
             ninja.log
+            link.log
+            targets.txt
             build/meson-logs/meson-log.txt
             ios-cross.txt
             sweet_drm_mali.o

@@ -72,15 +72,23 @@ jobs:
             -I tools/sweetgl-mali/include -I tools/sweetgl-mali -I mesa/include \
             -c tools/sweetgl-mali/sweet_drm_mali.c -o sweet_drm_mali.o
           ls -l sweet_drm_mali.o
+          # the four symbols only unreachable paths reference (see the file)
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -Wall -Wextra \
+            -c tools/sweetgl-mali/mesa-stubs.c -o mesa-stubs.o
+          ls -l mesa-stubs.o
       - name: Link check (every object, so every missing symbol is listed)
         if: always()
         run: |
           set +e
           libs=$(find build -name '*.a' | sort)
           echo "$libs" | wc -l
+          # The GL dispatch (_glapi_*) lives in the shared glapi library, which this link of static
+          # archives does not include: take its objects, so one dylib holds everything.
+          glapi=$(find build/src/mapi/shared-glapi -name '*.o' | sort)
+          echo "glapi objects: $(echo $glapi | wc -w)"
           xcrun --sdk iphoneos clang++ -arch arm64 -miphoneos-version-min=16.0 -dynamiclib -Wl,-all_load \
             -Wl,-undefined,error -Wl,-dead_strip_dylibs \
-            $libs sweet_drm_mali.o -framework IOKit -framework CoreFoundation -lc++ -lz \
+            $libs $glapi sweet_drm_mali.o mesa-stubs.o -framework IOKit -framework CoreFoundation -lc++ -lz \
             -o link-check.dylib 2>&1 | tee link.log | head -5
           grep -c "Undefined symbols\|duplicate symbol" link.log || true
           ls -l link-check.dylib || true
@@ -100,4 +108,5 @@ jobs:
             build/meson-logs/meson-log.txt
             ios-cross.txt
             sweet_drm_mali.o
+            mesa-stubs.o
           retention-days: 14

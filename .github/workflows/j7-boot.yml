@@ -17,6 +17,10 @@ on:
       ios_version:
         description: "iOS version of the IPSW the device tree /product node is taken from"
         default: "16.7.16"
+      iphone8:
+        description: "Internal resolution: render an iPhone 8 screen (750x1334 @2x) and scale it to the panel (needs the kernel built with 0315). Adds sweetfb_scale=1 sweetfb_lw=750 sweetfb_lh=1334 to the boot args."
+        type: boolean
+        default: false
 
 # Downloading the xnu run's artifact (run-id) uses the workflow token; in a private repository that
 # needs actions: read (the repository's default token permissions do not include it).
@@ -82,8 +86,14 @@ jobs:
           set -euxo pipefail
           mkdir -p out
           ls -l kernel
-          python3 tools/mkadt_j7prime.py out/j7prime.adt --board "${{ inputs.board || 'd21ap' }}"
-          python3 tools/mkpayload.py kernel/kernel.development.a5xelte out/j7prime.adt out/payload.bin --cmdline "${{ inputs.cmdline }}"
+          cmdline="${{ inputs.cmdline }}"
+          iphone8=""
+          if [ "${{ inputs.iphone8 }}" = "true" ]; then
+            iphone8="--iphone8"
+            cmdline="$cmdline sweetfb_scale=1 sweetfb_lw=750 sweetfb_lh=1334"
+          fi
+          python3 tools/mkadt_j7prime.py out/j7prime.adt --board "${{ inputs.board || 'd21ap' }}" $iphone8
+          python3 tools/mkpayload.py kernel/kernel.development.a5xelte out/j7prime.adt out/payload.bin --cmdline "$cmdline"
           python3 tools/mkembeddedkernel.py shim/j7prime/outxnu/Image out/payload.bin out/embedded-kernel.Image
           python3 tools/mkdtbh.py -o out/dt.img device/on7xelte.dtb
           python3 tools/mkj7img.py --kernel out/embedded-kernel.Image --dt out/dt.img --name j7xnu -o out/j7-xnu-boot.img

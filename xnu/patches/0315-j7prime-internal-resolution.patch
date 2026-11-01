@@ -1,0 +1,40 @@
+From: j7 internal resolution
+Subject: j7prime: internal resolution (sweetfb_scale/lw/lh on the A5XELTE config)
+
+The scaled display (CPU renderer draws a smaller canvas, present() scales it to the panel) was
+compiled only for HEROLTE. Enable it for the A5XELTE/J7 config: sweetfb_scale=1 sweetfb_lw=750
+sweetfb_lh=1334 presents an iPhone 8 screen. Touch needs no change: SweetHIDTouch normalizes
+over the panel and the scaled display covers it.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -220,7 +220,27 @@
+ 		fLogicalW = fWidth * 2 / 3;
+ 		fLogicalH = fHeight * 2 / 3;
+ 	}
+-#elif !defined(ARM64_BOARD_CONFIG_A5XELTE)
++#elif defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* Internal resolution (J7 Prime): the CPU renderer draws a smaller display and
++	 * present() scales it to the panel (scaledCopy, nearest). sweetfb_scale=1 alone gives
++	 * 2/3 of the panel; sweetfb_lw/sweetfb_lh pick the size, e.g. 750x1334, the iPhone 8
++	 * screen (375x667 points at @2x). They must match the ADT canvas (mkadt_j7prime.py
++	 * --iphone8). Without sweetfb_scale nothing changes: the display is the panel. */
++	int scale = 0;
++	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
++	if (scale) {
++		fScaled = true;
++		fLogicalW = fWidth * 2 / 3;
++		fLogicalH = fHeight * 2 / 3;
++		uint32_t lw = 0, lh = 0;
++		PE_parse_boot_argn("sweetfb_lw", &lw, sizeof(lw));
++		PE_parse_boot_argn("sweetfb_lh", &lh, sizeof(lh));
++		if (lw >= 320 && lw <= fWidth && lh >= 480 && lh <= fHeight) {
++			fLogicalW = lw;
++			fLogicalH = lh;
++		}
++	}
++#else
+ 	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;

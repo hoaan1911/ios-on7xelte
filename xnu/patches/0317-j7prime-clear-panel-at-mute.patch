@@ -1,0 +1,20 @@
+From: j7 clear panel
+Subject: a5xelte fb: clear the panel when the console is muted at the first swap
+
+Boot log lines drawn by the console before the GUI's first swap were left on screen wherever the
+compositor does not redraw (bottom of the panel). Clear the panel once, when the console is muted.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -642,6 +642,10 @@
+ 			/* Not PE_initialize_console(kPEDisableScreen): its console switch
+ 			 * writes the read-only-late cons_ops_index and panics. */
+ 			sweet_console_muted = 1;
++			/* Whatever the console drew before this first swap stays on screen wherever the GUI
++			 * does not draw (boot log lines at the bottom, junk at the top): start from black.
++			 * fPixels is the physical map of the whole panel, scaledCopy() writes all of it too. */
++			memset((void *)fPixels, 0, (size_t)fRowBytes * fHeight);
+ 		}
+ 	}
+ 

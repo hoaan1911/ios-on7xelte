@@ -1,0 +1,38 @@
+From: j7 scaled copy
+Subject: scaledCopy: scale by panel/logical, not a fixed 3/2
+
+scaledCopy() assumed the logical display is exactly 2/3 of the panel. With 750x1334 on a 1080x1920
+panel it stretched 1.5x instead of 1.44x: the right and bottom edges were cropped (dock lost) and
+the image was off-centre. Use the real ratio, as the S7 build does.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -587,8 +587,9 @@
+     int32_t w, int32_t h)
+ {
+ 	static uint16_t column[2048];
+-	int32_t px0 = dx * 3 / 2, px1 = (dx + w) * 3 / 2;
+-	int32_t py0 = dy * 3 / 2, py1 = (dy + h) * 3 / 2;
++	/* panel / logical ratio, whatever the logical size is (1.5 for 2/3 of the panel, 1.44 for 750x1334) */
++	int32_t px0 = dx * (int32_t)fWidth / (int32_t)fLogicalW, px1 = (dx + w) * (int32_t)fWidth / (int32_t)fLogicalW;
++	int32_t py0 = dy * (int32_t)fHeight / (int32_t)fLogicalH, py1 = (dy + h) * (int32_t)fHeight / (int32_t)fLogicalH;
+ 	if (px1 > (int32_t)fWidth) {
+ 		px1 = (int32_t)fWidth;
+ 	}
+@@ -600,13 +601,13 @@
+ 		return 0;
+ 	}
+ 	for (int32_t x = 0; x < pw; x++) {
+-		int32_t c = (px0 + x) * 2 / 3 - dx;
++		int32_t c = (px0 + x) * (int32_t)fLogicalW / (int32_t)fWidth - dx;
+ 		column[x] = (uint16_t)(c < 0 ? 0 : (c >= w ? w - 1 : c));
+ 	}
+ 	int32_t previous = -1;
+ 	uint32_t *prevRow = NULL;
+ 	for (int32_t py = py0; py < py1; py++) {
+-		int32_t r = py * 2 / 3 - dy;
++		int32_t r = py * (int32_t)fLogicalH / (int32_t)fHeight - dy;
+ 		r = r < 0 ? 0 : (r >= h ? h - 1 : r);
+ 		uint32_t *out = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes + (uint64_t)px0 * 4);
+ 		if (r == previous && prevRow != NULL) {

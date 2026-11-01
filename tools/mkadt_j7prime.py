@@ -61,10 +61,15 @@ def apply_identity(root, ident, product_adt):
               f'model name and iPad wording', file=sys.stderr)
 
 
-def build(board='d21ap', product_adt=None):
+def build(board='d21ap', product_adt=None, iphone8=False):
     root = mkadt.build(seed=os.urandom(64), qemu=True)
     # 'samsung,a5xelte' stays first (apply_identity): the A5XELTE kernel's platform expert matches on it.
     ident = IDENTITIES[board]
+    # --iphone8: iOS lays out and renders an iPhone 8 screen, 375x667 points at @2x (750x1334),
+    # about half the pixels of the 1080x1920 panel for CoreAnimation's CPU renderer. The kernel
+    # scales it up to the panel; its boot args must be sweetfb_scale=1 sweetfb_lw=750
+    # sweetfb_lh=1334 (patch 0315). The canvas below and those two numbers must agree.
+    canvas = (750, 1334) if iphone8 else (1080, 1920)
     chosen = child(root, 'chosen')
     buttons = child(root, 'buttons')
     # Samsung's GPA2-5 mechanical key is the iOS Home (Menu) button.
@@ -126,8 +131,8 @@ def build(board='d21ap', product_adt=None):
     arm_io.children.append(mkadt.node('disp0', [
         ('device_type', mkadt.cstr('display-subsystem')),
         ('compatible', mkadt.cstr('samsung,a5xelte-display')),
-        ('canvas-width', mkadt.u32(1080)),
-        ('canvas-height', mkadt.u32(1920)),
+        ('canvas-width', mkadt.u32(canvas[0])),
+        ('canvas-height', mkadt.u32(canvas[1])),
     ]))
     # Mali-T830 resource nub (Exynos7870 G3D). The 7580 compatible string is kept
     # second so the existing A5XELTEGPU matching entry still starts the service;
@@ -154,6 +159,16 @@ def build(board='d21ap', product_adt=None):
         ('reg', mkadt.u64(0x13540000, 0x2000)),
     ]))
     apply_identity(root, ident, product_adt)
+    if iphone8:
+        set_prop(chosen, 'display-scale', mkadt.u32(2))
+        try:
+            product = child(root, 'product')
+        except ValueError:
+            print('warning: --iphone8 without a /product node: artwork-device-subtype and '
+                  'artwork-scale-factor not set', file=sys.stderr)
+        else:
+            set_prop(product, 'artwork-device-subtype', mkadt.u32(1334))
+            set_prop(product, 'artwork-scale-factor', mkadt.u32(2))
     return root
 
 
@@ -164,7 +179,10 @@ if __name__ == '__main__':
                         help='iPhone identity of the iOS root (d21ap = iPhone 8 Plus, d22ap = iPhone X)')
     parser.add_argument('--product-adt', type=Path, default=None,
                         help='real <board>.adt from the IPSW (default: research/ipsw-x/<board>.adt)')
+    parser.add_argument('--iphone8', action='store_true',
+                        help='present an iPhone 8 screen (750x1334 @2x) that the kernel scales to the panel '
+                             '(boot args sweetfb_scale=1 sweetfb_lw=750 sweetfb_lh=1334)')
     args = parser.parse_args()
-    blob = adt.serialize(build(args.board, args.product_adt or RESEARCH / f'{args.board}.adt'))
+    blob = adt.serialize(build(args.board, args.product_adt or RESEARCH / f'{args.board}.adt', args.iphone8))
     args.output.write_bytes(blob)
     print(f'{args.output}: {len(blob)} bytes')

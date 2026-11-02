@@ -110,3 +110,18 @@ jobs:
             sweet_drm_mali.o
             mesa-stubs.o
           retention-days: 14
+      # The OSMesa sources the GL layer has to be written against (Mesa 24.3.4 here, 25.0.x on the S7),
+      # as they are after patch-mesa.py: small, and enough to write exact-match patches.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mesa-osmesa-src
+          path: |
+            mesa/src/gallium/frontends/osmesa
+            mesa/src/gallium/targets/osmesa
+            mesa/src/gallium/auxiliary/target-helpers
+            mesa/src/panfrost/lib/kmod/pan_kmod.c
+            mesa/src/panfrost/lib/kmod/pan_kmod.h
+            mesa/meson.build
+            mesa/meson.options
+          retention-days: 7

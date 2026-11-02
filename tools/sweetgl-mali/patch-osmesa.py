@@ -6,7 +6,8 @@ OpenGL ES contexts, for the EAGL layer CoreAnimation's GLES renderer will run on
 
 Every edit asserts that the text it replaces is found exactly once, so a Mesa change shows up as a
 clear failure here rather than a silent no-op. Edits follow the S7 port's gpu/mesa/patch-mesa.py,
-re-checked against Mesa 24.3.4. Also copies sweet_hw.c into the OSMesa target.
+re-checked against Mesa 24.3.4. Also copies sweet_hw.c, the libdrm stand-in (sweet_drm_mali.c/.h) and
+mesa-stubs.c into the OSMesa target, so libOSMesa links on its own.
 """
 import shutil
 import sys
@@ -39,7 +40,10 @@ edit('src/gallium/targets/osmesa/meson.build',
      "osmesa_sweet_files = []\n"
      "osmesa_sweet_deps = []\n"
      "if host_machine.system() == 'darwin' and with_gallium_panfrost\n"
-     "  osmesa_sweet_files += 'sweet_hw.c'\n"
+     "  # the libdrm stand-in and the stubs go into the library itself: Panfrost's DRM calls and\n"
+     "  # sweet_drm_bo_map/unmap/log have to resolve here (the library is linked on its own)\n"
+     "  osmesa_sweet_files += ['sweet_hw.c', 'sweet_drm_mali.c', 'mesa-stubs.c']\n"
+     "  osmesa_link_args += ['-framework', 'IOKit', '-framework', 'CoreFoundation']\n"
      "  osmesa_sweet_deps += [driver_panfrost]\n"
      "  foreach d : ['dep_libdrm', 'idep_xmlconfig']\n"
      "    if is_variable(d)\n"
@@ -65,5 +69,6 @@ edit('src/gallium/frontends/osmesa/osmesa.c',
      "   if (profile == 0x36) /* GLES context: major 1 = ES1, else ES2/ES3 */\n"
      "      attribs.profile = (version_major == 1) ? API_OPENGLES : API_OPENGLES2;\n")
 
-shutil.copy(here / 'sweet_hw.c', mesa / 'src/gallium/targets/osmesa/sweet_hw.c')
-print('copied sweet_hw.c')
+for name in ('sweet_hw.c', 'sweet_drm_mali.c', 'sweet_drm_mali.h', 'mesa-stubs.c'):
+    shutil.copy(here / name, mesa / 'src/gallium/targets/osmesa' / name)
+    print('copied', name)

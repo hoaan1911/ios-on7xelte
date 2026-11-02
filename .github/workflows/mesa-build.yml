@@ -34,6 +34,7 @@ jobs:
           set -euo pipefail
           git clone --depth 1 --branch "${{ inputs.mesa_ref || 'mesa-24.3.4' }}" https://gitlab.freedesktop.org/mesa/mesa.git mesa
           python3 tools/sweetgl-mali/patch-mesa.py mesa
+          python3 tools/sweetgl-mali/patch-osmesa.py mesa
       - name: Configure
         run: |
           set -euo pipefail
@@ -46,7 +47,7 @@ jobs:
           cd mesa
           opts=$(python3 ../tools/sweetgl-mali/mesa-opts.py . \
             -Dplatforms= -Degl=disabled -Dglx=disabled -Dgbm=disabled \
-            -Dgallium-drivers=panfrost -Dvulkan-drivers= \
+            -Dgallium-drivers=panfrost,softpipe -Dvulkan-drivers= -Dosmesa=true \
             -Dllvm=disabled -Dgles1=disabled -Dgles2=enabled -Dopengl=true \
             -Dzstd=disabled -Dzlib=disabled -Dexpat=disabled -Dxmlconfig=disabled \
             -Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled \
@@ -125,3 +126,11 @@ jobs:
             mesa/meson.build
             mesa/meson.options
           retention-days: 7
+      # The OSMesa library itself: Panfrost first, softpipe as the fallback, GLES contexts allowed.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: j7-osmesa
+          path: build/src/gallium/targets/osmesa/libOSMesa.8.dylib
+          retention-days: 7
+          if-no-files-found: warn

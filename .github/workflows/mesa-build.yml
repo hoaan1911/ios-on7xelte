@@ -162,7 +162,12 @@ jobs:
           toks = shlex.split(cmd)
           # The GL dispatch is a separate dylib in meson's link (libglapi.0.dylib, not on iOS): take the
           # objects it was built from instead, so everything is in this one image.
-          glapi = sorted(glob.glob('build/src/mapi/shared-glapi/libglapi.0.dylib.p/*.o'))
+          # (os.listdir, not glob: two of the five are named '.._entry.c.o' and '.._u_current.c.o', and glob's
+          # '*' never matches a name that starts with a dot, which left out entry_get_public and
+          # _glapi_tls_Context and friends)
+          objdir = 'build/src/mapi/shared-glapi/libglapi.0.dylib.p'
+          glapi = sorted(os.path.join(objdir, f) for f in os.listdir(objdir) if f.endswith('.o'))
+          assert len(glapi) == 5, glapi
           assert glapi, 'no libglapi objects'
           glapi = [os.path.abspath(o) for o in glapi]
           out, i = [], 0
@@ -183,8 +188,16 @@ jobs:
           objs = [os.path.abspath('out/obj/' + o) for o in ('eagl.o', 'gl_sweet.o', 'ca_hooks.o', 'sweet_backboardd.o')]
           out += ['-o', os.path.abspath('out/sweetgl-unpadded.dylib'), '-install_name', '/usr/lib/sweetgl.dylib'] + objs
           out += ['-framework', 'IOSurface', '-framework', 'CoreFoundation', '-lobjc']
-          print(' '.join(shlex.quote(t) for t in out))
-          subprocess.check_call(out, cwd='build')
+          line = ' '.join(shlex.quote(t) for t in out)
+          print(line)
+          # The linker's own message goes last, where the end of the step log shows it, and to a file.
+          r = subprocess.run(out, cwd='build', capture_output=True, text=True)
+          text = r.stdout + r.stderr
+          with open('out/relink.log', 'w') as f:
+              f.write(line + '\n\n' + text)
+          print('---- linker output (exit %d) ----' % r.returncode)
+          print(text[:20000])
+          raise SystemExit(r.returncode)
           PY
           codesign -f -s - out/sweetgl-unpadded.dylib
           lipo -info out/sweetgl-unpadded.dylib
@@ -199,6 +212,15 @@ jobs:
           # Pad after signing, as j7gpu-dylib does: the signature stays where the load command says.
           python3 -c "open('out/sweetgl.dylib','r+b').truncate(67108864)"
           shasum -a 256 out/sweetgl.dylib | tee out/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sweetgl-relink-log
+          path: |
+            out/relink.log
+            out/exported-gl.txt
+          if-no-files-found: warn
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         with:
           name: sweetgl-gpu-dylib

@@ -134,3 +134,68 @@ jobs:
           path: build/src/gallium/targets/osmesa/libOSMesa.8.dylib
           retention-days: 7
           if-no-files-found: warn
+      # The GPU path as ONE image: the bridge between CoreAnimation's GLES renderer and Mesa (HakiOS's EAGL
+      # bridge, tools/sweetgl-mali/eagl) linked into the OSMesa library itself, which is what the root's
+      # /usr/lib/sweetgl.dylib placeholder (64 MiB, one file) can hold. DYLD_INSERT_LIBRARIES into
+      # backboardd (boot arg sweetenv) loads it; its constructors set the bridge up.
+      - name: EAGL bridge and one sweetgl.dylib
+        run: |
+          set -euo pipefail
+          E=tools/sweetgl-mali/eagl
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CC="xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot $SDK"
+          mkdir -p out/obj
+          osm=build/src/gallium/targets/osmesa/libOSMesa.8.dylib
+          # the gl* entry points this OSMesa exports: the bridge's function table is made from them
+          nm -gU "$osm" | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > out/exported-gl.txt
+          echo "exported gl functions: $(wc -l < out/exported-gl.txt)"
+          python3 $E/mkeagl.py $E/eagl_slots.txt mesa/src/mapi/glapi/registry/gl.xml out/exported-gl.txt $E/eagl.c > out/eagl_gen.h
+          $CC -O2 -g -w -Iout -I$E -I$E/include -c $E/eagl.c -o out/obj/eagl.o
+          $CC -O2 -g -Wall -I$E -c $E/gl_sweet.c -o out/obj/gl_sweet.o
+          $CC -O2 -g -Wall -c $E/ca_hooks.c -o out/obj/ca_hooks.o
+          $CC -O2 -g -Wall -c $E/sweet_backboardd.c -o out/obj/sweet_backboardd.o
+          # Relink libOSMesa exactly as meson did, with the bridge objects added and a new name.
+          python3 - <<'PY'
+          import os, shlex, subprocess
+          target = 'src/gallium/targets/osmesa/libOSMesa.8.dylib'
+          cmd = subprocess.check_output(['ninja', '-C', 'build', '-t', 'commands', target], text=True).strip().splitlines()[-1]
+          toks = shlex.split(cmd)
+          out, i = [], 0
+          while i < len(toks):
+              t = toks[i]
+              if t in ('-o', '-install_name'):
+                  i += 2
+                  continue
+              if t.startswith('-Wl,-install_name'):
+                  i += 1
+                  continue
+              out.append(t)
+              i += 1
+          objs = [os.path.abspath('out/obj/' + o) for o in ('eagl.o', 'gl_sweet.o', 'ca_hooks.o', 'sweet_backboardd.o')]
+          out += ['-o', os.path.abspath('out/sweetgl-unpadded.dylib'), '-install_name', '/usr/lib/sweetgl.dylib'] + objs
+          out += ['-framework', 'IOSurface', '-framework', 'CoreFoundation', '-lobjc']
+          print(' '.join(shlex.quote(t) for t in out))
+          subprocess.check_call(out, cwd='build')
+          PY
+          codesign -f -s - out/sweetgl-unpadded.dylib
+          lipo -info out/sweetgl-unpadded.dylib
+          otool -L out/sweetgl-unpadded.dylib
+          # Everything it loads must be on the phone already.
+          bad=$(otool -L out/sweetgl-unpadded.dylib | tail -n +2 | awk '{print $1}' | grep -vE '^(/usr/lib/|/System/)' || true)
+          [ -z "$bad" ] || { echo "dependencies not in iOS: $bad"; exit 1; }
+          size=$(stat -f %z out/sweetgl-unpadded.dylib)
+          echo "sweetgl.dylib is $size bytes"
+          [ "$size" -le 67108864 ] || { echo "over 64 MiB"; exit 1; }
+          cp out/sweetgl-unpadded.dylib out/sweetgl.dylib
+          # Pad after signing, as j7gpu-dylib does: the signature stays where the load command says.
+          python3 -c "open('out/sweetgl.dylib','r+b').truncate(67108864)"
+          shasum -a 256 out/sweetgl.dylib | tee out/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweetgl-gpu-dylib
+          path: |
+            out/sweetgl.dylib
+            out/SHA256SUMS
+            out/exported-gl.txt
+          compression-level: 9
+          retention-days: 14

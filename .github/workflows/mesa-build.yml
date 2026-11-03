@@ -156,17 +156,26 @@ jobs:
           $CC -O2 -g -Wall -c $E/sweet_backboardd.c -o out/obj/sweet_backboardd.o
           # Relink libOSMesa exactly as meson did, with the bridge objects added and a new name.
           python3 - <<'PY'
-          import os, shlex, subprocess
+          import glob, os, shlex, subprocess
           target = 'src/gallium/targets/osmesa/libOSMesa.8.dylib'
           cmd = subprocess.check_output(['ninja', '-C', 'build', '-t', 'commands', target], text=True).strip().splitlines()[-1]
           toks = shlex.split(cmd)
+          # The GL dispatch is a separate dylib in meson's link (libglapi.0.dylib, not on iOS): take the
+          # objects it was built from instead, so everything is in this one image.
+          glapi = sorted(glob.glob('build/src/mapi/shared-glapi/libglapi.0.dylib.p/*.o'))
+          assert glapi, 'no libglapi objects'
+          glapi = [os.path.abspath(o) for o in glapi]
           out, i = [], 0
           while i < len(toks):
               t = toks[i]
               if t in ('-o', '-install_name'):
                   i += 2
                   continue
-              if t.startswith('-Wl,-install_name'):
+              if t.startswith('-Wl,-install_name') or t.startswith('-Wl,-rpath'):
+                  i += 1
+                  continue
+              if t.endswith('libglapi.0.dylib'):
+                  out += glapi
                   i += 1
                   continue
               out.append(t)

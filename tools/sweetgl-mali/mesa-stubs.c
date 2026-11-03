@@ -14,6 +14,12 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* Mesa builds with -Werror=missing-prototypes, and these are not in a header this file can include. */
+bool pipe_loader_drm_probe_fd(void **dev, int fd, bool zink);
+void *renderonly_create_gpu_import_for_resource(void *rsc, void *ro, void *out_handle);
+void renderonly_scanout_destroy(void *scanout, void *ro);
+void *sw_screen_create_vk(void *winsys, const void *config, bool sw_vk);
+
 bool
 pipe_loader_drm_probe_fd(void **dev, int fd, bool zink)
 {

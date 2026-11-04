@@ -230,3 +230,24 @@ jobs:
             out/exported-gl.txt
           compression-level: 9
           retention-days: 14
+      # The Panfrost sources behind the first GPU crash (backboardd, NULL + 0x48 in the batch setup), as they
+      # are in this tree after patch-mesa.py, to read what that field is and why it stays empty.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mesa-panfrost-src
+          path: |
+            mesa/src/gallium/drivers/panfrost/pan_job.c
+            mesa/src/gallium/drivers/panfrost/pan_jm.c
+            mesa/src/gallium/drivers/panfrost/pan_screen.c
+            mesa/src/gallium/drivers/panfrost/pan_screen.h
+            mesa/src/gallium/drivers/panfrost/pan_context.h
+            mesa/src/gallium/drivers/panfrost/pan_resource.c
+            mesa/src/panfrost/lib/pan_device.h
+            mesa/src/panfrost/lib/pan_props.c
+            mesa/src/panfrost/lib/pan_bo.c
+            mesa/src/panfrost/lib/pan_bo.h
+            mesa/src/panfrost/lib/kmod/pan_kmod.c
+            mesa/src/panfrost/lib/kmod/pan_kmod.h
+          if-no-files-found: warn
+          retention-days: 7

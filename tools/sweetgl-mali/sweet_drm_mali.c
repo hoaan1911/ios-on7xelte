@@ -135,11 +135,22 @@ bo_get(uint32_t handle)
     return handle >= 1 && handle <= MAX_BOS && bos[handle - 1].used ? &bos[handle - 1] : NULL;
 }
 
+#define MAX_BO_BYTES (64ull << 20)  /* what the kernel's map selector takes (0310, 0311) */
+
 static int
-bo_create(uint32_t size, uint32_t *handle, uint64_t *gva)
+bo_create(uint32_t size, uint32_t flags, uint32_t *handle, uint64_t *gva)
 {
     uint64_t len = ((uint64_t)size + GPU_PAGE - 1) & ~(uint64_t)(GPU_PAGE - 1);
-    if (size == 0 || len > (64ull << 20)) {
+    /* Mesa's tiler heap is a PANFROST_BO_HEAP of 128 MiB, which the real kernel driver commits as the
+     * GPU needs it. Here every BO is committed whole and the kernel maps at most 64 MiB at a time, so
+     * a heap gets 64 MiB behind it (Mesa still believes in 128): refusing it left dev->tiler_heap NULL,
+     * which Mesa never checks, and the first batch submit crashed backboardd on it. */
+    if ((flags & PANFROST_BO_HEAP) && len > MAX_BO_BYTES) {
+        sweet_drm_log("sweet_drm: heap BO of %u KiB backed with %llu KiB", size / 1024,
+                      (unsigned long long)(MAX_BO_BYTES / 1024));
+        len = MAX_BO_BYTES;
+    }
+    if (size == 0 || len > MAX_BO_BYTES) {
         return -EINVAL;
     }
     uint32_t h = 0;
@@ -314,7 +325,7 @@ drmIoctl(int fd, unsigned long request, void *arg)
     }
     case DRM_IOCTL_PANFROST_CREATE_BO: {
         struct drm_panfrost_create_bo *c = arg;
-        ret = bo_create(c->size, &c->handle, &c->offset);
+        ret = bo_create(c->size, c->flags, &c->handle, &c->offset);
         break;
     }
     case DRM_IOCTL_PANFROST_GET_BO_OFFSET: {

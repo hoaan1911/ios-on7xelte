@@ -42,7 +42,7 @@ edit('src/gallium/targets/osmesa/meson.build',
      "if host_machine.system() == 'darwin' and with_gallium_panfrost\n"
      "  # the libdrm stand-in and the stubs go into the library itself: Panfrost's DRM calls and\n"
      "  # sweet_drm_bo_map/unmap/log have to resolve here (the library is linked on its own)\n"
-     "  osmesa_sweet_files += ['sweet_hw.c', 'sweet_drm_mali.c', 'mesa-stubs.c']\n"
+     "  osmesa_sweet_files += ['sweet_hw.c', 'sweet_drm_mali.c', 'mesa-stubs.c', 'sweet_trace.c']\n"
      "  osmesa_link_args += ['-framework', 'IOKit', '-framework', 'CoreFoundation']\n"
      "  osmesa_sweet_deps += [driver_panfrost]\n"
      "  foreach d : ['dep_libdrm', 'idep_xmlconfig']\n"
@@ -69,6 +69,6 @@ edit('src/gallium/frontends/osmesa/osmesa.c',
      "   if (profile == 0x36) /* GLES context: major 1 = ES1, else ES2/ES3 */\n"
      "      attribs.profile = (version_major == 1) ? API_OPENGLES : API_OPENGLES2;\n")
 
-for name in ('sweet_hw.c', 'sweet_drm_mali.c', 'sweet_drm_mali.h', 'mesa-stubs.c'):
+for name in ('sweet_hw.c', 'sweet_drm_mali.c', 'sweet_drm_mali.h', 'mesa-stubs.c', 'sweet_trace.c'):
     shutil.copy(here / name, mesa / 'src/gallium/targets/osmesa' / name)
     print('copied', name)

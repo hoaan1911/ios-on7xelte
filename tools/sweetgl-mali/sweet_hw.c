@@ -23,6 +23,7 @@ void sweet_drm_log(const char *fmt, ...) __attribute__((format(printf, 1, 2))); 
 
 struct pipe_screen *sweet_hw_create_screen(void);
 int sweet_hw_active(void);
+void sweet_trace_start(void);   /* sweet_trace.c: Mesa's job trace into the kernel log */
 
 static struct pipe_screen *sweet_screen;
 
@@ -41,6 +42,9 @@ sweet_hw_create_screen(void)
       sweet_drm_log("sweet_hw: SWEET_GPU=0, using softpipe");
       return NULL;
    }
+
+   /* Before the screen: Panfrost reads PAN_MESA_DEBUG when it is created. */
+   sweet_trace_start();
 
    int fd = drmOpenWithType("panfrost", NULL, 0);
    if (fd < 0) {

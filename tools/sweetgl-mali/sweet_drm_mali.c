@@ -273,6 +273,82 @@ get_param(uint32_t param, uint64_t *value)
     return 0;
 }
 
+/* ---- the failing job chain, for the log ---- */
+
+/* The CPU address of [va, va + len) when it is inside one BO. Lock held. */
+static const uint8_t *
+gva_to_cpu(uint64_t va, uint64_t len)
+{
+    for (uint32_t i = 0; i < MAX_BOS; i++) {
+        if (bos[i].used && va >= bos[i].gva && va + len <= bos[i].gva + bos[i].size) {
+            return (const uint8_t *)bos[i].mem + (va - bos[i].gva);
+        }
+    }
+    return NULL;
+}
+
+static const char *
+job_type_name(unsigned type)
+{
+    switch (type) {
+    case 1: return "null";
+    case 2: return "write_value";
+    case 3: return "cache_flush";
+    case 4: return "compute";
+    case 5: return "vertex";
+    case 7: return "tiler";
+    case 8: return "fused";
+    case 9: return "fragment";
+    default: return "?";
+    }
+}
+
+/*
+ * What a Midgard job header says (Panfrost's "Job Header", 32 bytes: exception status, first incomplete task,
+ * fault pointer, size/type/barrier/index, two dependency indices, next job) and the first words of each job
+ * behind it. The GPU writes the exception status and fault pointer into the header of the job that failed.
+ * Logged once per process, with the BO map, so a "js=58" can be read against what was there.
+ */
+static void
+dump_chain(uint64_t jc)
+{
+    static int done;
+    if (done) {
+        return;
+    }
+    done = 1;
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < MAX_BOS; i++) {
+        if (bos[i].used && count++ < 40) {
+            sweet_drm_log("bo %u: gva=%llx size=%llx", i + 1, (unsigned long long)bos[i].gva,
+                (unsigned long long)bos[i].size);
+        }
+    }
+    uint64_t va = jc;
+    for (unsigned n = 0; n < 8 && va != 0; n++) {
+        const uint8_t *p = gva_to_cpu(va, 0x80);
+        if (!p) {
+            sweet_drm_log("job %u @%llx: not inside one BO", n, (unsigned long long)va);
+            break;
+        }
+        uint32_t w[32];
+        memcpy(w, p, sizeof(w));
+        unsigned type = (p[0x10] >> 1) & 0x7f;
+        unsigned index = (unsigned)p[0x12] | ((unsigned)p[0x13] << 8);
+        uint64_t fault, next;
+        memcpy(&fault, p + 0x08, 8);
+        memcpy(&next, p + 0x18, 8);
+        sweet_drm_log("job %u @%llx %s(%u) size=%u idx=%u exc=%08x task=%08x fault=%llx next=%llx", n,
+            (unsigned long long)va, job_type_name(type), type, (unsigned)(p[0x10] & 1), index, w[0], w[1],
+            (unsigned long long)fault, (unsigned long long)next);
+        for (unsigned r = 0; r < 4; r++) {
+            sweet_drm_log("  +%02x: %08x %08x %08x %08x %08x %08x %08x %08x", r * 32, w[r * 8], w[r * 8 + 1],
+                w[r * 8 + 2], w[r * 8 + 3], w[r * 8 + 4], w[r * 8 + 5], w[r * 8 + 6], w[r * 8 + 7]);
+        }
+        va = next;
+    }
+}
+
 /* ---- SUBMIT: run the job chain to completion ---- */
 static int
 submit(const struct drm_panfrost_submit *s)
@@ -299,6 +375,7 @@ submit(const struct drm_panfrost_submit *s)
         snprintf(line, sizeof(line), "submit jc=%llx slot=%llu failed status=%d js=%llx",
             (unsigned long long)s->jc, (unsigned long long)slot, (int)(int64_t)w[0], (unsigned long long)w[1]);
         IOConnectCallStructMethod(conn, 5, line, strlen(line), NULL, NULL);
+        dump_chain(s->jc);
         return -EIO;
     }
     if (s->out_sync && s->out_sync <= MAX_SYNCOBJ && syncobj_used[s->out_sync - 1]) {

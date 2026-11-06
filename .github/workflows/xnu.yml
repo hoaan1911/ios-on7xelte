@@ -16,7 +16,7 @@ on:
         description: make -k (collect all compile errors in one run)
         default: "true"
       runner:
-        description: GitHub runner image (needs an Xcode 15.x; macos-15 is used, but the workflow must find a compatible Xcode 15.x)
+        description: GitHub runner image (macos-14 is retired; macos-15 has Xcode 16.x, the oldest of which is used)
         default: macos-15
   push:
     branches: [main, herolte, codex/a5xelte-bringup]
@@ -37,8 +37,7 @@ env:
 
 jobs:
   build:
-    # macos-15 may ship Xcode 16.x; Xcode 15.x iig matches the xnu-8796 IORPC ABI
-    # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
+    # macos-15 has Xcode 16.x only (macos-14, with 15.x, is retired): see the Xcode step below
     runs-on: ${{ inputs.runner || 'macos-15' }}
     timeout-minutes: 120
     steps:
@@ -96,11 +95,17 @@ jobs:
           sw_vers
           ls -d /Applications/Xcode*.app
 
-          # Xcode 15.x iig is required for the xnu-8796 IORPC ABI.
-          # Do not silently fall back to Xcode 16.x: it generates incompatible IORPC.kernelContent.
+          # GitHub's macOS 14 images (the last with Xcode 15.x) were retired on 2026-11-02, so there is no
+          # Xcode 15 on any hosted runner now. Prefer 15.x if one ever shows up; otherwise the OLDEST
+          # Xcode 16.x (never 26.x): it is the closest to the iig this xnu-8796 was written against.
+          # If its iig output does not compile (IORPC.kernelContent), the error annotations say so.
           XC=$(ls -d /Applications/Xcode_15*.app 2>/dev/null | sort -V | tail -1 || true)
           if [ -z "$XC" ]; then
-            echo "::error::Xcode 15.x is required; this runner does not provide it. Refusing incompatible Xcode 16.x iig."
+            XC=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | head -1 || true)
+            [ -n "$XC" ] && echo "::warning::no Xcode 15.x on this runner; using $XC"
+          fi
+          if [ -z "$XC" ]; then
+            echo "::error::no Xcode 15.x or 16.x on this runner"
             exit 1
           fi
 
@@ -195,7 +200,7 @@ jobs:
           mkdir -p sdk-kernel-platform
           cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
 
-          tar czf buildtree.tgz \
+          tar czf buildtree.tgz --ignore-failed-read \
             --exclude='*.o' \
             --exclude='*.cpo' \
             --exclude='*.a' \

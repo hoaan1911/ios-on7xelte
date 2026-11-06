@@ -402,7 +402,7 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - Base ADT: iPhone 8 d20ap DeviceTree from iOS 16.7.16 IPSW (tools/remotezip.py + tools/adt.py; LZFSE payload).
   Template values are empty: the loader must fill chosen/*, memory-map, cpu*/reg etc. like iBoot.
 - XNU build: GitHub Actions (dipa-studio/ios-sweet, xnu.yml) via blacktop/darwin-xnu-build, MACOS_VERSION=13.5.
-  New-clang fixes in xnu/patches; Xcode 16 iig is incompatible (IORPC.kernelContent) -> macos-14 runner, oldest Xcode.
+  New-clang fixes in xnu/patches; Xcode 16 iig is incompatible (IORPC.kernelContent) -> Xcode 15.x iig required; macos-15 runner must provide/install Xcode 15.x.
 
 ## Kernel architecture plan (SWEET machine config)
 - First stock build (VMAPPLE) is arm64e (PAC). Kryo 470 = ARMv8.2, no PAC -> SWEET must build plain arm64

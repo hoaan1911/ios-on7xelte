@@ -303,6 +303,49 @@ job_type_name(unsigned type)
     }
 }
 
+/* 32-byte rows of [va, va + bytes), as the GPU would read them. */
+static void
+dump_mem(const char *what, uint64_t va, unsigned bytes)
+{
+    const uint8_t *p = gva_to_cpu(va, bytes);
+    if (!p) {
+        sweet_drm_log("%s @%llx: not inside one BO", what, (unsigned long long)va);
+        return;
+    }
+    for (unsigned off = 0; off < bytes; off += 32) {
+        uint32_t w[8];
+        memcpy(w, p + off, sizeof(w));
+        sweet_drm_log("%s %llx: %08x %08x %08x %08x %08x %08x %08x %08x", what, (unsigned long long)(va + off),
+            w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+    }
+}
+
+/* The structures a job points to: every 8-byte value of its payload that is an address inside a BO. */
+static void
+dump_ptrs(const uint8_t *job)
+{
+    uint64_t seen[16];
+    unsigned nseen = 0;
+    for (unsigned off = 0x40; off < 0x80; off += 8) {
+        uint64_t v;
+        memcpy(&v, job + off, 8);
+        if (v == 0 || !gva_to_cpu(v, 0x20)) {
+            continue;
+        }
+        unsigned dup = 0;
+        for (unsigned i = 0; i < nseen; i++) {
+            dup |= seen[i] == v;
+        }
+        if (dup || nseen == 16) {
+            continue;
+        }
+        seen[nseen++] = v;
+        char what[24];
+        snprintf(what, sizeof(what), "ptr+%02x", off);
+        dump_mem(what, v, 0x100);
+    }
+}
+
 /*
  * What a Midgard job header says (Panfrost's "Job Header", 32 bytes: exception status, first incomplete task,
  * fault pointer, size/type/barrier/index, two dependency indices, next job) and the first words of each job
@@ -344,6 +387,9 @@ dump_chain(uint64_t jc)
         for (unsigned r = 0; r < 4; r++) {
             sweet_drm_log("  +%02x: %08x %08x %08x %08x %08x %08x %08x %08x", r * 32, w[r * 8], w[r * 8 + 1],
                 w[r * 8 + 2], w[r * 8 + 3], w[r * 8 + 4], w[r * 8 + 5], w[r * 8 + 6], w[r * 8 + 7]);
+        }
+        if (w[0] != 1) {        /* not "done": the one that failed */
+            dump_ptrs(p);
         }
         va = next;
     }

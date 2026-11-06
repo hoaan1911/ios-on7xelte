@@ -16,8 +16,8 @@ on:
         description: make -k (collect all compile errors in one run)
         default: "true"
       runner:
-        description: GitHub runner image (needs an Xcode 15.x; try macos-15 when macos-14 is unavailable)
-        default: macos-14
+        description: GitHub runner image (needs an Xcode 15.x; macos-15 is used, but the workflow must find a compatible Xcode 15.x)
+        default: macos-15
   push:
     branches: [main, herolte, codex/a5xelte-bringup]
     paths:
@@ -37,9 +37,9 @@ env:
 
 jobs:
   build:
-    # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
+    # macos-15 may ship Xcode 16.x; Xcode 15.x iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: ${{ inputs.runner || 'macos-14' }}
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -96,9 +96,13 @@ jobs:
           sw_vers
           ls -d /Applications/Xcode*.app
 
-          # Prefer Xcode 15.x for the expected iig ABI; otherwise use the oldest.
-          XC=$(ls -d /Applications/Xcode_15*.app 2>/dev/null | sort -V | tail -1)
-          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          # Xcode 15.x iig is required for the xnu-8796 IORPC ABI.
+          # Do not silently fall back to Xcode 16.x: it generates incompatible IORPC.kernelContent.
+          XC=$(ls -d /Applications/Xcode_15*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -z "$XC" ]; then
+            echo "::error::Xcode 15.x is required; this runner does not provide it. Refusing incompatible Xcode 16.x iig."
+            exit 1
+          fi
 
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           sudo xcode-select -s "$XC"

@@ -1,0 +1,43 @@
+From: j7 gpu config
+Subject: j7prime g3d: the GPU configuration quirks (SHADER/TILER/JM_CONFIG) after every reset
+
+Mesa's first batch ended with the tiler job at exception 0x58 (DATA_INVALID_FAULT). Panfrost's
+gpu_init_quirks and the S7 port's 0243 set SC_LS_ALLOW_ATTR_TYPES, TC_CLOCK_GATE_OVERRIDE and the job
+throttle limit; this driver wrote none of them. Done in j7m_cores_on(), so also after a fault's reset.
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -823,10 +823,32 @@
+     return false;
+ }
+ 
++/*
++ * After every reset, before the cores are powered, as Linux panfrost does (panfrost_gpu_init_quirks); the
++ * Galaxy S7 port found the same three needed on the T880, the same GPU family as this T830:
++ *   SHADER_CONFIG 0xf04 bit 16 SC_LS_ALLOW_ATTR_TYPES: the load/store unit must accept typed attribute
++ *     descriptors, or Mesa's jobs stop with DATA_INVALID_FAULT (0x58)
++ *   TILER_CONFIG 0xf08 bit 0 TC_CLOCK_GATE_OVERRIDE: the tiler clock gate (T76X_3953)
++ *   JM_CONFIG 0xf00: job throttle limit 0x3f at bit 3
++ * Without them the first tiler job of Mesa's first batch (a write_value, a vertex and a tiler job) ended with
++ * exception 0x58 and backboardd went down; the reset on that fault cleared them for good.
++ */
++static void
++j7m_config_quirks(void)
++{
++    a5g3d_write32(gJ7M.gpu, 0xf04, a5g3d_read32(gJ7M.gpu, 0xf04) | (1u << 16));
++    a5g3d_write32(gJ7M.gpu, 0xf08, a5g3d_read32(gJ7M.gpu, 0xf08) | 1u);
++    a5g3d_write32(gJ7M.gpu, 0xf00, 0x3fu << 3);
++    IOLog("J7 G3D: config jm=%08x shader=%08x tiler=%08x l2_mmu=%08x\n",
++        a5g3d_read32(gJ7M.gpu, 0xf00), a5g3d_read32(gJ7M.gpu, 0xf04),
++        a5g3d_read32(gJ7M.gpu, 0xf08), a5g3d_read32(gJ7M.gpu, 0xf0c));
++}
++
+ /* L2, then shader, then tiler (the Panfrost order that passed on the phone). */
+ static bool
+ j7m_cores_on(void)
+ {
++    j7m_config_quirks();
+     a5g3d_write32(gJ7M.gpu, 0x24, 0xffffffffu);
+     const bool ok = j7m_power_wait(0x1a0, 0x160, gJ7ML2Present) &&
+         j7m_power_wait(0x180, 0x140, gJ7MShaderPresent) &&

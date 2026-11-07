@@ -1,0 +1,19 @@
+From: j7 gpu barrier
+Subject: j7prime g3d: dsb sy before the job manager is pointed at a chain
+
+The S7 port's 0247: chains written by the CPU must have landed before HEAD_NEXT is written, or a few
+percent stop with JOB_READ_FAULT (0x42) at their first job, and after that no job runs until a reset.
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -600,6 +600,9 @@
+         return false;
+     }
+     a5g3d_write32(gJ7M.gpu, J7M_JOB_IRQ_CLEAR, 0xffffffffu);
++    /* Everything the CPU wrote for this chain has to be in memory before the job manager reads it (the S7
++     * port saw ~4% of chains stop with JOB_READ_FAULT at their first job without this barrier). */
++    __asm__ volatile ("dsb sy" ::: "memory");
+     a5g3d_write32(gJ7M.gpu, js + 0x40, static_cast<uint32_t>(jc_va));
+     a5g3d_write32(gJ7M.gpu, js + 0x44, static_cast<uint32_t>(jc_va >> 32));
+     a5g3d_write32(gJ7M.gpu, js + 0x50, gJ7M.shader);

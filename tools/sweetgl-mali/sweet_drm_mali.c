@@ -137,18 +137,38 @@ bo_get(uint32_t handle)
 
 #define MAX_BO_BYTES (64ull << 20)  /* what the kernel's map selector takes (0310, 0311) */
 
+/* How much memory the tiler heap gets (MiB, SWEET_HEAP_MB overrides). The S7 port's 32 works. */
+static uint64_t
+heap_cap(void)
+{
+    const char *s = getenv("SWEET_HEAP_MB");
+    uint64_t mb = s ? strtoull(s, NULL, 10) : 32;
+    if (mb < 1) {
+        mb = 1;
+    }
+    if (mb > (MAX_BO_BYTES >> 20)) {
+        mb = MAX_BO_BYTES >> 20;
+    }
+    return mb << 20;
+}
+
+/*
+ * *out_size is what the BO really is: Mesa takes a BO's size from the ioctl's reply (pan_kmod_bo_init), and
+ * the tiler is told its heap runs from the BO's address for that many bytes. Mesa asks for a 128 MiB heap
+ * (PANFROST_BO_HEAP), which the real kernel driver commits as the GPU needs it; here every BO is committed
+ * whole and the kernel maps at most 64 MiB at a time. A heap capped without saying so made the tiler write
+ * past its end over the BOs after it, and the tiler job stopped with DATA_INVALID_FAULT (0x58): the S7 port
+ * had exactly that (its herodrm.c). Refusing the heap instead left dev->tiler_heap NULL, which Mesa never
+ * checks, and backboardd crashed in the first batch.
+ */
 static int
-bo_create(uint32_t size, uint32_t flags, uint32_t *handle, uint64_t *gva)
+bo_create(uint32_t size, uint32_t flags, uint32_t *handle, uint64_t *gva, uint64_t *out_size)
 {
     uint64_t len = ((uint64_t)size + GPU_PAGE - 1) & ~(uint64_t)(GPU_PAGE - 1);
-    /* Mesa's tiler heap is a PANFROST_BO_HEAP of 128 MiB, which the real kernel driver commits as the
-     * GPU needs it. Here every BO is committed whole and the kernel maps at most 64 MiB at a time, so
-     * a heap gets 64 MiB behind it (Mesa still believes in 128): refusing it left dev->tiler_heap NULL,
-     * which Mesa never checks, and the first batch submit crashed backboardd on it. */
-    if ((flags & PANFROST_BO_HEAP) && len > MAX_BO_BYTES) {
-        sweet_drm_log("sweet_drm: heap BO of %u KiB backed with %llu KiB", size / 1024,
-                      (unsigned long long)(MAX_BO_BYTES / 1024));
-        len = MAX_BO_BYTES;
+    if ((flags & PANFROST_BO_HEAP) && len > heap_cap()) {
+        sweet_drm_log("sweet_drm: heap BO of %u KiB is %llu KiB", size / 1024,
+                      (unsigned long long)(heap_cap() / 1024));
+        len = heap_cap();
     }
     if (size == 0 || len > MAX_BO_BYTES) {
         return -EINVAL;
@@ -177,6 +197,7 @@ bo_create(uint32_t size, uint32_t flags, uint32_t *handle, uint64_t *gva)
     bos[h - 1] = (struct sbo){ .mem = mem, .gva = out[0], .size = len, .used = 1 };
     *handle = h;
     *gva = out[0];
+    *out_size = len;
     return 0;
 }
 
@@ -448,7 +469,11 @@ drmIoctl(int fd, unsigned long request, void *arg)
     }
     case DRM_IOCTL_PANFROST_CREATE_BO: {
         struct drm_panfrost_create_bo *c = arg;
-        ret = bo_create(c->size, c->flags, &c->handle, &c->offset);
+        uint64_t actual = 0;
+        ret = bo_create(c->size, c->flags, &c->handle, &c->offset, &actual);
+        if (ret == 0) {
+            c->size = (uint32_t)actual;     /* Mesa reads the real size back from here */
+        }
         break;
     }
     case DRM_IOCTL_PANFROST_GET_BO_OFFSET: {

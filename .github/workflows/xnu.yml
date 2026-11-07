@@ -190,6 +190,7 @@ jobs:
 
       - name: Package build tree for local compiles
         if: always()
+        continue-on-error: true   # a packaging problem must not turn a good kernel build red
         run: |
           if [ ! -d dxb ]; then
             echo "Build directory dxb does not exist; skipping build-tree package."
@@ -200,7 +201,7 @@ jobs:
           mkdir -p sdk-kernel-platform
           cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
 
-          tar czf buildtree.tgz --ignore-failed-read \
+          tar czf buildtree.tgz \
             --exclude='*.o' \
             --exclude='*.cpo' \
             --exclude='*.a' \

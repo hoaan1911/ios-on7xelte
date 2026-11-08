@@ -1,0 +1,62 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..2d7e678 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -43,6 +43,9 @@
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+ 	kSweetSurfaceLookup             = 4,
++	/* a surface made out of the caller's own memory, see externalMethod() */
++	kSweetSurfaceWrapClientImage    = 6,
++	kSweetSurfaceWrapClientMemory   = 7,
+ 	kSweetSurfaceLimits             = 13,
+ 	kSweetSurfaceLookupFromPort     = 34,
+ 	kSweetSurfaceCreatePort         = 35,
+@@ -721,6 +724,36 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	return ret;
+ }
+ 
++/*
++ * IOSurface.framework asks for a surface made out of the caller's own memory with these two
++ * selectors, and builds an IOSurfaceClient out of the lock result it is answered with. The zeroed
++ * "success" the default case below gives the setters is not a lock result: on 2026-11-08 backboardd
++ * got a client with no base address and no shared state page out of it, and the first
++ * IOSurfaceClientGetBulkAttachments() on that client (state + 0x30, 0x70 bytes) died reading 0x30,
++ * sig 11 in _platform_memmove with lr IOSurface+0x4ffc, after every run of the first shaders. So
++ * the wrap is refused: a client that is never built cannot be asked for its attachments. What was
++ * asked is logged (once per selector) for the day it is implemented.
++ */
++static uint32_t sweet_surf_wraps_logged;
++
++static void
++sweet_surf_wrap_refused(uint32_t selector, IOExternalMethodArguments *args)
++{
++	uint64_t arg0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
++	uint64_t arg1 = args->scalarInputCount > 1 ? args->scalarInput[1] : 0;
++	char name[32];
++
++	if (sweet_surf_wraps_logged >= 4) {
++		return;
++	}
++	sweet_surf_wraps_logged++;
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET SURF: %s wrap sel %u refused: scalars %u [0x%lx 0x%lx] struct in %u%s, out %u%s\n",
++	    name, selector, args->scalarInputCount, (unsigned long)arg0, (unsigned long)arg1,
++	    (unsigned)args->structureInputSize, args->structureInputDescriptor != NULL ? "+ool" : "",
++	    (unsigned)args->structureOutputSize, args->structureOutputDescriptor != NULL ? "+ool" : "");
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -772,6 +805,10 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
++	case kSweetSurfaceWrapClientImage:
++	case kSweetSurfaceWrapClientMemory:
++		sweet_surf_wrap_refused(selector, args);
++		return kIOReturnUnsupported;
+ 	default:
+ 		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {

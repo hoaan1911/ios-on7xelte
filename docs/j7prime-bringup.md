@@ -96,3 +96,23 @@ published with the ios-root release as `sweetgl-extents.txt`.
   throwaway dylib with `-undefined error`: `link.log` lists every symbol still missing.
 - 0313 (sweetenv) was rewritten against the real kern_exec.c from the xnu-peek artifact: exec_add_user_string takes an
   int segment here and the first attempt's context did not match.
+
+## backboardd's NULL in IOSurfaceClientGetBulkAttachments (patch 0320, 2026-11-08)
+- The GPU job no longer fails (log: `heap BO of 131072 KiB is 32768 KiB`, no `submit ... failed`), and CoreAnimation's
+  first shaders now compile on the GPU path (`hakios-gl: the first shaders`, `SWEET SURF: backboardd create id 2
+  750x1334 fmt 0x42475241 ...`). backboardd then dies, 11 times a boot, at `IOSurfaceClientGetBulkAttachments+0x2c`:
+  `sig 11 far 0x30`, pc in `_platform_memmove+0xb0`, lr `IOSurface+0x4ffc` (unslid `0x1d1b01e70`, the same as before the
+  heap fix). From the crash reporter's registers: `memmove(dst = stack, src = 0x30, len = 0x70)` with
+  `x0 = 0x1704a3100` (= sp + 0x20).
+- 0x30/0x70 is `state + 0x30`, the 0x70 bytes of bulk attachments in the shared state page (NOTES: lock result +0x08 is
+  that page). So `IOSurfaceClient + 0x8` is NULL: a client built out of a lock result that had no base address and no
+  state page, not a real surface of ours.
+- The last surface call before the crash is `SWEET SURF: backboardd sel 6` = `WrapClientImage`, which the kernel's
+  `IOSurfaceRootUserClient` did not implement: the default case answered success with zeroed outputs, and the framework
+  builds an `IOSurfaceClient` out of whatever a wrap/lookup/create returns. Patch **0320** refuses 6 and 7
+  (`WrapClientImage`, `WrapClientMemory`) with `kIOReturnUnsupported`, so no such client is built, and logs
+  `SWEET SURF: <proc> wrap sel N refused: scalars ..., struct in ..., out ...` once per selector so the next boot says
+  what the framework actually asks for if the wrap turns out to be needed. Not phone-tested: needs an `xnu` build.
+- The signature above comes from `tools/sweetgl-mali/eagl/sweet_crash.c` (built into sweetgl.dylib by `mesa-build`,
+  installed in backboardd by `sweet_backboardd.c`): `J7 G3D client: crash: ...` plus a 14-frame `dladdr` walk, which is
+  what turned the shared-cache addresses into `IOSurface+0x4ffc` / `QuartzCore+...`.

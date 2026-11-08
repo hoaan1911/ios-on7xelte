@@ -13,7 +13,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-14
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
@@ -154,6 +154,7 @@ jobs:
           $CC -O2 -g -Wall -I$E -c $E/gl_sweet.c -o out/obj/gl_sweet.o
           $CC -O2 -g -Wall -c $E/ca_hooks.c -o out/obj/ca_hooks.o
           $CC -O2 -g -Wall -c $E/sweet_backboardd.c -o out/obj/sweet_backboardd.o
+          $CC -O2 -g -Wall -c $E/sweet_crash.c -o out/obj/sweet_crash.o
           # Relink libOSMesa exactly as meson did, with the bridge objects added and a new name.
           python3 - <<'PY'
           import glob, os, shlex, subprocess
@@ -185,7 +186,7 @@ jobs:
                   continue
               out.append(t)
               i += 1
-          objs = [os.path.abspath('out/obj/' + o) for o in ('eagl.o', 'gl_sweet.o', 'ca_hooks.o', 'sweet_backboardd.o')]
+          objs = [os.path.abspath('out/obj/' + o) for o in ('eagl.o', 'gl_sweet.o', 'ca_hooks.o', 'sweet_backboardd.o', 'sweet_crash.o')]
           out += ['-o', os.path.abspath('out/sweetgl-unpadded.dylib'), '-install_name', '/usr/lib/sweetgl.dylib'] + objs
           out += ['-framework', 'IOSurface', '-framework', 'CoreFoundation', '-lobjc']
           line = ' '.join(shlex.quote(t) for t in out)

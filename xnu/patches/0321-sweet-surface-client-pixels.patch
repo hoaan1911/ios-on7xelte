@@ -1,0 +1,26 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 2d7e678..5913f95 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -699,6 +699,21 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			ret = kIOReturnNoMemory;
+ 		} else {
+ 			bzero(mem->getBytesNoCopy(), s->allocSize);
++			/*
++			 * A surface asked for over the client's own memory: "IOSurfaceAddress" is where
++			 * those pixels already are (that memory is not mapped here). Ignored, the surface
++			 * stayed zeroed for good - CoreAnimation's 180x180 app icons never appeared on
++			 * the Galaxy S7 either, until this was copied in there. With the wrap selectors
++			 * refused (0320) there is no other way those pixels reach us.
++			 */
++			OSNumber *address = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++			if (address != NULL && address->unsigned64BitValue() != 0) {
++				uint64_t want = (uint64_t)s->bytesPerRow * s->height;
++				int err = copyin((user_addr_t)address->unsigned64BitValue(), mem->getBytesNoCopy(),
++				    (vm_size_t)MIN(want, (uint64_t)s->allocSize));
++				IOLog("SWEET SURF: pixels of %ux%u taken from client address 0x%lx -> %d\n",
++				    s->width, s->height, (unsigned long)address->unsigned64BitValue(), err);
++			}
+ 			s->memory = mem;
+ 			s->mapCache = kIOMapDefaultCache;
+ 			if (!sweet_surface_publish(s)) {

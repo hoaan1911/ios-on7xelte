@@ -116,3 +116,23 @@ published with the ios-root release as `sweetgl-extents.txt`.
 - The signature above comes from `tools/sweetgl-mali/eagl/sweet_crash.c` (built into sweetgl.dylib by `mesa-build`,
   installed in backboardd by `sweet_backboardd.c`): `J7 G3D client: crash: ...` plus a 14-frame `dladdr` walk, which is
   what turned the shared-cache addresses into `IOSurface+0x4ffc` / `QuartzCore+...`.
+
+## Compared with the Galaxy S7 that has GPU acceleration (wardevsa/ios-a5xelte, branch `herolte`)
+- The backboardd crash above is their **`0244-iosurface-wrap-refuse-drop-trunc.patch`**, found independently and for the
+  same reason ("the default case's zeroed success left a client with NULL pointers, and IOSurfaceGetBulkAttachments
+  faulted on NULL+0x30"). Their selectors 6/7 comments match ours (`6` = wrap client image, struct in 0x20; `7` = wrap
+  client memory, scalars [address, length]) and they note what we assumed: refusing makes the library return NULL and
+  the caller, CoreAnimation's image upload, takes its copying path. 0320 therefore agrees with a tree whose GPU path
+  runs, which is the strongest check available while our build is unverified.
+- `0255-sweetsurface-client-address-and-diag.patch` -> **0321**: a surface created with `IOSurfaceAddress` (the client's
+  own memory) must start with those pixels; ignored, it stayed zeroed and CoreAnimation's 180x180 app icons never
+  appeared. Its per-key property dump is left out here as noise.
+- `0244` also fixes their `herolte_drop.c` (vnode_open leaves O_TRUNC to its caller, so a shorter file kept its old
+  tail). This tree has no `herolte_drop.c`; if a short `/usr/lib/sweetgl.dylib` push ever leaves a stale tail, that is
+  the shape of the bug.
+- Not ported, and why: `0252`/`0254` round every surface's row pitch up to 64 bytes so Panfrost can import it - that is
+  for their surface-BO import, while our bridge copies through OSMesa (`gl_sweet.c` returns "not done"), and 0254 had to
+  make it `sweetrowalign=1`-only because the keyboard then came out skewed; `0248-herogpu-surface-bo` is that import
+  itself, a feature our bridge does not have; `0317` is WebKit-only logging; `0276` replaces the scaled default surface
+  with its own memory (ours is still 0222's `fScaled ? fLogicalW : fWidth` over panel memory), a display-scaling
+  difference to revisit once drawing works, not a crash.

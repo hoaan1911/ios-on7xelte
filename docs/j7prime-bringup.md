@@ -145,5 +145,7 @@ published with the ios-root release as `sweetgl-extents.txt`.
      good rounds pass), so nothing on the panel was drawn by the GPU - the logo is iBoot's;
   2. after ~6 minutes CREATE_BO returns ENOMEM and backboardd dies in Mesa's `submit_batch` on the NULL BO. The kernel
      BO table was 64 entries and CoreAnimation maps one per IOSurface.
-- `0322` raises the table to 512 and makes the next log say what the fault was about (`J7 G3D: fault at <address> in bo
-  N of M (…, tables u/t)`) and why a map was refused, instead of only `-3` and a bare ENOMEM.
+- `0322` raises the table to 512 and adds the initial fault address/BO report and map-refusal reason.
+- **Next boot-log result:** the BO-table exhaustion and backboardd NULL-BO crash are gone; the selftest's valid submission passes, while all actual submits still fail `-3 js=8`. The reported VAs include `0x38e2440`, the job-chain head in BO 11, and `0x3d45000`, BO 18's first page. Correctly decoded Mali status bytes `0xc2`/`0xc3` indicate level-2/level-3 translation faults (READ/WRITE), with source IDs `0x7c10`/`0x7c20`. A single pool initialization is logged. No GPU frame or lock screen has been observed; root/table visibility remains unresolved.
+- `0323` adds TRANSTAB readback, a bounds-checked page-table walk for the fault VA, decoded fault fields, and a 16-entry successful BO map/free ring. It applies cleanly to the reconstructed source including 0322. On the next boot, pull `J7 G3D: walk transtab=...` and `J7 G3D: recent ...` lines to determine whether the root, table chain, leaf, or BO lifetime is wrong.
+- The build copies `xnu/patches/*.patch` into the xnu source tree, so each file must be the kernel diff itself. `0323-j7-g3d-fault-walk.patch` must stay a single patch of `iokit/Kernel/arm/A5XELTEGPU.cpp`; an exported `git format-patch` (repo-root paths plus a `create mode` entry) cannot apply there and silently leaves the walk out of the kernel.

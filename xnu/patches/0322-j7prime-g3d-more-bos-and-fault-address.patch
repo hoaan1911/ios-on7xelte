@@ -1,0 +1,120 @@
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+index 366c36d..c6a4af5 100644
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -296,7 +296,10 @@ j7g3d_publish(IOService *service, int level)
+  * Register layout and descriptor formats are the ones the A5 test already proved on
+  * this GPU family (write-value job, 0x2c1 leaves, memattr 0x888d88).
+  * =================================================================================== */
+-#define J7M_MAX_BOS     64
++/* 64 was the selftest's number.  A user-space client maps a BO per IOSurface and CoreAnimation
++ * holds far more than that: minutes into a boot every CREATE_BO came back ENOMEM, Mesa got a
++ * NULL BO and died in submit_batch.  The table is scanned linearly, so this is cheap. */
++#define J7M_MAX_BOS     512
+ #define J7M_VA_LO       0x01000000ULL
+ #define J7M_VA_HI       0x80000000ULL   /* MMU_FEATURES 0x2821: 33 VA bits; stay well below */
+ #define J7M_PT_BYTES    (2u * 1024 * 1024)
+@@ -617,6 +620,41 @@ j7m_submit(uint32_t slot, uint64_t jc_va, uint32_t *seq)
+     return true;
+ }
+ 
++/*
++ * The one thing the log did not have: the address a fault was about.  Every chain said "-3" with the
++ * same job status, and the address with the BO it lands in (or the fact that it lands in none) is what
++ * tells a missing mapping from a wrong pointer.  First four only - a broken frame repeats this forever.
++ */
++static void
++j7m_fault_report(uint32_t jobIRQ, uint32_t mmuIRQ)
++{
++    static unsigned shown;
++
++    if (shown++ >= 4) {
++        return;
++    }
++    const uint64_t fault = ((uint64_t)a5g3d_read32(gJ7M.gpu, J7M_AS0 + 0x24) << 32) |
++        a5g3d_read32(gJ7M.gpu, J7M_AS0 + 0x20);
++    uint64_t mapped = 0;
++    unsigned used = 0, inside = 0;
++    for (unsigned i = 0; i < J7M_MAX_BOS; i++) {
++        const struct J7MaliBo &b = gJ7M.bos[i];
++        if (!b.used) {
++            continue;
++        }
++        used++;
++        mapped += b.size;
++        if (fault >= b.va && fault < b.va + b.size) {
++            inside = i + 1;
++        }
++    }
++    IOLog("J7 G3D: fault at %llx in bo %u of %u (%llu KiB mapped, tables %u/%u): "
++        "faultstatus=%08x mmu_irq=%08x job_irq=%08x js_status=%08x\n",
++        (unsigned long long)fault, inside, used, (unsigned long long)(mapped / 1024),
++        gJ7M.poolUsed, gJ7M.poolTables, a5g3d_read32(gJ7M.gpu, J7M_AS0 + 0x1c),
++        mmuIRQ, jobIRQ, a5g3d_read32(gJ7M.gpu, J7M_JS(gJ7M.inflightSlot) + 0x24));
++}
++
+ /* Poll for completion. 0 = done OK, -1 = timeout, -2 = job fault, -3 = MMU fault. */
+ static int
+ j7m_wait(unsigned timeout_us)
+@@ -642,6 +680,9 @@ j7m_wait(unsigned timeout_us)
+     } else if (!(jobIRQ & (1u << slot))) {
+         rc = -1;
+     }
++    if (rc == -3) {
++        j7m_fault_report(jobIRQ, mmuIRQ);
++    }
+     if (rc != -1) {
+         a5g3d_write32(gJ7M.gpu, J7M_JOB_IRQ_CLEAR, jobIRQ);
+         a5g3d_write32(gJ7M.gpu, J7M_MMU_IRQ_CLEAR, mmuIRQ);
+@@ -905,6 +946,24 @@ j7m_serve_start(IOService *service, vm_offset_t gpu)
+     return true;
+ }
+ 
++/* User space only sees the ENOMEM of the ioctl; which of the four steps ran out has to be said here. */
++static void
++j7m_map_fail(const char *why)
++{
++    static unsigned shown;
++
++    if (shown++ < 8) {
++        unsigned used = 0;
++        for (unsigned i = 0; i < J7M_MAX_BOS; i++) {
++            if (gJ7M.bos[i].used) {
++                used++;
++            }
++        }
++        IOLog("J7 G3D: client map refused: %s (%u of %u BO slots used, %u of %u page tables)\n", why, used,
++            (unsigned)J7M_MAX_BOS, gJ7M.poolUsed, gJ7M.poolTables);
++    }
++}
++
+ /* Lock held.  Wire md and map its pages into AS0.  On success the slot owns the caller's
+  * reference to md; on failure the caller keeps it. */
+ static struct J7MaliBo *
+@@ -921,11 +980,17 @@ j7m_map_user(IOMemoryDescriptor *md, void *owner)
+             break;
+         }
+     }
+-    if (!bo || md->prepare(kIODirectionInOut) != kIOReturnSuccess) {
++    if (!bo) {
++        j7m_map_fail("no free BO slot");
++        return NULL;
++    }
++    if (md->prepare(kIODirectionInOut) != kIOReturnSuccess) {
++        j7m_map_fail("wiring the client's memory failed");
+         return NULL;
+     }
+     const uint64_t va = j7m_va_alloc(size);
+     if (!va) {
++        j7m_map_fail("no GPU VA left");
+         md->complete();
+         return NULL;
+     }
+@@ -937,6 +1002,7 @@ j7m_map_user(IOMemoryDescriptor *md, void *owner)
+         ok = pa && !(pa & (J7M_PAGE - 1)) && seg >= J7M_PAGE && j7m_map_page(va + done, pa);
+     }
+     if (!ok) {
++        j7m_map_fail("a physical segment or the page-table pool");
+         for (uint64_t u = 0; u < done; u += J7M_PAGE) {
+             j7m_unmap_page(va + u);
+         }

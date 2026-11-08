@@ -136,3 +136,14 @@ published with the ios-root release as `sweetgl-extents.txt`.
   itself, a feature our bridge does not have; `0317` is WebKit-only logging; `0276` replaces the scaled default surface
   with its own memory (ours is still 0222's `fScaled ? fLogicalW : fWidth` over panel memory), a display-scaling
   difference to revisit once drawing works, not a crash.
+
+## First boot with the GPU up: logo and no lock screen (2026-11-08)
+- `0320` holds: the boot has no IOSurface fault (11 per boot before) and `sel 6` is refused once per upload. `0321` is
+  doing its job too - `SWEET SURF: pixels of 120x120 taken from client address 0x… -> 0` for every client-owned surface.
+- Two faults of their own, in order of importance:
+  1. every submit fails `status=-3 js=8` (MMU fault; the kernel's own intentional-fault round prints the same js=8, its
+     good rounds pass), so nothing on the panel was drawn by the GPU - the logo is iBoot's;
+  2. after ~6 minutes CREATE_BO returns ENOMEM and backboardd dies in Mesa's `submit_batch` on the NULL BO. The kernel
+     BO table was 64 entries and CoreAnimation maps one per IOSurface.
+- `0322` raises the table to 512 and makes the next log say what the fault was about (`J7 G3D: fault at <address> in bo
+  N of M (…, tables u/t)`) and why a map was refused, instead of only `-3` and a bare ENOMEM.

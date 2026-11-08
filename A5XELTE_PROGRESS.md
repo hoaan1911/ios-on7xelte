@@ -131,3 +131,26 @@ Stage the iPhone 8 Plus userland in an exact-size HFSX USERDATA image, select it
 - **0132 phone result: first Mali-rendered pixels verified:** TWRP recovered SYSTEM flush #13 (30,922 bytes). JS0 fragment completion IRQ was `0x1`; job header exception was `0x1` (DONE), MMU IRQ, AS fault and GPU fault were zero, and all 256 private target pixels changed from the sentinel to opaque red `0xff0000ff`. SpringBoard and backboardd executed. This proves isolated fragment rendering on the phone, not display scanout or iOS UI acceleration.
 - **0133 direct-scanout trial started:** `a5gpu=5` maps 16 pages of the loader's physical DECON scanout buffer into Mali AS0 and submits a one-shot 16×16 opaque-green clear at `(528,944)` with 4320-byte row stride. `a5gpu=4` still tests only private memory. The A5XELTE Mach-O linked; the known `dsymutil` `/dev/fd/62` error followed link. The 20,283,408-byte BOOT candidate SHA-256 is `2b9cff9ee4d52e289e5eb54c732a2eb3fa341c338212da3f3de4090fe830f8e3`. Mac ADB confirmed a5xelte TWRP and BOOT p10, saved the full working 0132 BOOT privately, wrote exactly that count only to p10, and rebooted. No post-write hash comparison was run.
 - **0133 phone result: Mali pixels reached the panel:** The user saw the green square. A read-only TWRP pull recovered SYSTEM flush #1 (12,109 bytes): fragment job-header exception `1` (DONE), JS0 IRQ `1`, MMU IRQ `0`, AS fault `0`, and GPU fault `0`. This establishes one GPU-produced visible patch, not CoreAnimation or SpringBoard acceleration. The captured early log does not show later userland boot.
+
+## 2026-11-08 — J7 Prime: first iOS 16 boot with the GPU service up (logo, no lock screen)
+- Boot args `j7gpu=7 sweetfb_scale=1 sweetfb_lw=750 sweetfb_lh=1334`. The backboardd crash patch `0320` targets is gone: no
+  `IOSurface+0x4ffc` / `_platform_memmove` fault anywhere in the boot (it was 11 per boot before), `sel 6` now reads
+  `SWEET SURF: backboardd wrap sel 6 refused: scalars 0 [0x0 0x0] struct in 32, out 2664`, and `0321` copies the client's
+  pixels: `SWEET SURF: pixels of 120x120 taken from client address 0x110938000 -> 0` for surfaces 4-11.
+- The panel shows the Apple logo and never the lock screen. The log has two independent faults, neither yet fixed:
+  1. **Every** GPU submit fails, from frame 1: `submit jc=… slot=1 failed status=-3 js=8` then
+     `panfrost_batch_submit failed: 5`. `-3` is the driver's "MMU fault" and `js=8` is the same JS_STATUS the kernel's own
+     intentional-fault round prints (`client round 1 (fault) … status=-3 js=00000008`), while its good rounds pass
+     (`client selftest PASSED`). So the job manager and AS0 work for kernel memory and no user-space chain has ever run;
+     the logo on screen is the one iBoot drew, not a GPU frame.
+  2. ~6 minutes in, `MESA: error: DRM_IOCTL_PANFROST_CREATE_BO failed (err=12)` starts and backboardd dies:
+     `crash: far=48 pc=sweetgl.dylib+6b71b4 submit_batch+f4`, `f0 0 panfrost_batch_submit+5cc`,
+     `f02 panfrost_ptr_unmap+234`, `f03 u_default_texture_subdata+9c`, `f08 surface_to_texture+c8c`,
+     `f09 my_texImageIOSurface+35c`. Mesa dereferences the NULL BO that our failed ioctl returned. The kernel table was
+     `J7M_MAX_BOS 64` and CoreAnimation maps a BO per IOSurface (textures up to 76 by then), so the slots ran out.
+- Patch `0322`: `J7M_MAX_BOS` 64 -> 512, plus the two facts the log did not have - `J7 G3D: fault at <address> in bo N of M
+  (… KiB mapped, tables used/total): faultstatus=… mmu_irq=… job_irq=… js_status=…` for the first four faults (AS0+0x1c/
+  0x20/0x24, the address matched against the live BO table), and `J7 G3D: client map refused: <why>` naming which of the
+  four mapping steps ran out instead of a bare ENOMEM in user space.
+- Not established: any GPU-rendered frame, the lock screen, and the address of that first fault. The next boot's
+  `fault at` line decides between a missing mapping and a wrong pointer in the chain.

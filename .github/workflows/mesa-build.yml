@@ -13,16 +13,29 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    # macos-14 (the last image with Xcode 15.x) was retired on 2026-11-02: jobs on that label fail before
+    # the first step ("The configuration 'macos-14-arm64-us-default' is not supported"). macos-15 is arm64
+    # and ships Xcode 16.x; nothing here runs target code on the runner, it cross-compiles for iphoneos.
+    runs-on: macos-15
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
       - name: Xcode and tools
         run: |
           set -euo pipefail
-          x=$(ls -d /Applications/Xcode_15*.app 2>/dev/null | sort -V | tail -1 || true)
-          [ -z "$x" ] || sudo xcode-select -s "$x/Contents/Developer"
+          # Pin the newest Xcode 16.x: it is the closest to the iOS 16 SDK this port targets, and pinning keeps
+          # a later image (macos-26, Xcode 26.x) from changing the toolchain under the build.
+          x=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -z "$x" ]; then
+            echo "::error::no Xcode 16.x on this runner (macos-15 ships 16.0-16.4)"
+            ls -d /Applications/Xcode*.app || true
+            exit 1
+          fi
+          sudo xcode-select -s "$x"
+          echo "DEVELOPER_DIR=$x/Contents/Developer" >> "$GITHUB_ENV"
+          xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos clang --version | head -1
           brew install ninja bison flex
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install --quiet meson mako pyyaml packaging

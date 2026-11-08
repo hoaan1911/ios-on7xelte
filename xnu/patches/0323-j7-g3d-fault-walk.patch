@@ -1,0 +1,185 @@
+From c15fbab508e963909055d598b8fdd4627b978fd6 Mon Sep 17 00:00:00 2001
+From: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 08:11:14 +0000
+Subject: [PATCH] Add J7 Mali page-table fault diagnostics
+
+The 0322 boot log shows persistent translation faults after resolving BO-table exhaustion. Add a bounded page-table walk and recent BO map/free history to identify the active root or missing mapping on the next boot.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+---
+ A5XELTE_PROGRESS.md                           |   5 +-
+ docs/j7prime-bringup.md                       |   5 +-
+ xnu/patches/0323-j7prime-g3d-fault-walk.patch | 135 ++++++++++++++++++
+ 3 files changed, 141 insertions(+), 4 deletions(-)
+ create mode 100644 xnu/patches/0323-j7prime-g3d-fault-walk.patch
+
+diff --git a/A5XELTE_PROGRESS.md b/A5XELTE_PROGRESS.md
+index 7bf2fd5..c81b952 100644
+--- a/A5XELTE_PROGRESS.md
++++ b/A5XELTE_PROGRESS.md
+@@ -152,5 +152,6 @@ Stage the iPhone 8 Plus userland in an exact-size HFSX USERDATA image, select it
+   (… KiB mapped, tables used/total): faultstatus=… mmu_irq=… job_irq=… js_status=…` for the first four faults (AS0+0x1c/
+   0x20/0x24, the address matched against the live BO table), and `J7 G3D: client map refused: <why>` naming which of the
+   four mapping steps ran out instead of a bare ENOMEM in user space.
+-- Not established: any GPU-rendered frame, the lock screen, and the address of that first fault. The next boot's
+-  `fault at` line decides between a missing mapping and a wrong pointer in the chain.
++- New boot-log diagnosis: the `CREATE_BO failed (err=12)` lines and the backboardd NULL-BO crash are gone; there is no `crash: sig=` line. The selftest still passes its good rounds (`client round 0/2 (good) status=0 js=00000000`) and rejects its deliberate fault (`status=-3 js=00000008`); unowned-VA submit is rejected and client unmap succeeds. The four observed faults decode as translation faults, not permission faults: low status byte `0xc2`/`0xc3` is translation fault at level 2/3; access bits identify READ/WRITE and bits 31:16 identify source `0x7c10`/`0x7c20`. One fault VA `0x38e2440` is exactly the job-chain head, within BO 11 (`0x38e2000`, 64 KiB); another, `0x3d45000`, is BO 18's first page. The faults recur at the first head while every GPU submit remains `status=-3 js=8` from frame 1; frames 1–3 each report GL work but zero draws in place. There is one `serving user clients` / page-table-pool initialization. The log still shows the Apple logo and no lock screen. This locates the issue in GPU translation/page-table visibility or root selection, but does not establish which one.
++- Patch `0323` adds fault-status words, AS0 TRANSTAB readback vs. `gJ7M.root`, a pool-bounded walk printing `ent/l2/l3/leaf`, and a 16-entry map/free event ring (`recent` lines) to distinguish stale/missing mappings from a wrong root or VA. It is generated from the reconstructed source; its `git apply --check` validation passes against the 0322 reconstruction. No source-level cause is claimed yet.
++- Not established: a GPU-rendered frame, the lock screen, or why the GPU walker faults. The next boot log should include `J7 G3D: walk transtab=...` and `J7 G3D: recent ...` lines; those will distinguish a wrong root/table from a missing leaf or BO lifetime issue.
+diff --git a/docs/j7prime-bringup.md b/docs/j7prime-bringup.md
+index 678e1d7..0a826d8 100644
+--- a/docs/j7prime-bringup.md
++++ b/docs/j7prime-bringup.md
+@@ -145,5 +145,6 @@ published with the ios-root release as `sweetgl-extents.txt`.
+      good rounds pass), so nothing on the panel was drawn by the GPU - the logo is iBoot's;
+   2. after ~6 minutes CREATE_BO returns ENOMEM and backboardd dies in Mesa's `submit_batch` on the NULL BO. The kernel
+      BO table was 64 entries and CoreAnimation maps one per IOSurface.
+-- `0322` raises the table to 512 and makes the next log say what the fault was about (`J7 G3D: fault at <address> in bo
+-  N of M (…, tables u/t)`) and why a map was refused, instead of only `-3` and a bare ENOMEM.
++- `0322` raises the table to 512 and adds the initial fault address/BO report and map-refusal reason.
++- **Next boot-log result:** the BO-table exhaustion and backboardd NULL-BO crash are gone; the selftest's valid submission passes, while all actual submits still fail `-3 js=8`. The reported VAs include `0x38e2440`, the job-chain head in BO 11, and `0x3d45000`, BO 18's first page. Correctly decoded Mali status bytes `0xc2`/`0xc3` indicate level-2/level-3 translation faults (READ/WRITE), with source IDs `0x7c10`/`0x7c20`. A single pool initialization is logged. No GPU frame or lock screen has been observed; root/table visibility remains unresolved.
++- `0323` adds TRANSTAB readback, a bounds-checked page-table walk for the fault VA, decoded fault fields, and a 16-entry successful BO map/free ring. It applies cleanly to the reconstructed source including 0322. On the next boot, pull `J7 G3D: walk transtab=...` and `J7 G3D: recent ...` lines to determine whether the root, table chain, leaf, or BO lifetime is wrong.
+diff --git a/xnu/patches/0323-j7prime-g3d-fault-walk.patch b/xnu/patches/0323-j7prime-g3d-fault-walk.patch
+new file mode 100644
+index 0000000..b820c90
+--- /dev/null
++++ b/xnu/patches/0323-j7prime-g3d-fault-walk.patch
+@@ -0,0 +1,135 @@
++From: j7 g3d
++Subject: [PATCH] j7prime: diagnose G3D page-table faults
++
++Decode Mali MMU fault status, read back AS0's translation-table root, safely walk
++our page-table pool for the faulting VA, and print recent BO map/free events.
++
++--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
+++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
++@@ -322,6 +322,18 @@ struct J7MaliBo {
++     bool used;
++ };
++
+++/* A short history of BO lifetimes, printed with the next fault.  A translation fault inside a
+++ * mapped BO means the GPU's walk found nothing where this driver wrote a leaf; whether that range
+++ * was just mapped, freed or re-used tells a lost mapping apart from a range that was never ours. */
+++#define J7M_EVENTS      16
+++
+++struct J7MEvent {
+++    uint64_t va;
+++    uint64_t size;
+++    uint32_t slot;
+++    char kind;                      /* 'k' kernel BO, 'm' client map, 'f' free */
+++};
+++
++ static struct {
++     vm_offset_t gpu;
++     IOBufferMemoryDescriptor *pool;
++@@ -336,6 +348,8 @@ static struct {
++     bool inflight;
++     uint32_t inflightSlot;
++     struct J7MaliBo bos[J7M_MAX_BOS];
+++    struct J7MEvent events[J7M_EVENTS];
+++    uint32_t eventHead;
++ } gJ7M;
++
++ static uint64_t *
++@@ -344,6 +358,17 @@ j7m_table(uint64_t pa)
++     return reinterpret_cast<uint64_t *>(gJ7M.poolVA + (pa - gJ7M.poolPA));
++ }
++
+++static void
+++j7m_note(char kind, unsigned slot, uint64_t va, uint64_t size)
+++{
+++    struct J7MEvent *e = &gJ7M.events[gJ7M.eventHead % J7M_EVENTS];
+++    gJ7M.eventHead++;
+++    e->kind = kind;
+++    e->slot = slot;
+++    e->va = va;
+++    e->size = size;
+++}
+++
++ /* PA of a new zeroed 4 KiB table, or 0. */
++ static uint64_t
++ j7m_table_new(void)
++@@ -573,12 +598,14 @@ j7m_bo_new(uint64_t size)
++     bo->va = va;
++     bo->size = size;
++     bo->used = true;
+++    j7m_note('k', static_cast<unsigned>(bo - gJ7M.bos) + 1, va, size);
++     return bo;
++ }
++
++ static void
++ j7m_bo_free(struct J7MaliBo *bo)
++ {
+++    j7m_note('f', static_cast<unsigned>(bo - gJ7M.bos) + 1, bo->va, bo->size);
++     for (uint64_t u = 0; u < bo->size; u += J7M_PAGE) {
++         j7m_unmap_page(bo->va + u);
++     }
++@@ -635,6 +662,12 @@ j7m_fault_report(uint32_t jobIRQ, uint32_t mmuIRQ)
++     }
++     const uint64_t fault = ((uint64_t)a5g3d_read32(gJ7M.gpu, J7M_AS0 + 0x24) << 32) |
++         a5g3d_read32(gJ7M.gpu, J7M_AS0 + 0x20);
+++    const uint32_t fs = a5g3d_read32(gJ7M.gpu, J7M_AS0 + 0x1c);
+++    const unsigned status = fs & 0xff;
+++    const unsigned level = status & 3;
+++    const unsigned access = (fs >> 8) & 3;
+++    const char *faultKind = (status & 0xfc) == 0xc0 ? "translation" : "other";
+++    const char *accessKind = access == 1 ? "execute" : access == 2 ? "read" : access == 3 ? "write" : "unknown";
++     uint64_t mapped = 0;
++     unsigned used = 0, inside = 0;
++     for (unsigned i = 0; i < J7M_MAX_BOS; i++) {
++@@ -648,11 +681,43 @@ j7m_fault_report(uint32_t jobIRQ, uint32_t mmuIRQ)
++             inside = i + 1;
++         }
++     }
+++
+++    const uint64_t transtab = ((uint64_t)a5g3d_read32(gJ7M.gpu, J7M_AS0 + 0x04) << 32) |
+++        a5g3d_read32(gJ7M.gpu, J7M_AS0 + 0x00);
+++    uint64_t ent[4] = { 0, 0, 0, 0 };
+++    bool walkOK = gJ7M.poolVA && gJ7M.poolPA && gJ7M.poolTables;
+++    uint64_t table = transtab & 0x0000fffffffff000ULL;
+++    const unsigned shifts[3] = { 39, 30, 21 };
+++    const uint64_t poolEnd = gJ7M.poolPA + (uint64_t)gJ7M.poolTables * J7M_PAGE;
+++    for (unsigned i = 0; walkOK && i < 4; i++) {
+++        if (table < gJ7M.poolPA || table > poolEnd - J7M_PAGE || (table & (J7M_PAGE - 1))) {
+++            walkOK = false;
+++            break;
+++        }
+++        const unsigned shift = i < 3 ? shifts[i] : 12;
+++        ent[i] = j7m_table(table)[(fault >> shift) & 0x1ff];
+++        if (i < 3) {
+++            if (!(ent[i] & 1)) {
+++                break;
+++            }
+++            table = ent[i] & 0x0000fffffffff000ULL;
+++        }
+++    }
++     IOLog("J7 G3D: fault at %llx in bo %u of %u (%llu KiB mapped, tables %u/%u): "
++-        "faultstatus=%08x mmu_irq=%08x job_irq=%08x js_status=%08x\n",
+++        "faultstatus=%08x (%s level %u %s source=%x) mmu_irq=%08x job_irq=%08x js_status=%08x\n",
++         (unsigned long long)fault, inside, used, (unsigned long long)(mapped / 1024),
++-        gJ7M.poolUsed, gJ7M.poolTables, a5g3d_read32(gJ7M.gpu, J7M_AS0 + 0x1c),
+++        gJ7M.poolUsed, gJ7M.poolTables, fs, faultKind, level, accessKind, fs >> 16,
++         mmuIRQ, jobIRQ, a5g3d_read32(gJ7M.gpu, J7M_JS(gJ7M.inflightSlot) + 0x24));
+++    IOLog("J7 G3D: walk transtab=%llx root=%llx valid=%u ent=%llx l2=%llx l3=%llx leaf=%llx\n",
+++        (unsigned long long)transtab, (unsigned long long)gJ7M.root, walkOK,
+++        (unsigned long long)ent[0], (unsigned long long)ent[1],
+++        (unsigned long long)ent[2], (unsigned long long)ent[3]);
+++    const uint32_t n = gJ7M.eventHead < J7M_EVENTS ? gJ7M.eventHead : J7M_EVENTS;
+++    for (uint32_t i = 0; i < n; i++) {
+++        const struct J7MEvent &e = gJ7M.events[(gJ7M.eventHead - n + i) % J7M_EVENTS];
+++        IOLog("J7 G3D: recent %c bo=%u va=%llx size=%llx\n", e.kind, e.slot,
+++            (unsigned long long)e.va, (unsigned long long)e.size);
+++    }
++ }
++
++ /* Poll for completion. 0 = done OK, -1 = timeout, -2 = job fault, -3 = MMU fault. */
++@@ -1019,5 +1084,6 @@ j7m_map_user(IOMemoryDescriptor *md, void *owner)
++     bo->start = va;
++     bo->size = size;
++     bo->used = true;
+++    j7m_note('m', static_cast<unsigned>(bo - gJ7M.bos) + 1, va, size);
++     return bo;
++ }
+-- 
+2.43.0
+

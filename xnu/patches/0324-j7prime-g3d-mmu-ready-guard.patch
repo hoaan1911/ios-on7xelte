@@ -1,0 +1,49 @@
+From 17ab0a1a0e4c2a6e8f4b5d3c9a7e6f2b8d1c0a9e Mon Sep 17 00:00:00 2001
+From: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+Subject: [PATCH] J7 G3D: refuse client submit until AS0/MMU is ready
+
+When j7m_serve_start programs AS0 and brings up the page-table pool, the
+user client can be opened before the GPU's address space is actually usable.
+Refuse selector-2 submit with kIOReturnNotReady until gJ7M.mmuReady is set,
+so the first real submit does not silently fault with status=-3 js=8.
+
+Also track whether AS0 has been programmed in a new gJ7M.mmuReady field.
+
+Co-authored-by: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+---
+ iokit/Kernel/arm/A5XELTEGPU.cpp | 9 ++++++--
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+index 93cd289..2be9ba8 100644
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -344,6 +344,7 @@ static struct {
+     uint64_t root;
+     uint32_t shader;
+     bool mmuLive;
++    bool mmuReady;        /* AS0 programmed after serve_start: protects the first client submit */
+     uint32_t seq;
+     bool inflight;
+     uint32_t inflightSlot;
+@@ -1003,6 +1004,7 @@ j7m_serve_start(IOService *service, vm_offset_t gpu)
+         service->setProperty("J7G3DServe", "mmu-failed");
+         return false;
+     }
++    gJ7M.mmuReady = true;   /* AS0 programmed and the page-table pool is live: the user client may submit. */
+     service->setProperty(kIOUserClientClassKey, "J7MaliUserClient");
+     service->setProperty("J7G3DServe", "ready");
+     gJ7MServing = true;
+@@ -1239,6 +1241,12 @@ J7MaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a
+                 break;
+             }
+             uint32_t seq = 0;
++            if (!gJ7M.mmuReady) {
++                IOLog("J7 G3D: client submit refused: AS0/MMU not ready yet (mmuReady=%u, poolTables=%u)\n",
++                    gJ7M.mmuReady, gJ7M.poolTables);
++                ret = kIOReturnNotReady;
++                break;
++            }
+             j7m_cache(kIOMemoryIncoherentIOStore);
+             if (!j7m_submit(static_cast<uint32_t>(slot), jc, &seq)) {
+                 ret = kIOReturnBusy;

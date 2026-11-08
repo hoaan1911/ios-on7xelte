@@ -10,8 +10,11 @@
 #include <string.h>
 #include <unistd.h>
 
+void sweet_crash_install(void);     /* sweet_crash.c: log where backboardd crashes */
+
 __attribute__((constructor)) static void sweet_backboardd_init(void) {
     if (strcmp(getprogname(), "backboardd") != 0) return;
+    sweet_crash_install();
     setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
     CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
     CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);

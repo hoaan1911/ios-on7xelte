@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
-index a83c73b..c8d9b08 100644
+index 5604bf4..60ade64 100644
 --- a/iokit/Kernel/arm/A5XELTEGPU.cpp
 +++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
 @@ -320,7 +320,8 @@ struct J7MaliBo {
@@ -85,7 +85,7 @@ index a83c73b..c8d9b08 100644
 -    }
 -    for (; n < budget && n < pages; n++) {
 -        const uint64_t at = bo->va + (uint64_t)((cursor + n) % pages) * J7M_PAGE;
-+    for (uint64_t i = 0; i < pages; i++) {
++    for (unsigned i = 0; i < J7M_VERIFY_BUDGET && i < pages; i++) {
 +        const uint64_t at = bo->va + i * J7M_PAGE;
          uint64_t pa = 0, have = 0;
          if (!j7m_bo_page(bo, at, &pa)) {

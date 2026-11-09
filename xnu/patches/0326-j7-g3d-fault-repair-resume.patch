@@ -1,0 +1,299 @@
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+index 25a00b4..a1b5205 100644
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -413,15 +413,33 @@ j7m_pool_sync(void)
+     __sync_synchronize();
+ }
+ 
++/* Is pa a page inside the page-table pool?  Every walk this driver does, and every walk the
++ * repair path does, is bounds-checked against this: a stale entry must never be followed. */
+ static bool
+-j7m_map_page(uint64_t va, uint64_t pa)
++j7m_in_pool(uint64_t pa)
++{
++    if (!gJ7M.poolVA || !gJ7M.poolPA || !gJ7M.poolTables) {
++        return false;
++    }
++    const uint64_t end = gJ7M.poolPA + (uint64_t)gJ7M.poolTables * J7M_PAGE;
++    return pa >= gJ7M.poolPA && pa <= end - J7M_PAGE && (pa & (J7M_PAGE - 1)) == 0;
++}
++
++/* replace=false is the normal map (an existing leaf is an allocator bug); replace=true is the
++ * fault repair, which rewrites the leaf and replaces an intermediate entry that does not point
++ * into the pool. */
++static bool
++j7m_map_page_at(uint64_t va, uint64_t pa, bool replace)
+ {
+     uint64_t table = gJ7M.root;
+     const unsigned shifts[3] = { 39, 30, 21 };
+     for (unsigned level = 0; level < 3; level++) {
+         uint64_t *t = j7m_table(table);
+         uint64_t &e = t[(va >> shifts[level]) & 0x1ff];
+-        if (!(e & 3)) {
++        if (!(e & 3) || !j7m_in_pool(e & 0x0000fffffffff000ULL)) {
++            if ((e & 3) && !replace) {
++                return false;
++            }
+             uint64_t next = j7m_table_new();
+             if (!next) {
+                 return false;
+@@ -431,7 +449,7 @@ j7m_map_page(uint64_t va, uint64_t pa)
+         table = e & 0x0000fffffffff000ULL;
+     }
+     uint64_t &leaf = j7m_table(table)[(va >> 12) & 0x1ff];
+-    if (leaf & 3) {
++    if ((leaf & 3) && !replace) {
+         return false;                /* already mapped: allocator bug */
+     }
+     /* Mali-LPAE leaf: read/write, outer-shareable, attribute index 0, type 1 (as the A5 test). */
+@@ -439,6 +457,12 @@ j7m_map_page(uint64_t va, uint64_t pa)
+     return true;
+ }
+ 
++static bool
++j7m_map_page(uint64_t va, uint64_t pa)
++{
++    return j7m_map_page_at(va, pa, false);
++}
++
+ static void
+ j7m_unmap_page(uint64_t va)
+ {
+@@ -454,6 +478,53 @@ j7m_unmap_page(uint64_t va)
+     j7m_table(table)[(va >> 12) & 0x1ff] = 0;
+ }
+ 
++/* Walk our own tables exactly the way the GPU's walker does and return the page's PA (0 turned
++ * into false).  The fault log reads this instead of a hand-computed index chain. */
++static bool
++j7m_lookup(uint64_t va, uint64_t *pa)
++{
++    uint64_t table = gJ7M.root;
++    const unsigned shifts[3] = { 39, 30, 21 };
++    for (unsigned level = 0; level < 3; level++) {
++        if (!j7m_in_pool(table)) {
++            return false;
++        }
++        const uint64_t e = j7m_table(table)[(va >> shifts[level]) & 0x1ff];
++        if (!(e & 1)) {
++            return false;
++        }
++        table = e & 0x0000fffffffff000ULL;
++    }
++    if (!j7m_in_pool(table)) {
++        return false;
++    }
++    const uint64_t leaf = j7m_table(table)[(va >> 12) & 0x1ff];
++    if (!(leaf & 1)) {
++        return false;
++    }
++    if (pa) {
++        *pa = leaf & 0x0000fffffffff000ULL;
++    }
++    return true;
++}
++
++/* Physical page for a page of an already mapped BO (kernel BO or wired client memory). */
++static bool
++j7m_bo_page(struct J7MaliBo *bo, uint64_t page, uint64_t *pa)
++{
++    IOMemoryDescriptor *md = bo->md ? static_cast<IOMemoryDescriptor *>(bo->md) : bo->umd;
++    if (!md || page < bo->va || page >= bo->va + bo->size) {
++        return false;
++    }
++    IOByteCount seg = 0;
++    const uint64_t p = md->getPhysicalSegment(page - bo->va, &seg, kIOMemoryMapperNone);
++    if (!p || (p & (J7M_PAGE - 1)) || seg < J7M_PAGE) {
++        return false;
++    }
++    *pa = p;
++    return true;
++}
++
+ static bool
+ j7m_mmu_wait_idle(void)
+ {
+@@ -513,7 +584,9 @@ j7m_mmu_flush(uint64_t va, uint64_t len)
+     }
+     a5g3d_write32(gJ7M.gpu, J7M_AS0 + 0x10, static_cast<uint32_t>(lockaddr));
+     a5g3d_write32(gJ7M.gpu, J7M_AS0 + 0x14, static_cast<uint32_t>(lockaddr >> 32));
+-    return j7m_mmu_cmd(2) && j7m_mmu_cmd(4);   /* LOCK, FLUSH_PT */
++    /* LOCK, FLUSH_PT, UNLOCK (Panfrost's locked flush).  The unlock used to be missing, which
++     * left the AS locked on the flushed range after every map. */
++    return j7m_mmu_cmd(2) && j7m_mmu_cmd(4) && j7m_mmu_cmd(3);
+ }
+ 
+ /* First-fit GPU VA for a new BO, one guard page after every BO. 0 if none. */
+@@ -713,18 +786,20 @@ j7m_fault_report(uint32_t jobIRQ, uint32_t mmuIRQ)
+         (unsigned long long)transtab, (unsigned long long)gJ7M.root, walkOK,
+         (unsigned long long)ent[0], (unsigned long long)ent[1],
+         (unsigned long long)ent[2], (unsigned long long)ent[3]);
+-    if (walkOK && ent[1] && (ent[1] & 1)) {
+-        const uint64_t l3base = ent[1] & 0x0000fffffffff000ULL;
+-        const unsigned l3leaf = (fault >> 12) & 0x1ff;
+-        uint64_t l3entry = 0;
+-        if (l3base >= gJ7M.poolPA && l3base < poolEnd - J7M_PAGE &&
+-            (l3base & (J7M_PAGE - 1)) == 0) {
++    /* ent[] here is root at 39, L1 at 30, L2 at 21, L3 leaf at 12: the L3 table lives in ent[2].
++     * 0325 read it out of ent[1] (one level too high), so its l3_leaf=0 meant nothing. */
++    uint64_t l3base = 0, l3entry = 0, ours = 0;
++    const unsigned l3leaf = (fault >> 12) & 0x1ff;
++    if (walkOK && (ent[2] & 1)) {
++        l3base = ent[2] & 0x0000fffffffff000ULL;
++        if (j7m_in_pool(l3base)) {
+             l3entry = j7m_table(l3base)[l3leaf];
+         }
+-        IOLog("J7 G3D: page-table readback l2_entry=%llx l3_table=%llx l3_leaf=%llx\n",
+-            (unsigned long long)ent[1], (unsigned long long)l3base,
+-            (unsigned long long)l3entry);
+     }
++    const bool selfMapped = j7m_lookup(fault, &ours);
++    IOLog("J7 G3D: page-table readback l2_entry=%llx l3_table=%llx l3_leaf=%u leaf=%llx "
++        "ours=%u pa=%llx\n", (unsigned long long)ent[2], (unsigned long long)l3base, l3leaf,
++        (unsigned long long)l3entry, selfMapped, (unsigned long long)ours);
+     const uint32_t n = gJ7M.eventHead < J7M_EVENTS ? gJ7M.eventHead : J7M_EVENTS;
+     for (uint32_t i = 0; i < n; i++) {
+         const struct J7MEvent &e = gJ7M.events[(gJ7M.eventHead - n + i) % J7M_EVENTS];
+@@ -733,6 +808,68 @@ j7m_fault_report(uint32_t jobIRQ, uint32_t mmuIRQ)
+     }
+ }
+ 
++/*
++ * A translation fault stalls the job on this MMU; the walker retries the access once the tables
++ * cover it (the model Panfrost implements in panfrost_mmu_map_fault_addr).  The readback showed
++ * lanes missing under BOs this driver had already mapped, so a fault is treated as a mapping to
++ * finish, not as the end of the frame: the chain is resumed instead of failing the submit, which
++ * is what turned every lock-screen frame into "panfrost_batch_submit failed: 5" and a CPU copy
++ * of the screen surface.
++ */
++#define J7M_REPAIR_LIMIT    8       /* resumed faults per job before a real reset */
++#define J7M_REPAIR_PAGES    96      /* pages per BO re-walked at fault time */
++
++/* 1 = tables changed (resume), 0 = faulting VA is not ours (the selftest's deliberate fault),
++ * -1 = our BO but nothing to fix: the GPU walked tables that already cover the page. */
++static int
++j7m_repair(uint64_t fault)
++{
++    static unsigned shown;
++    const uint64_t page = fault & ~(J7M_PAGE - 1);
++    for (unsigned i = 0; i < J7M_MAX_BOS; i++) {
++        struct J7MaliBo *bo = &gJ7M.bos[i];
++        if (!bo->used || page < bo->va || page >= bo->va + bo->size) {
++            continue;
++        }
++        unsigned fixed = 0, unmappable = 0;
++        uint64_t firstFix = 0;
++        /* The faulting page first, then the head of the BO: a job chain reads its descriptors all
++         * over it, so a single repaired page only moves the next fault a few words along. */
++        for (unsigned n = 0; n < J7M_REPAIR_PAGES; n++) {
++            const uint64_t at = n == 0 ? page : bo->va + (uint64_t)(n - 1) * J7M_PAGE;
++            if (at >= bo->va + bo->size) {
++                break;
++            }
++            uint64_t pa = 0;
++            if (!j7m_bo_page(bo, at, &pa)) {
++                unmappable++;
++                continue;
++            }
++            uint64_t have = 0;
++            if (j7m_lookup(at, &have) && have == pa) {
++                continue;
++            }
++            if (j7m_map_page_at(at, pa, true)) {
++                if (fixed == 0) {
++                    firstFix = at;
++                }
++                fixed++;
++            }
++        }
++        if (fixed) {
++            j7m_pool_sync();
++            (void)j7m_mmu_flush(bo->va, bo->size);
++        }
++        if (shown++ < 8) {
++            IOLog("J7 G3D: fault repair: bo=%u va=%llx fixed=%u first=%llx unmappable=%u "
++                "tables=%u/%u\n", i + 1, (unsigned long long)page, fixed,
++                (unsigned long long)firstFix, unmappable, gJ7M.poolUsed, gJ7M.poolTables);
++        }
++        return fixed ? 1 : -1;
++    }
++    return 0;
++}
++
+ /* Poll for completion. 0 = done OK, -1 = timeout, -2 = job fault, -3 = MMU fault. */
+ static int
+ j7m_wait(unsigned timeout_us)
+@@ -741,32 +878,48 @@ j7m_wait(unsigned timeout_us)
+         return 0;
+     }
+     const uint32_t slot = gJ7M.inflightSlot;
+-    uint32_t jobIRQ = 0, mmuIRQ = 0;
+-    for (unsigned us = 0; us < timeout_us; us += 10) {
+-        jobIRQ = a5g3d_read32(gJ7M.gpu, J7M_JOB_IRQ_RAWSTAT);
+-        mmuIRQ = a5g3d_read32(gJ7M.gpu, J7M_MMU_IRQ_RAWSTAT);
+-        if ((jobIRQ & ((1u << slot) | (1u << (slot + 16)))) || mmuIRQ) {
+-            break;
++    unsigned repairs = 0;
++    for (;;) {
++        uint32_t jobIRQ = 0, mmuIRQ = 0;
++        for (unsigned us = 0; us < timeout_us; us += 10) {
++            jobIRQ = a5g3d_read32(gJ7M.gpu, J7M_JOB_IRQ_RAWSTAT);
++            mmuIRQ = a5g3d_read32(gJ7M.gpu, J7M_MMU_IRQ_RAWSTAT);
++            if ((jobIRQ & ((1u << slot) | (1u << (slot + 16)))) || mmuIRQ) {
++                break;
++            }
++            IODelay(10);
+         }
+-        IODelay(10);
+-    }
+-    int rc = 0;
+-    if (mmuIRQ) {
+-        rc = -3;
+-    } else if (jobIRQ & (1u << (slot + 16))) {
+-        rc = -2;
+-    } else if (!(jobIRQ & (1u << slot))) {
+-        rc = -1;
+-    }
+-    if (rc == -3) {
+-        j7m_fault_report(jobIRQ, mmuIRQ);
+-    }
+-    if (rc != -1) {
+-        a5g3d_write32(gJ7M.gpu, J7M_JOB_IRQ_CLEAR, jobIRQ);
+-        a5g3d_write32(gJ7M.gpu, J7M_MMU_IRQ_CLEAR, mmuIRQ);
+-        gJ7M.inflight = false;
++        int rc = 0;
++        if (mmuIRQ) {
++            rc = -3;
++        } else if (jobIRQ & (1u << (slot + 16))) {
++            rc = -2;
++        } else if (!(jobIRQ & (1u << slot))) {
++            rc = -1;
++        }
++        if (rc == -3) {
++            j7m_fault_report(jobIRQ, mmuIRQ);
++            if (repairs < J7M_REPAIR_LIMIT) {
++                const uint64_t fault =
++                    ((uint64_t)a5g3d_read32(gJ7M.gpu, J7M_AS0 + 0x24) << 32) |
++                    a5g3d_read32(gJ7M.gpu, J7M_AS0 + 0x20);
++                if (j7m_repair(fault) > 0) {
++                    /* Tables now cover the address: clear the fault and let the stalled job
++                     * retry the access instead of failing the submit. */
++                    repairs++;
++                    a5g3d_write32(gJ7M.gpu, J7M_MMU_IRQ_CLEAR, mmuIRQ);
++                    a5g3d_write32(gJ7M.gpu, J7M_JOB_IRQ_CLEAR, jobIRQ);
++                    continue;
++                }
++            }
++        }
++        if (rc != -1) {
++            a5g3d_write32(gJ7M.gpu, J7M_JOB_IRQ_CLEAR, jobIRQ);
++            a5g3d_write32(gJ7M.gpu, J7M_MMU_IRQ_CLEAR, mmuIRQ);
++            gJ7M.inflight = false;
++        }
++        return rc;
+     }
+-    return rc;
+ }
+ 
+ /* GPU soft reset: stops everything, clears AS0 and the job slots. */

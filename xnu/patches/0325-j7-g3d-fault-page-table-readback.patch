@@ -1,0 +1,47 @@
+From 17ab0a1a0e4c2a6e8f4b5d3c9a7e6f2b8d1c0a9e Mon Sep 17 00:00:00 2001
+From: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+Subject: [PATCH] J7 G3D: read back the L2->L3 pointer and L3 leaf on a fault
+
+When j7m_fault_report walks our page-table pool and finds the L2 entry
+(ent[1]) present, print what that L2 entry points at: the L3 table base
+and whether that L3 table actually has a valid leaf for the faulting VA.
+
+This mirrors the donor HeroGL read-fault path (hgu_pte: read back the PTE
+for the faulting VA from the driver's own page tables) but reads from our
+pool directly via j7m_table, since j7m_fault_report already walks it.
+
+Combined with the 0323 walk, this distinguishes a mapping that exists in
+our pool but still faults for the GPU (wrong root / AS0 / flush / job-slot
+issue to chase next) from an L2 table that was allocated but whose L3
+table or leaf for this VA was never written or was lost -- which is what
+the current J7 boot log shows for the Mesa fault at 38e2440 (l2=833e5003,
+l3=0, leaf=0).
+
+Co-authored-by: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+---
+ iokit/Kernel/arm/A5XELTEGPU.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+index 93cd289..429b09c 100644
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -701,6 +701,18 @@
+         (unsigned long long)transtab, (unsigned long long)gJ7M.root, walkOK,
+         (unsigned long long)ent[0], (unsigned long long)ent[1],
+         (unsigned long long)ent[2], (unsigned long long)ent[3]);
++    if (walkOK && ent[1] && (ent[1] & 1)) {
++        const uint64_t l3base = ent[1] & 0x0000fffffffff000ULL;
++        const unsigned l3leaf = (fault >> 12) & 0x1ff;
++        uint64_t l3entry = 0;
++        if (l3base >= gJ7M.poolPA && l3base < poolEnd - J7M_PAGE &&
++            (l3base & (J7M_PAGE - 1)) == 0) {
++            l3entry = j7m_table(l3base)[l3leaf];
++        }
++        IOLog("J7 G3D: page-table readback l2_entry=%llx l3_table=%llx l3_leaf=%llx\n",
++            (unsigned long long)ent[1], (unsigned long long)l3base,
++            (unsigned long long)l3entry);
++    }
+     const uint32_t n = gJ7M.eventHead < J7M_EVENTS ? gJ7M.eventHead : J7M_EVENTS;
+     for (uint32_t i = 0; i < n; i++) {
+         const struct J7MEvent &e = gJ7M.events[(gJ7M.eventHead - n + i) % J7M_EVENTS];

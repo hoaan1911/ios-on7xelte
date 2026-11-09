@@ -157,3 +157,28 @@ Stage the iPhone 8 Plus userland in an exact-size HFSX USERDATA image, select it
 - **Device observation (later 0322 boot):** With 21 BOs and 50,640 KiB live, the same three client faults recur — `0x38e2440` and `0x38e2dc0` (`7c1002c2`, translation level 2, read) inside the 64 KiB job-chain BO, and `0x3d45000` (`7c2003c3`, level 3, write) at a BO start — while the deliberate client fault reports `7c2003c1` (level 1). Every submit still returns `status=-3 js=8`, and the recovered console has no `J7 G3D: walk` or `recent` line, so that kernel was built with `0322` only: `xnu/patches/0323-j7-g3d-fault-walk.patch` on `main` is the exported format-patch, not the kernel diff.
 - Not established: a GPU-rendered frame, the lock screen, or why the GPU walker faults. The next boot log should include `J7 G3D: walk transtab=...` and `J7 G3D: recent ...` lines; those will distinguish a wrong root/table from a missing leaf or BO lifetime issue.
 - Patch `0324` (`xnu/patches/0324-j7prime-g3d-mmu-ready-guard.patch`) is the same kernel diff, generated from the reconstructed tree and byte-verified end to end: `17ab0a1` -> apply `0323` -> apply `0324` -> result matches the committed 0323+A+B+C target. It adds `bool mmuReady;` to `gJ7M`, sets `gJ7M.mmuReady = true;` in `j7m_serve_start` after `j7m_mmu_enable()` succeeds, and refuses selector-2 submit with `kIOReturnNotReady` when `!gJ7M.mmuReady` before `j7m_cache`+`j7m_submit`. It is one file, `iokit/Kernel/arm/A5XELTEGPU.cpp`, 33 lines. It is a hypothesis (first submit faults because AS0/MMU is not yet ready), to be confirmed or refuted by the next boot's `walk`/`recent` lines; if the fault is a wrong root or stale leaf, revert this guard and fix the real cause.
+
+# 2026-11-09 — J7 G3D: verify every BO page before submit (0328-gpu)
+
+- 0327 boots to lock screen/home screen with GPU acceleration but is painfully slow:
+  checking only a 4096-page slice per submit left whole BOs unmapped, the job slot faulted
+  and every frame waited out the client's five second timeout (`frames=1 elapsed_ms=5250`,
+  `fps=0.1`). 0328 therefore verifies every page of every live BO before each submit, against
+  PAs cached at map time — a full pass is a table walk (no descriptor walks) and one flush
+  per submit instead of per-BO.  A BO that still loses leaves prints one line
+  (`submit verify: bo=.. gva=.. pages=.. filled=.. first=.. unknown=.. tables=..`), and a
+  clean pass prints a heartbeat every 240 submits, so the next log says whether holes appear
+  between map and submit.
+
+- Core change: each BO now keeps `uint64_t *pas`, one PA per page, filled at map time.
+  `j7m_bo_page()` answers from `pas` via a pure table walk. `j7m_verify_as()` walks every
+  page of every live BO, issues a single `j7m_pool_sync()` + `j7m_mmu_flush()` for the
+  changed range. `j7m_bo_new` allocates `pas` with `IOMalloc`/`bzero`; `j7m_bo_free` frees it
+  before `bzero(bo, sizeof(*bo))`.
+
+- Expected effect: the 5-second wait timeout per frame disappears, frame rate should improve
+  from ~0.1 fps to a much higher rate. Remaining slowness may be Mesa/CPU side.
+
+- Note: the console mute patch (`a5fb_noconsole=1` stopping log text on panel) is deferred
+  to future work — it targets `osfmk/console/serial_console.c` which is not in this repo.
+  The panel text issue remains as known known in 0327.

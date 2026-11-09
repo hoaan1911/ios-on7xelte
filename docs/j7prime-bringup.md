@@ -150,3 +150,19 @@ published with the ios-root release as `sweetgl-extents.txt`.
 - `0323` adds TRANSTAB readback, a bounds-checked page-table walk for the fault VA, decoded fault fields, and a 16-entry successful BO map/free ring. It applies cleanly to the reconstructed source including 0322. On the next boot, pull `J7 G3D: walk transtab=...` and `J7 G3D: recent ...` lines to determine whether the root, table chain, leaf, or BO lifetime is wrong.
 - The build copies `xnu/patches/*.patch` into the xnu source tree, so each file must be the kernel diff itself. `0323-j7-g3d-fault-walk.patch` must stay a single patch of `iokit/Kernel/arm/A5XELTEGPU.cpp`; an exported `git format-patch` (repo-root paths plus a `create mode` entry) cannot apply there and silently leaves the walk out of the kernel.
 - Patch `0324` (`xnu/patches/0324-j7prime-g3d-mmu-ready-guard.patch`) is the same kernel diff, generated from the reconstructed tree and byte-verified end to end: `17ab0a1` -> apply `0323` -> apply `0324` -> result matches the committed 0323+A+B+C target. It adds `bool mmuReady;` to `gJ7M`, sets `gJ7M.mmuReady = true;` in `j7m_serve_start` after `j7m_mmu_enable()` succeeds, and refuses selector-2 submit with `kIOReturnNotReady` when `!gJ7M.mmuReady` before `j7m_cache`+`j7m_submit`. It is one file, `iokit/Kernel/arm/A5XELTEGPU.cpp`, 33 lines. It is a hypothesis (first submit faults because AS0/MMU is not yet ready), to be confirmed or refuted by the next boot's `walk`/`recent` lines; if the fault is a wrong root or stale leaf, revert this guard and fix the real cause.
+
+## 2026-11-09 — 0328-gpu: verify every BO page before submit (slowness fix)
+
+0327 boots to the lock screen with GPU rendering. The remaining defect is the frame rate:
+0327 checked only a 4096-page slice per submit, so a BO outside the slice still faulted
+(`fault at 300b040 ... l3=0`), the job slot faulted (`js=8`), the wait ran into the
+client's 5 s timeout (`status=-1`, `frames=1 elapsed_ms=5250`) and Mesa dropped the batch.
+0328 therefore checks the whole address space of every live BO before each submit, against
+PAs cached when the BO was mapped. This is a pure table walk (no descriptor walks) with one
+flush per submit instead of per-BO. Expected effect: the 5-second wait timeout per frame
+disappears, frame rate improves from ~0.1 fps to a much higher rate.
+
+The console mute (stopping log text on the panel) is deferred to future work — it targets
+`osfmk/console/serial_console.c` which is not in this repo. In 0327, `a5fb_noconsole=1`
+only mutes `_cnputs()` (the ring drain) but the video console paints through
+`_cnputc()` → `cons_ops[VC_CONS_OPS].putc`, so log text still appears on the panel.

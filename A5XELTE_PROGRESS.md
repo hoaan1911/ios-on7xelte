@@ -1,3 +1,51 @@
+# 2026-11-09 — J7 G3D: verify AS0 before submit, after every map (0327)
+
+- The 0326 image booted to Apple logo, then black, exactly as before 0326: the log is from
+  that run (boot-args identical to the usual set; `launchd` prints
+  `... sweetfb_scale=1 sweetfb_lw=750 sweetfb_lh=1334` appended, so `iphone8=true` did add the
+  internal-screen sizing). The 0326 code is on the phone: `fault repair:` lines appear with
+  `bo=... va=... fixed=16/95/4 first=... unmappable=0 tables=32..39/512`.
+- What 0326 settled: every reported fault is `ours=0` and the repaired pages are a **whole
+  BO prefix** (`fixed=95` = 96 pages minus the faulting page, so the entire scanned prefix was
+  absent). The L2 entry is 0 outright on the `300b040` fault (`l2_entry=0 l3_table=0`), i.e.
+  the L3 table for that 2 MiB region did not exist yet even though the BO had been recorded
+  as mapped. So the holes are in the driver's own tables — not a stale GPU TLB view, not a
+  wrong pointer.
+- What 0326 changed in the failure mode: the fault is now handled (`fault at 3010180 ... ours=0`
+  then `fault repair: ... fixed=4`, `mmu_irq` cleared, poll resumes) but the submit then reports
+  `status=-1` (timeout) instead of the old `-3`: clearing the MMU fault does not restart a job
+  slot that is already in fault state (`js=8`), so the chain never completes, Mesa still drops
+  the batch (`panfrost_batch_submit failed: 5`), and `hakios-gl` still reports
+  `1 picture copied out, 0 drawn in place` with `a copy` attaches. Repairing at fault time
+  cannot win that race; the holes have to be filled before the walker runs.
+- The display side is not the blocker: `SWEET FB: swap 1 layer 0 surface 2 750x1334 ... bpr 3072`
+  is copied by `present()` (`A5XELTE FB: frames=1 ... bytes=8294400` = one full 1080x1920
+  panel copy), and `bytes=0` on the later window is correct — that swap is surface 1, the
+  framebuffer's own surface, which `present()` deliberately skips. Only two swaps happen in
+  the whole boot and then `SWEET FB: display off`, because the compositor has no drawn frame
+  to present.
+- 0327 therefore checks the address space against the BO descriptors *before* it is used:
+  - `j7m_verify_bo()` walks a bounded page slice of one BO (rotating per-BO cursor), re-derives
+    each page's PA with `j7m_bo_page()` and fills any leaf that is absent or wrong through
+    `j7m_map_page_at(..., replace=true)`.
+  - `j7m_verify_as(J7M_VERIFY_BUDGET)` runs from submit (selector 2) before the chain is
+    handed to the job manager: 4096 pages per submit spread over every BO, round-robin start,
+    flush per changed BO, and logs
+    `submit verify: checked=... filled=... unknown=... tables=.../...` for the first 24 times a
+    hole is found (and once every 120 submits afterwards as a heartbeat).
+  - `j7m_map_verify()` re-walks a BO immediately after it is mapped (kernel and client paths),
+    fills anything that did not read back, and logs `map verify: bo=... gva=... pages=...
+    missing=... unknown=...` — `missing>0` here means the map path itself leaves holes, which
+    is the one thing the previous logs could not distinguish.
+  - `j7m_bo_free()` now only clears a leaf that still maps that BO's own page; a leaf that maps
+    something else belongs to another live BO, and clearing it would unmask that BO for the GPU.
+    Cross-BO clearing is logged as `free bo=... kept=... leaves that map another BO`.
+  - Selector 0 and 1 log the first 24 `client map gva=... bo=...` / `client unmap gva=...
+    ret=...` calls, so BO churn (a VA freed and re-used under a live chain) is visible.
+- What the next log decides: `map verify: missing=0` everywhere plus
+  `submit verify: filled=0` means the tables are coherent and the remaining fault source is
+  GPU-side; `filled>0` on the first submits means entries are being lost between map and
+  submit, and the `free ... kept=` / `client unmap` lines say whether frees are the cause.
 # 2026-11-09 — J7 G3D: fault-time page-table repair and resume (0326)
 
 - 0325 reached the phone (boot log contains `page-table readback` lines; the image was built

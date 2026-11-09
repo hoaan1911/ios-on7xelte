@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
-index a83c73b..c8d9b08 100644
+index 5604bf4..60ade64 100644
 --- a/iokit/Kernel/arm/A5XELTEGPU.cpp
 +++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
 @@ -320,7 +320,8 @@ struct J7MaliBo {

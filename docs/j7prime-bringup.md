@@ -1,3 +1,18 @@
+## 2026-11-09 — 0328: every page before submit, and the panel stops showing log text
+
+0327 boots to the lock screen with GPU rendering. The remaining two defects are the frame rate
+and the kernel log text painted over the panel.
+
+The frame rate comes from the fault path: 0327 checked only a 4096-page slice per submit, so a
+BO outside the slice still faulted (`fault at 300b040 ... l3=0`), the job slot faulted
+(`js=8`), the wait ran into the client's 5 s timeout (`status=-1`, `frames=1 elapsed_ms=5250`)
+and Mesa dropped the batch. 0328 verifies every page of every live BO before each submit,
+against a PA list cached when the BO was mapped, so the pass is a table walk and costs one
+flush; holes are rewritten before the GPU ever walks them.
+
+The text on the panel was a mute that only covered `_cnputs()` while the video console paints
+from `_cnputc()`; the guard now sits there too, so `a5fb_noconsole=1` really stops drawing once
+the first swap has presented. The persistent log is unaffected.
 ## 2026-11-09 — 0327: validate AS0 before the GPU walks it
 
 0326 proved the translation faults are real holes in the driver's own page tables, not a

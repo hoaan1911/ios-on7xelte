@@ -1,3 +1,42 @@
+# 2026-11-09 — J7 G3D: check every page before submit, mute the video console (0328)
+
+- 0327 worked: the same image boots to the lock screen and the Settings UI is rendered by the
+  GPU for the first time (`SWEET FB: swap 8 ... surface 2`, `1 picture copied out`), so the
+  page-table repair model is right. Two problems remain, both visible in that log and on the
+  panel: the display updates on the order of minutes, and kernel log text is painted over the
+  bottom of the screen while `a5fb_noconsole=1` is on the command line.
+- Why it is slow: 0327 verified a 4096-page slice per submit with a rotating cursor, so a BO
+  whose leaves were gone outside that slice still faulted. The log shows exactly that -
+  `submit verify: checked=6268 filled=4096` followed by
+  `fault at 300b040 in bo 4 of 21` whose walk is `l3=0` (the L3 table for that 2 MiB region is
+  absent), then `submit ... failed status=-1 js=8`. A faulted job slot never completes, so the
+  frame costs the client's whole wait timeout (5 s): `frames=1 elapsed_ms=5250 fps=0.1`
+  repeated. Mesa then drops the batch (`panfrost_batch_submit failed: 5`) and copies.
+- 0328 therefore checks the whole address space before every submit instead of a slice:
+  - each BO now keeps a PA list built while it is mapped (`bo->pas`, `IOMalloc`, freed in
+    `j7m_bo_free`), so verification compares table leaves against cached PAs and never calls
+    `getPhysicalSegment` again - a full pass is a table walk, not a descriptor walk;
+  - `j7m_verify_as()` walks every page of every live BO, rewrites only the leaves that do not
+    read back, and issues a single `j7m_pool_sync()` + `j7m_mmu_flush()` for the changed range
+    instead of one flush per BO;
+  - a BO that loses leaves still prints one line naming it
+    (`submit verify: bo=.. gva=.. pages=.. filled=.. first=.. unknown=.. tables=..`), and a
+    clean pass prints a heartbeat every 240 submits, so the next log says whether holes appear
+    between map and submit at all;
+  - `j7m_map_verify()` is silent unless the map path itself lost an entry, which keeps the log
+    readable now that it is no longer drawing on the panel.
+- Why the text is on the panel: the mute only existed in `_cnputs()` (the console-ring drain).
+  The video console paints from `_cnputc()` through `cons_ops[VC_CONS_OPS].putc`, so anything
+  that goes straight to the character path still drew after `a5fb_noconsole=1`. 0328 adds the
+  same guard to `_cnputc()` (`idx == VC_CONS_OPS && sweet_console_muted && !panic_active()`),
+  and keeps `_cnputs()`'s `sweet_log_append` ahead of it so the persistent log still has
+  everything. Panics and the debugger still draw.
+- `xnu.yml` now also publishes `osfmk/console/serial_console.c` in the `xnu-peek` artifact, so
+  the mute patch can be checked against the builder's own copy (`peek/skipped-patches.txt` names
+  any patch the builder skipped).
+- Next log decides: with `filled=0` on every pass and no `fault at`, the remaining slowness is
+  Mesa/CPU side; a `submit verify: bo=..` line names the BO that keeps getting unmasked, and its
+  `first=` VA plus the `free bo=..`/`client unmap` history says who clears it.
 # 2026-11-09 — J7 G3D: verify AS0 before submit, after every map (0327)
 
 - The 0326 image booted to Apple logo, then black, exactly as before 0326: the log is from

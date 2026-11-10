@@ -166,3 +166,34 @@ The console mute (stopping log text on the panel) is deferred to future work —
 `osfmk/console/serial_console.c` which is not in this repo. In 0327, `a5fb_noconsole=1`
 only mutes `_cnputs()` (the ring drain) but the video console paints through
 `_cnputc()` → `cons_ops[VC_CONS_OPS].putc`, so log text still appears on the panel.
+## 2026-11-10 — device result of 0328, and the real bottleneck (0329/0330)
+
+**Device observation (boot log + photos).** 0328 boots, does not panic, and the lock-screen clock is
+white instead of red: the compositor is on the GPU. It is still unusably slow (the clock jumped from
+7:11 to 11:xx while waiting, and the screen glitches). The boot log says why:
+
+- `frames=1 elapsed_ms=5321 fps=0.1` — every present waits out ~5.3 s, i.e. the job slot never
+  completes and the client gives up on its timeout.
+- `client map refused: a physical segment or the page-table pool (135 of 512 BO slots used, 512 of 512 page tables)`
+  — the 2 MiB page-table pool is exhausted.
+- then `fault at 4fcac00 in bo 47 ... faultstatus=000001c2 (translation level 2 execute)` and
+  `submit jc=... slot=1 failed status=-3 js=8`: the refused map left a window with no L3 table.
+- `CRASH backboardd ... submit_batch`: sweetgl dereferences the NULL BO, backboardd restarts, and
+  that restart is the glitching screen.
+
+So the 5-second stalls are pool exhaustion, not verification cost.
+
+**0329 — panel console.** 0328 gated `_cnputc` with `idx == VC_CONS_OPS`, but this board has no Apple
+video console: `cons_ops_index` stays on `SERIAL_CONS_OPS` and `serial_putc_options` falls back to
+`fbcon_putc()`, which is what paints the panel. The gate never fired, which is why the log text is
+still at the bottom of the panel. 0329 mutes every console op once the GUI has presented; `_cnputs()`
+has already appended the line to the persistent eMMC log by then and panics still draw.
+
+**0330 — page-table pool.** Ask for 16 MiB (4096 tables), halving until a physically contiguous block
+exists, recycle an L3 table as soon as its whole 2 MiB window is empty (free list reused by
+`j7m_table_new`), and store only the tables that exist on each sync instead of the whole pool.
+
+**Patch bookkeeping.** `0328-j7-g3d-verify-every-page.patch` never applied — it sorted after
+`0328-j7-g3d-verify-every-page-and-mute-console.patch` and the build log reported `Skipping patch
+... 0328-j7-g3d-verify-every-page.patch`, so the aggressive every-page verification that boots is the
+one in the `-and-mute-console` file. The duplicate file is removed so the tree has one 0328 again.

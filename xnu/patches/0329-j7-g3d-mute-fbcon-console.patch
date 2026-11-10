@@ -1,0 +1,30 @@
+From: j7 console
+Subject: a5xelte fbcon: stop the panel console, whichever console op draws it
+
+The boot log keeps running into the panel after the GUI starts.  0328 gated _cnputc only when
+cons_ops_index was VC_CONS_OPS, but this board has no Apple video console: cons_ops_index stays on
+SERIAL_CONS_OPS and serial_putc_options falls back to fbcon_putc(), which is what paints the panel,
+so the gate never fired.  Mute every console op once the GUI has presented; _cnputs() has already
+appended the line to the persistent eMMC log by then, and a panic or the debugger still draws.
+
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index cd63f3f..f30582b 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -250,11 +250,11 @@ _cnputc(char c, bool poll)
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	extern int sweet_console_muted;
+-	/* The video console paints through cons_ops[] from here, not only through _cnputs() (which
+-	 * drains the ring): without this the panel keeps showing log text after a5fb_noconsole=1.
+-	 * _cnputs() appends to the persistent log before it reaches this function, so the log keeps
+-	 * everything; a panic and the debugger still draw. */
+-	if (idx == VC_CONS_OPS && sweet_console_muted && !panic_active() && !in_debugger) {
++	/* Every console op paints here, not only the video one: this board keeps cons_ops_index on
++	 * SERIAL_CONS_OPS and serial_putc_options falls back to fbcon_putc(), which is what draws the
++	 * panel.  _cnputs() has already appended the line to the persistent log before this runs, so
++	 * the log keeps everything; a panic and the debugger still draw. */
++	if (sweet_console_muted && !panic_active() && !in_debugger) {
+ 		return;
+ 	}
+ #endif

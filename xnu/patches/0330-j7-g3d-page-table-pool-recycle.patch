@@ -1,0 +1,171 @@
+From: j7 speed
+Subject: j7 g3d: grow and recycle the page-table pool (the five second frame stalls)
+
+The 2026-11-10 boot log shows the pool dying, not the GPU: "client map refused: a physical segment
+or the page-table pool (135 of 512 BO slots used, 512 of 512 page tables)", then a translation fault
+at level 2 in bo 47, "submit ... failed status=-3 js=8" and a five second wait per present
+(frames=1 elapsed_ms=5321).  sweetgl then dereferences the NULL BO in submit_batch and backboardd
+crashes, which is the glitching screen.
+
+Two things were wrong.  The pool was 2 MiB (512 tables) and nothing ever returned a table: every
+freed surface left its L3 tables behind, so a compositor session that maps and frees a surface per
+glyph walked the pool to the end.  Fix: ask for 16 MiB (4096 tables), halving until a physically
+contiguous block is available, and recycle an L3 table as soon as its whole 2 MiB window is empty.
+
+Also stop storing the whole pool on every sync: with 16 MiB that would cost more than the tables it
+protects.  Only the tables that have been handed out are pushed.
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+index 60ade64..c75209e 100644
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -302,7 +302,9 @@ j7g3d_publish(IOService *service, int level)
+ #define J7M_MAX_BOS     512
+ #define J7M_VA_LO       0x01000000ULL
+ #define J7M_VA_HI       0x80000000ULL   /* MMU_FEATURES 0x2821: 33 VA bits; stay well below */
+-#define J7M_PT_BYTES    (2u * 1024 * 1024)
++#define J7M_PT_BYTES    (16u * 1024 * 1024)  /* pool ceiling, 4096 tables */
++#define J7M_PT_MIN      (2u * 1024 * 1024)   /* never below what the earlier boots used */
++#define J7M_PT_TABLES   (J7M_PT_BYTES / 0x1000u)
+ #define J7M_PAGE        0x1000ULL        /* the GPU's page size, whatever the CPU's is */
+ 
+ #define J7M_JOB_IRQ_RAWSTAT 0x1000
+@@ -372,15 +374,26 @@ j7m_note(char kind, unsigned slot, uint64_t va, uint64_t size)
+     e->size = size;
+ }
+ 
++/* Tables whose whole 2 MiB window went away.  Handed out again before the pool grows, so a session
++ * that keeps mapping and freeing surfaces stays inside the pool. */
++static uint64_t gJ7MPoolFree[J7M_PT_TABLES];
++static uint32_t gJ7MPoolFreeCount;
++
+ /* PA of a new zeroed 4 KiB table, or 0. */
+ static uint64_t
+ j7m_table_new(void)
+ {
+-    if (gJ7M.poolUsed >= gJ7M.poolTables) {
+-        return 0;
++    uint64_t pa;
++
++    if (gJ7MPoolFreeCount) {
++        pa = gJ7MPoolFree[--gJ7MPoolFreeCount];
++    } else {
++        if (gJ7M.poolUsed >= gJ7M.poolTables) {
++            return 0;
++        }
++        pa = gJ7M.poolPA + (uint64_t)gJ7M.poolUsed * J7M_PAGE;
++        gJ7M.poolUsed++;
+     }
+-    uint64_t pa = gJ7M.poolPA + (uint64_t)gJ7M.poolUsed * J7M_PAGE;
+-    gJ7M.poolUsed++;
+     bzero(j7m_table(pa), J7M_PAGE);
+     return pa;
+ }
+@@ -390,19 +403,37 @@ j7m_pool_init(void)
+ {
+     bzero(&gJ7M.bos, sizeof(gJ7M.bos));
+     gJ7M.poolUsed = 0;
+-    gJ7M.pool = IOBufferMemoryDescriptor::withOptions(
+-        kIODirectionInOut | kIOMemoryPhysicallyContiguous, J7M_PT_BYTES, J7M_PAGE);
+-    if (!gJ7M.pool || !gJ7M.pool->getBytesNoCopy()) {
+-        return false;
++    gJ7MPoolFreeCount = 0;
++    /* 2 MiB (512 tables) was sized for the selftest.  A compositor session maps a surface per glyph
++     * and the pool never handed a table back, so minutes in every map was refused ("512 of 512 page
++     * tables"); each refused map left a job slot faulting and the frame died on a five second wait.
++     * Ask for 16 MiB and halve until a physically contiguous block is actually there. */
++    for (uint32_t bytes = J7M_PT_BYTES; bytes >= J7M_PT_MIN; bytes >>= 1) {
++        gJ7M.pool = IOBufferMemoryDescriptor::withOptions(
++            kIODirectionInOut | kIOMemoryPhysicallyContiguous, bytes, J7M_PAGE);
++        if (!gJ7M.pool || !gJ7M.pool->getBytesNoCopy()) {
++            if (gJ7M.pool) {
++                gJ7M.pool->release();
++                gJ7M.pool = NULL;
++            }
++            continue;
++        }
++        IOByteCount seg = 0;
++        gJ7M.poolPA = gJ7M.pool->getPhysicalSegment(0, &seg, kIOMemoryMapperNone);
++        if (!gJ7M.poolPA || seg < bytes || (gJ7M.poolPA & (J7M_PAGE - 1))) {
++            gJ7M.pool->release();
++            gJ7M.pool = NULL;
++            gJ7M.poolPA = 0;
++            continue;
++        }
++        gJ7M.poolVA = static_cast<uint8_t *>(gJ7M.pool->getBytesNoCopy());
++        gJ7M.poolTables = bytes / static_cast<uint32_t>(J7M_PAGE);
++        bzero(gJ7M.poolVA, bytes);
++        break;
+     }
+-    IOByteCount seg = 0;
+-    gJ7M.poolPA = gJ7M.pool->getPhysicalSegment(0, &seg, kIOMemoryMapperNone);
+-    if (!gJ7M.poolPA || seg < J7M_PT_BYTES || (gJ7M.poolPA & (J7M_PAGE - 1))) {
++    if (!gJ7M.pool || !gJ7M.poolVA || !gJ7M.poolTables) {
+         return false;
+     }
+-    gJ7M.poolVA = static_cast<uint8_t *>(gJ7M.pool->getBytesNoCopy());
+-    gJ7M.poolTables = J7M_PT_BYTES / J7M_PAGE;
+-    bzero(gJ7M.poolVA, J7M_PT_BYTES);
+     gJ7M.root = j7m_table_new();
+     return gJ7M.root != 0;
+ }
+@@ -411,7 +442,12 @@ j7m_pool_init(void)
+ static void
+ j7m_pool_sync(void)
+ {
+-    gJ7M.pool->performOperation(kIOMemoryIncoherentIOStore, 0, J7M_PT_BYTES);
++    /* Only the tables that exist: a whole-pool store on every map and every submit would cost more
++     * than the tables it is protecting now that the pool can be 16 MiB. */
++    const vm_size_t bytes = static_cast<vm_size_t>(gJ7M.poolUsed) * static_cast<vm_size_t>(J7M_PAGE);
++    if (bytes) {
++        gJ7M.pool->performOperation(kIOMemoryIncoherentIOStore, 0, bytes);
++    }
+     __sync_synchronize();
+ }
+ 
+@@ -465,6 +501,37 @@ j7m_map_page(uint64_t va, uint64_t pa)
+     return j7m_map_page_at(va, pa, false);
+ }
+ 
++/* Give an L3 table back when its whole 2 MiB window is empty: clear the entry that points at it and
++ * push the page on the free list.  A window still shared with another BO keeps its table. */
++static void
++j7m_release_l3(uint64_t va, uint64_t l3)
++{
++    if (!j7m_in_pool(l3) || gJ7MPoolFreeCount >= J7M_PT_TABLES) {
++        return;
++    }
++    const uint64_t *leaves = j7m_table(l3);
++    for (unsigned i = 0; i < 512; i++) {
++        if (leaves[i] & 3) {
++            return;
++        }
++    }
++    uint64_t parent = gJ7M.root;
++    const unsigned shifts[3] = { 39, 30, 21 };
++    for (unsigned level = 0; level < 2; level++) {
++        const uint64_t e = j7m_table(parent)[(va >> shifts[level]) & 0x1ff];
++        if (!(e & 3) || !j7m_in_pool(e & 0x0000fffffffff000ULL)) {
++            return;
++        }
++        parent = e & 0x0000fffffffff000ULL;
++    }
++    uint64_t &slot = j7m_table(parent)[(va >> 21) & 0x1ff];
++    if ((slot & 0x0000fffffffff000ULL) != l3) {
++        return;
++    }
++    slot = 0;
++    gJ7MPoolFree[gJ7MPoolFreeCount++] = l3;
++}
++
+ static void
+ j7m_unmap_page(uint64_t va)
+ {
+@@ -478,6 +545,7 @@ j7m_unmap_page(uint64_t va)
+         table = e & 0x0000fffffffff000ULL;
+     }
+     j7m_table(table)[(va >> 12) & 0x1ff] = 0;
++    j7m_release_l3(va, table);
+ }
+ 
+ /* Walk our own tables exactly the way the GPU's walker does and return the page's PA (0 turned

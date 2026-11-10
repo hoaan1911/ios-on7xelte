@@ -182,3 +182,19 @@ Stage the iPhone 8 Plus userland in an exact-size HFSX USERDATA image, select it
 - Note: the console mute patch (`a5fb_noconsole=1` stopping log text on panel) is deferred
   to future work — it targets `osfmk/console/serial_console.c` which is not in this repo.
   The panel text issue remains as known known in 0327.
+# 2026-11-10 — J7 G3D: 0328 device result, panel console mute (0329), pool recycle (0330)
+
+- **Device observation:** 0328 (the aggressive every-page verification that the build actually
+  applied) boots on the J7 Prime without a panic and the lock-screen clock is GPU-rendered (white,
+  not the CPU path's red). It is still very slow and the screen glitches.
+- **Boot log evidence:** `frames=1 elapsed_ms=5321` per present; `client map refused ... 512 of 512
+  page tables`; `fault at 4fcac00 ... translation level 2 execute`; `submit ... failed status=-3
+  js=8`; `CRASH backboardd ... submit_batch`. The 5 s stalls are page-table pool exhaustion
+  (2 MiB, 512 tables, nothing ever returned), not the cost of verification.
+- **0329** mutes `_cnputc` for every console op, not only `VC_CONS_OPS`: on this board
+  `cons_ops_index` stays on `SERIAL_CONS_OPS` and `serial_putc_options` falls back to
+  `fbcon_putc()`, which is what painted the panel, so 0328's gate never fired.
+- **0330** asks for a 16 MiB pool (4096 tables, halving until a contiguous block exists), recycles an
+  L3 table when its whole 2 MiB window is empty, and syncs only the tables that exist.
+- `0328-j7-g3d-verify-every-page.patch` was never applied (build log: `Skipping patch`); it is
+  removed so `0328-j7-g3d-verify-every-page-and-mute-console.patch` is the single 0328 again.

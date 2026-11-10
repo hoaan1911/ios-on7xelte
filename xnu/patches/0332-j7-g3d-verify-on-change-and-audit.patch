@@ -1,0 +1,160 @@
+From: j7 speed
+Subject: j7 g3d: stop paying for the whole-AS verify, and name whoever clears a live mapping
+
+The 2026-11-10 boot log with 0330 shows the pool is not the whole story: the pool is 4096 tables and
+maps succeed, yet submits still fault ("fault at 3010400 in bo 5 ... translation level 2 execute",
+"walk ... l2=... l3=0 leaf=0") and j7m_repair rewrites the same BO's leaves again and again
+("fault repair: bo=44 va=39c1000 fixed=95"), while the table count climbs 705 -> 1863 -> 2546 ->
+2914 of 4096.  A whole 2 MiB window entry is being cleared under a BO that is still live.
+
+Three changes:
+
+- audit: clear-path callers (j7m_unmap_page, j7m_release_l3) now check whether a live BO still owns
+  the range they are about to clear and print one line naming it.  A BO being torn down is exempt.
+
+- verify: 0328 walked every page of every BO on every submit (checked=17520 at 4 fps).  The tables
+  only change when this driver writes or clears a mapping, so give the driver a map generation and
+  re-walk only when it moved, plus once every 32nd submit as a safety net.
+
+- pool: 16 MiB (4096 tables) was still exhausted in the fault-repair churn; ask for 64 MiB and say
+  once when the pool is actually full, so exhaustion stops being a silent 5 s timeout.
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+index c75209e..2e5b791 100644
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -302,8 +302,8 @@ j7g3d_publish(IOService *service, int level)
+ #define J7M_MAX_BOS     512
+ #define J7M_VA_LO       0x01000000ULL
+ #define J7M_VA_HI       0x80000000ULL   /* MMU_FEATURES 0x2821: 33 VA bits; stay well below */
+-#define J7M_PT_BYTES    (16u * 1024 * 1024)  /* pool ceiling, 4096 tables */
+-#define J7M_PT_MIN      (2u * 1024 * 1024)   /* never below what the earlier boots used */
++#define J7M_PT_BYTES    (64u * 1024 * 1024)  /* pool ceiling, 16384 tables */
++#define J7M_PT_MIN      (4u * 1024 * 1024)   /* never below what the earlier boots used */
+ #define J7M_PT_TABLES   (J7M_PT_BYTES / 0x1000u)
+ #define J7M_PAGE        0x1000ULL        /* the GPU's page size, whatever the CPU's is */
+ 
+@@ -350,6 +350,10 @@ static struct {
+     bool mmuLive;
+     bool mmuReady;        /* AS0 programmed after serve_start: protects the first client submit */
+     uint32_t seq;
++    /* Bumped by every leaf/entry this driver writes or clears: the whole-AS verify only has to run
++     * again when one of these moved (or every so often, as a safety net). */
++    uint32_t mapGen;
++    uint32_t verifyGen;
+     bool inflight;
+     uint32_t inflightSlot;
+     struct J7MaliBo bos[J7M_MAX_BOS];
+@@ -389,6 +393,12 @@ j7m_table_new(void)
+         pa = gJ7MPoolFree[--gJ7MPoolFreeCount];
+     } else {
+         if (gJ7M.poolUsed >= gJ7M.poolTables) {
++            static bool said;
++            if (!said) {
++                said = true;
++                IOLog("J7 G3D: page-table pool exhausted (%u of %u tables): further maps refused\n",
++                    gJ7M.poolUsed, gJ7M.poolTables);
++            }
+             return 0;
+         }
+         pa = gJ7M.poolPA + (uint64_t)gJ7M.poolUsed * J7M_PAGE;
+@@ -403,6 +413,8 @@ j7m_pool_init(void)
+ {
+     bzero(&gJ7M.bos, sizeof(gJ7M.bos));
+     gJ7M.poolUsed = 0;
++    gJ7M.mapGen = 0;
++    gJ7M.verifyGen = 0xffffffffu;    /* differs from mapGen: the first submit verifies */
+     gJ7MPoolFreeCount = 0;
+     /* 2 MiB (512 tables) was sized for the selftest.  A compositor session maps a surface per glyph
+      * and the pool never handed a table back, so minutes in every map was refused ("512 of 512 page
+@@ -492,6 +504,7 @@ j7m_map_page_at(uint64_t va, uint64_t pa, bool replace)
+     }
+     /* Mali-LPAE leaf: read/write, outer-shareable, attribute index 0, type 1 (as the A5 test). */
+     leaf = pa | 0x2c1;
++    gJ7M.mapGen++;
+     return true;
+ }
+ 
+@@ -501,6 +514,34 @@ j7m_map_page(uint64_t va, uint64_t pa)
+     return j7m_map_page_at(va, pa, false);
+ }
+ 
++/* A cleared mapping that a live BO still owns is this driver unmapping memory the GPU is about to
++ * read: the fault-repair loop has been papering over exactly that, one 5 s slot timeout at a time.
++ * Name the BO and the caller once, so the next log says who does it. */
++#define J7M_AUDIT_LOG   16              /* one line per hit, then quiet */
++
++static const struct J7MaliBo *gJ7MUnmapping;   /* BO being torn down: not an audit hit */
++
++static void
++j7m_audit_cleared(uint64_t va, uint64_t len, const char *what)
++{
++    static unsigned shown;
++
++    if (shown >= J7M_AUDIT_LOG) {
++        return;
++    }
++    for (unsigned i = 0; i < J7M_MAX_BOS; i++) {
++        const struct J7MaliBo *bo = &gJ7M.bos[i];
++        if (!bo->used || bo == gJ7MUnmapping || va + len <= bo->va || va >= bo->va + bo->size) {
++            continue;
++        }
++        shown++;
++        IOLog("J7 G3D: audit: %s cleared %llx+%llx but live bo=%u owns %llx+%llx\n", what,
++            (unsigned long long)va, (unsigned long long)len, i + 1,
++            (unsigned long long)bo->va, (unsigned long long)bo->size);
++        return;
++    }
++}
++
+ /* Give an L3 table back when its whole 2 MiB window is empty: clear the entry that points at it and
+  * push the page on the free list.  A window still shared with another BO keeps its table. */
+ static void
+@@ -528,6 +569,7 @@ j7m_release_l3(uint64_t va, uint64_t l3)
+     if ((slot & 0x0000fffffffff000ULL) != l3) {
+         return;
+     }
++    j7m_audit_cleared(va & ~((1ULL << 21) - 1), 1ULL << 21, "release-l3");
+     slot = 0;
+     gJ7MPoolFree[gJ7MPoolFreeCount++] = l3;
+ }
+@@ -544,7 +586,9 @@ j7m_unmap_page(uint64_t va)
+         }
+         table = e & 0x0000fffffffff000ULL;
+     }
++    j7m_audit_cleared(va & ~(J7M_PAGE - 1), J7M_PAGE, "unmap");
+     j7m_table(table)[(va >> 12) & 0x1ff] = 0;
++    gJ7M.mapGen++;
+     j7m_release_l3(va, table);
+ }
+ 
+@@ -731,6 +775,13 @@ j7m_verify_as(void)
+         return;
+     }
+     passes++;
++    /* 0328 walked every page of every BO on every submit - 17k lookups per submit on a path that
++     * was already at 4 fps.  The tables only change when this driver writes or clears a mapping, so
++     * re-walk when that happened and once every 32nd submit as a safety net. */
++    if (gJ7M.mapGen == gJ7M.verifyGen && (passes % 32) != 0) {
++        return;
++    }
++    gJ7M.verifyGen = gJ7M.mapGen;
+     for (unsigned i = 0; i < J7M_MAX_BOS; i++) {
+         struct J7MaliBo *bo = &gJ7M.bos[i];
+         uint64_t first = 0;
+@@ -894,6 +945,7 @@ j7m_bo_free(struct J7MaliBo *bo)
+ {
+     j7m_note('f', static_cast<unsigned>(bo - gJ7M.bos) + 1, bo->va, bo->size);
+     unsigned kept = 0;
++    gJ7MUnmapping = bo;
+     for (uint64_t u = 0; u < bo->size; u += J7M_PAGE) {
+         /* Only clear a leaf that still maps this BO's own page: a leaf that maps something else
+          * belongs to another live BO and clearing it would unmask that BO for the GPU. */
+@@ -911,6 +963,7 @@ j7m_bo_free(struct J7MaliBo *bo)
+                 (unsigned)(bo - gJ7M.bos) + 1, (unsigned long long)bo->va, kept);
+         }
+     }
++    gJ7MUnmapping = NULL;
+     j7m_pool_sync();
+     (void)j7m_mmu_flush(bo->va, bo->size);
+     if (bo->md) {

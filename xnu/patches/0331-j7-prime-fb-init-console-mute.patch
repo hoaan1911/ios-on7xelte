@@ -1,0 +1,36 @@
+From: j7 console and speed
+Subject: a5xelte fb: initialize the console-mute flag so a5fb_noconsole actually mutes
+
+The panel kept the boot log at the bottom after the first swap even with a5fb_noconsole=1.
+AppleCLCD::present() mutes the console in a "first swap" block guarded by fConsolePaused, but that
+member is never initialized: the IOKit object is not zero-filled and there is no constructor for it,
+so a first swap that found it non-zero skipped the whole block (mute, and the panel clear with it)
+for the rest of the boot.  Set the flag (and the other uninitialized state the vsync path reads)
+explicitly in start(), and log the mute so the next boot log says whether it ran.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2f969ac..f9f58c7 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -293,6 +293,13 @@ AppleCLCD::start(IOService *provider)
+ #else
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ #endif
++	/* The IOKit object is not zero-filled and none of these are constructor-initialized.  A
++	 * fConsolePaused that happened to read true skipped the console mute for the whole boot, which
++	 * is why the panel kept the boot log at the bottom after a5fb_noconsole=1. */
++	fConsolePaused = false;
++	fDirty = false;
++	fPowerOff = false;
++	fFadeStep = 0;
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 	sweet_fb_copy_init();
+ #endif
+@@ -642,6 +649,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			/* Not PE_initialize_console(kPEDisableScreen): its console switch
+ 			 * writes the read-only-late cons_ops_index and panics. */
+ 			sweet_console_muted = 1;
++			IOLog("A5XELTE FB: console muted (a5fb_noconsole), panel cleared\n");
+ 			/* Whatever the console drew before this first swap stays on screen wherever the GUI
+ 			 * does not draw (boot log lines at the bottom, junk at the top): start from black.
+ 			 * fPixels is the physical map of the whole panel, scaledCopy() writes all of it too. */

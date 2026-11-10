@@ -197,3 +197,33 @@ exists, recycle an L3 table as soon as its whole 2 MiB window is empty (free lis
 `0328-j7-g3d-verify-every-page-and-mute-console.patch` and the build log reported `Skipping patch
 ... 0328-j7-g3d-verify-every-page.patch`, so the aggressive every-page verification that boots is the
 one in the `-and-mute-console` file. The duplicate file is removed so the tree has one 0328 again.
+
+## 2026-11-10 (second boot of 0328+0329+0330) — pool was not the cause
+
+**Device observation:** console text still at the bottom, only marginally faster, and it panics after
+a while. The boot log has no panic: `debug_log_init: Error!! gPanicBase is still not initialized`
+means panic-time logging is not reaching the persistent log, so the log ends mid-run.
+
+**What the log proves**
+
+- `J7 G3D: serving user clients (... page-table pool 4096 tables)` and maps of 4096 continued to be
+  accepted (`tables 4/4096`), so 0330 did what it said. It did **not** fix the stalls: submits still
+  fault (`fault at 3010400 in bo 5 ... translation level 2 execute`, `walk l2=83e71003 l3=0 leaf=0`)
+  and `fault repair: bo=44 va=39c1000 fixed=95` rewrites the same BO's leaves repeatedly, with the
+  table count climbing 705 -> 1863 -> 2546 -> 2914 of 4096. A **whole 2 MiB window entry** is being
+  cleared under a BO that is still live, and repair only patches the pages the next job touches.
+- `frames=1 elapsed_ms=5328` is a 300-callback window, i.e. mostly idle (no swap, no frame); the busy
+  windows show `frames=22 elapsed_ms=5549` (about 4 fps) with `avg_copy_us=12000`. So the 5 s number
+  is a frame-rate metric artefact, not a per-frame wait; the real cost is the fault/repair churn.
+- The console mute never ran: `AppleCLCD::present()` mutes inside a `fConsolePaused` block, and that
+  member is never initialized (the IOKit allocation is not zero-filled), so a first swap that read
+  it as true skipped the mute - and the panel clear with it - for the whole boot.
+
+**0331** initializes `fConsolePaused`, `fDirty`, `fPowerOff` and `fFadeStep` in `start()` and logs the
+mute, so the next log answers "did the mute run" directly.
+
+**0332** stops paying for the 17k-page whole-AS verify on every submit (it re-walks only when the
+driver's map generation moved, plus every 32nd submit), audits both clear paths and prints
+`audit: <caller> cleared <va>+<len> but live bo=<n> owns <va>+<len>` when a live BO is hit (that line
+is the answer to the leaf/entry vanishing), and raises the pool ceiling to 64 MiB with a one-shot
+"pool exhausted" line so exhaustion is never a silent timeout again.

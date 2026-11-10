@@ -227,3 +227,35 @@ driver's map generation moved, plus every 32nd submit), audits both clear paths 
 `audit: <caller> cleared <va>+<len> but live bo=<n> owns <va>+<len>` when a live BO is hit (that line
 is the answer to the leaf/entry vanishing), and raises the pool ceiling to 64 MiB with a one-shot
 "pool exhausted" line so exhaustion is never a silent timeout again.
+
+## 2026-11-10 panic on the 0331+0332 build — symbolicated
+
+The device panicked after a while, with the panel still drawing the "slide to power off" UI. That
+panic **is** captured on the panel but not in the persistent log (`debug_log_init` says
+`gPanicBase is still not initialized`, so panic-time kprintf has nowhere to go).
+
+```
+Kernel data abort at pc 0xfffffff007a4ab88, lr 0xfffffff007a48c88
+esr 0x96000004   (EC 0x25 data abort, DFSC 0b000100 = translation fault, level 0)
+far 0x00000d000b2a1000
+```
+
+Resolved against `kernel.development.a5xelte` from xnu run 42804501140 (`__TEXT` vmaddr
+`0xfffffff007004000`): **`j7m_unmap_page+0x58`, called from `j7m_map_user+0xc68`**.
+
+`j7m_unmap_page` walked the page tables trusting every entry (unlike `j7m_lookup`, which checks
+`j7m_in_pool()` at each level). One slot holding anything that is not a pool table — a leaf, or the
+junk that also makes leaves disappear — became `j7m_table(garbage)`, i.e. a wild pointer, and the
+CPU took the abort inside the **map** path. That also means the map path itself is where the
+corruption surfaces, which fits the table count climbing while leaves vanish under live BOs.
+
+**0333** guards all three levels (and logs the offending entry once instead of dereferencing it),
+removes the five-second stall (a slot that is already stopped/faulted never raises the completion
+interrupt, so the wait used to burn the whole client timeout — now 2 ms of grace and report it
+dead), and raises the per-job repair ceiling 8 -> 64.
+
+**0334 + `tools/mkadt_j7prime.py --iphone8plus`** let the internal resolution exceed the panel, so
+the iPhone 8 Plus canvas (1242x2208 @3x, display-scale 3) is rendered and shrunk to 1080x1920. The
+default surface is a view of the panel frame buffer and stays clamped to the panel.
+Boot args for it: `sweetfb_scale=1 sweetfb_lw=1242 sweetfb_lh=2208`.
+Note the cost: 2.7x the pixels of 750x1334, so this is not the setting for speed.

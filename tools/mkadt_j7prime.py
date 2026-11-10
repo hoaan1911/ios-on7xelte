@@ -61,7 +61,7 @@ def apply_identity(root, ident, product_adt):
               f'model name and iPad wording', file=sys.stderr)
 
 
-def build(board='d21ap', product_adt=None, iphone8=False):
+def build(board='d21ap', product_adt=None, iphone8=False, iphone8plus=False):
     root = mkadt.build(seed=os.urandom(64), qemu=True)
     # 'samsung,a5xelte' stays first (apply_identity): the A5XELTE kernel's platform expert matches on it.
     ident = IDENTITIES[board]
@@ -69,7 +69,15 @@ def build(board='d21ap', product_adt=None, iphone8=False):
     # about half the pixels of the 1080x1920 panel for CoreAnimation's CPU renderer. The kernel
     # scales it up to the panel; its boot args must be sweetfb_scale=1 sweetfb_lw=750
     # sweetfb_lh=1334 (patch 0315). The canvas below and those two numbers must agree.
-    canvas = (750, 1334) if iphone8 else (1080, 1920)
+    # --iphone8plus: 414x736 points at @3x (1242x2208), the iPhone 8 Plus canvas.  The panel is
+    # 1080x1920, so the kernel shrinks it (boot args sweetfb_scale=1 sweetfb_lw=1242
+    # sweetfb_lh=2208).  Same aspect ratio as the panel, so nothing is letterboxed.
+    if iphone8plus:
+        canvas = (1242, 2208)
+    elif iphone8:
+        canvas = (750, 1334)
+    else:
+        canvas = (1080, 1920)
     chosen = child(root, 'chosen')
     buttons = child(root, 'buttons')
     # Samsung's GPA2-5 mechanical key is the iOS Home (Menu) button.
@@ -159,16 +167,17 @@ def build(board='d21ap', product_adt=None, iphone8=False):
         ('reg', mkadt.u64(0x13540000, 0x2000)),
     ]))
     apply_identity(root, ident, product_adt)
-    if iphone8:
-        set_prop(chosen, 'display-scale', mkadt.u32(2))
+    if iphone8 or iphone8plus:
+        scale = 3 if iphone8plus else 2
+        set_prop(chosen, 'display-scale', mkadt.u32(scale))
         try:
             product = child(root, 'product')
         except ValueError:
-            print('warning: --iphone8 without a /product node: artwork-device-subtype and '
-                  'artwork-scale-factor not set', file=sys.stderr)
+            print(f'warning: --{"iphone8plus" if iphone8plus else "iphone8"} without a /product node: '
+                  'artwork-device-subtype and artwork-scale-factor not set', file=sys.stderr)
         else:
-            set_prop(product, 'artwork-device-subtype', mkadt.u32(1334))
-            set_prop(product, 'artwork-scale-factor', mkadt.u32(2))
+            set_prop(product, 'artwork-device-subtype', mkadt.u32(canvas[1]))
+            set_prop(product, 'artwork-scale-factor', mkadt.u32(scale))
     return root
 
 
@@ -182,7 +191,11 @@ if __name__ == '__main__':
     parser.add_argument('--iphone8', action='store_true',
                         help='present an iPhone 8 screen (750x1334 @2x) that the kernel scales to the panel '
                              '(boot args sweetfb_scale=1 sweetfb_lw=750 sweetfb_lh=1334)')
+    parser.add_argument('--iphone8plus', action='store_true',
+                        help='present an iPhone 8 Plus screen (1242x2208 @3x) that the kernel shrinks to the '
+                             'panel (boot args sweetfb_scale=1 sweetfb_lw=1242 sweetfb_lh=2208)')
     args = parser.parse_args()
-    blob = adt.serialize(build(args.board, args.product_adt or RESEARCH / f'{args.board}.adt', args.iphone8))
+    blob = adt.serialize(build(args.board, args.product_adt or RESEARCH / f'{args.board}.adt',
+                               args.iphone8, args.iphone8plus))
     args.output.write_bytes(blob)
     print(f'{args.output}: {len(blob)} bytes')

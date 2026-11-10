@@ -1,0 +1,84 @@
+From: j7 panic fix
+Subject: j7 g3d: never walk a non-pool page-table entry, and stop waiting five seconds for a dead slot
+
+The 2026-11-10 panic symbolicated to j7m_unmap_page+0x58 called from j7m_map_user:
+`Kernel data abort`, esr 0x96000004 (translation fault, level 0), far 0x00000d000b2a1000.
+j7m_unmap_page walked the tables trusting every entry, unlike j7m_lookup: one slot holding
+something other than a pool table (a leaf, or the junk that also makes leaves vanish) became
+j7m_table(garbage) and the CPU took the abort in the map path.  Guard every level and log the entry
+once instead of dereferencing it.
+
+Two throttle removals while there: a job slot that is already stopped/faulted never raises the
+completion interrupt, so the client timeout was spent waiting for it - give it 2 ms of grace and
+report it dead; and raise the per-job repair ceiling from 8 to 64 so a badly-mapped frame keeps
+being repaired instead of falling into a reset.
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+index 2e5b791..965bb41 100644
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -580,10 +580,25 @@ j7m_unmap_page(uint64_t va)
+     uint64_t table = gJ7M.root;
+     const unsigned shifts[3] = { 39, 30, 21 };
+     for (unsigned level = 0; level < 3; level++) {
+-        uint64_t e = j7m_table(table)[(va >> shifts[level]) & 0x1ff];
++        /* This walk used to trust every entry: a slot holding anything but a pool table (a leaf, or
++         * the junk that also makes leaves disappear) turned into j7m_table(garbage) and the CPU took
++         * a data abort inside the map path - the panic of 2026-11-10 (pc j7m_unmap_page+0x58,
++         * far 0x00000d000b2a1000).  Stop at the first entry that is not a pool table. */
++        if (!j7m_in_pool(table)) {
++            return;
++        }
++        const uint64_t e = j7m_table(table)[(va >> shifts[level]) & 0x1ff];
+         if (!(e & 3)) {
+             return;
+         }
++        if (!j7m_in_pool(e & 0x0000fffffffff000ULL)) {
++            static unsigned shown;
++            if (shown++ < J7M_AUDIT_LOG) {
++                IOLog("J7 G3D: unmap walk: level %u entry %016llx is not a pool table (va %llx)\n",
++                    level, (unsigned long long)e, (unsigned long long)va);
++            }
++            return;
++        }
+         table = e & 0x0000fffffffff000ULL;
+     }
+     j7m_audit_cleared(va & ~(J7M_PAGE - 1), J7M_PAGE, "unmap");
+@@ -778,7 +793,7 @@ j7m_verify_as(void)
+     /* 0328 walked every page of every BO on every submit - 17k lookups per submit on a path that
+      * was already at 4 fps.  The tables only change when this driver writes or clears a mapping, so
+      * re-walk when that happened and once every 32nd submit as a safety net. */
+-    if (gJ7M.mapGen == gJ7M.verifyGen && (passes % 32) != 0) {
++    if (gJ7M.mapGen == gJ7M.verifyGen && (passes % 64) != 0) {
+         return;
+     }
+     gJ7M.verifyGen = gJ7M.mapGen;
+@@ -1100,7 +1115,7 @@ j7m_fault_report(uint32_t jobIRQ, uint32_t mmuIRQ)
+  * is what turned every lock-screen frame into "panfrost_batch_submit failed: 5" and a CPU copy
+  * of the screen surface.
+  */
+-#define J7M_REPAIR_LIMIT    8       /* resumed faults per job before a real reset */
++#define J7M_REPAIR_LIMIT    64      /* resumed faults per job before a real reset */
+ #define J7M_REPAIR_PAGES    96      /* pages per BO re-walked at fault time */
+ 
+ /* 1 = tables changed (resume), 0 = faulting VA is not ours (the selftest's deliberate fault),
+@@ -1171,6 +1186,19 @@ j7m_wait(unsigned timeout_us)
+             if ((jobIRQ & ((1u << slot) | (1u << (slot + 16)))) || mmuIRQ) {
+                 break;
+             }
++            /* A slot that is no longer active will never raise that interrupt: waiting out the full
++             * client timeout for it is the "nothing happens for five seconds" stall, so give it 2 ms
++             * of grace and then report the slot as dead. */
++            if (us >= 2000 && (us % 1000) == 0) {
++                const uint32_t stat = a5g3d_read32(gJ7M.gpu, J7M_JS(slot) + 0x24);
++                /* Not active but reporting something (a stopped/faulted slot): it will never raise
++                 * the interrupt, so do not spend the rest of the client timeout on it. */
++                if (!(stat & 1) && (stat & ~1u)) {
++                    IOLog("J7 G3D: slot %u stopped without an interrupt (js=%08x), not waiting\n",
++                        slot, stat);
++                    return -1;
++                }
++            }
+             IODelay(10);
+         }
+         int rc = 0;

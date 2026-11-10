@@ -1,0 +1,40 @@
+From: j7 8 plus
+Subject: a5xelte fb: accept an iPhone 8 Plus canvas (1242x2208) and shrink it to the panel
+
+The presented size was limited to the panel, so only a smaller internal resolution could be used
+(750x1334 for the iPhone 8).  Allow the canvas up to twice the panel and let scaledCopy shrink
+1242x2208 to 1080x1920; the default surface is a view of the panel frame buffer, so it stays
+clamped to the panel to avoid writing past it.  ADT: --iphone8plus sets the 1242x2208 canvas with
+display-scale 3.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f9f58c7..32ce4b2 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -235,7 +235,9 @@ AppleCLCD::start(IOService *provider)
+ 		uint32_t lw = 0, lh = 0;
+ 		PE_parse_boot_argn("sweetfb_lw", &lw, sizeof(lw));
+ 		PE_parse_boot_argn("sweetfb_lh", &lh, sizeof(lh));
+-		if (lw >= 320 && lw <= fWidth && lh >= 480 && lh <= fHeight) {
++		/* The canvas may be larger than the panel: the iPhone 8 Plus renders 1242x2208 and
++		 * present() shrinks it to the panel.  Two panels' worth is the sanity bound. */
++		if (lw >= 320 && lw <= fWidth * 2 && lh >= 480 && lh <= fHeight * 2) {
+ 			fLogicalW = lw;
+ 			fLogicalH = lh;
+ 		}
+@@ -251,9 +253,12 @@ AppleCLCD::start(IOService *provider)
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	/* The default surface must have the presented size (a mismatch left
+-	 * every swap layer empty); scaled, it is the panel's top-left part. */
+-	fSurface = sweet_surface_create_physical(fPhys, fScaled ? fLogicalW : fWidth,
+-	    fScaled ? fLogicalH : fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
++	 * every swap layer empty); scaled, it is the panel's top-left part.  It is a view of the panel
++	 * frame buffer, so it stays clamped to the panel even when the presented size is larger. */
++	const uint32_t surfaceW = fScaled && fLogicalW < fWidth ? fLogicalW : fWidth;
++	const uint32_t surfaceH = fScaled && fLogicalH < fHeight ? fLogicalH : fHeight;
++	fSurface = sweet_surface_create_physical(fPhys, surfaceW, surfaceH, fRowBytes,
++	    SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {

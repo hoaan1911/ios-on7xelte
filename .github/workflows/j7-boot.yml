@@ -21,6 +21,10 @@ on:
         description: "Internal resolution: render an iPhone 8 screen (750x1334 @2x) and scale it to the panel (needs the kernel built with 0315). Adds sweetfb_scale=1 sweetfb_lw=750 sweetfb_lh=1334 to the boot args."
         type: boolean
         default: false
+      iphone8plus:
+        description: "Internal resolution: render an iPhone 8 Plus screen (1242x2208 @3x) and shrink it to the 1080x1920 panel (needs 0334). Boot args: sweetfb_scale=1 sweetfb_lw=1242 sweetfb_lh=2208."
+        type: boolean
+        default: false
 
 # Downloading the xnu run's artifact (run-id) uses the workflow token; in a private repository that
 # needs actions: read (the repository's default token permissions do not include it).
@@ -88,7 +92,10 @@ jobs:
           ls -l kernel
           cmdline="${{ inputs.cmdline }}"
           iphone8=""
-          if [ "${{ inputs.iphone8 }}" = "true" ]; then
+          if [ "${{ inputs.iphone8plus }}" = "true" ]; then
+            iphone8="--iphone8plus"
+            cmdline="$cmdline sweetfb_scale=1 sweetfb_lw=1242 sweetfb_lh=2208"
+          elif [ "${{ inputs.iphone8 }}" = "true" ]; then
             iphone8="--iphone8"
             cmdline="$cmdline sweetfb_scale=1 sweetfb_lw=750 sweetfb_lh=1334"
           fi

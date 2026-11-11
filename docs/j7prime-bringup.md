@@ -259,3 +259,42 @@ the iPhone 8 Plus canvas (1242x2208 @3x, display-scale 3) is rendered and shrunk
 default surface is a view of the panel frame buffer and stays clamped to the panel.
 Boot args for it: `sweetfb_scale=1 sweetfb_lw=1242 sweetfb_lh=2208`.
 Note the cost: 2.7x the pixels of 750x1334, so this is not the setting for speed.
+
+## 2026-11-11 — no panic, console muted, and where the frame time actually went
+
+The 0333/0334 boot came up, the panel console stays muted, and the "slide to power off" UI is
+drawn by SpringBoard's own compositor. The log is unambiguous about the remaining slowness:
+
+```
+J7 G3D: config jm=00000000 shader=00010000 tiler=00000001 l2_mmu=00000000
+J7 G3D: slot 0 stopped without an interrupt (js=00000008), not waiting
+J7 G3D client: submit jc=3dae4c0 slot=0 failed status=-1 js=8
+A5XELTE FB: frames=1 elapsed_ms=5309 fps=0.1 bytes=8294400 avg_copy_us=15048
+```
+
+Every client chain ends in `status=-1`: the job slot never raises its interrupt. Two things made
+that cost seconds per frame rather than microseconds:
+
+1. `j7m_wait` returned -1 with `gJ7M.inflight` still set, so the *next* submit was refused with
+   `kIOReturnBusy` until something cleared it.
+2. user-client case 3 then ran `j7m_recover()` - a full soft reset, cores off, MMU torn down and
+   rebuilt, every mapping re-created - for every failed chain.
+
+0335 removes both: a dead slot clears both IRQ words and `inflight` itself, the client timeout is
+capped at 600 us, the whole-address-space verify walk is gone from the submit path, and a reset
+only happens after four consecutive failures (or immediately after a real MMU fault).
+
+The `js=8` in the logs was also misread for several builds: +0x24 is JOB_HEAD_HI, not JS_STATUS.
+JS_STATUS is +0x20 and its bit 0 is ACTIVE; the early-out now reads that.
+
+**Battery.** SweetBattery was compiled for SWEET and HEROLTE only, so powerd fell back to the 1 %
+icon. This board's gauge is the S2MU004 block at 0x3B on `i2c@13830000` (Samsung
+`s2mu004-fuelgauge`, sibling of the S2MPU03 that `a5xelte_touch.c` already drives): 0336 adds
+`bsd/dev/a5xelte_battery.c` (RSOC 0x08, RVBAT 0x04, RCUR_CC 0x06, RBATCAP 0x0e, polled
+S3C2440-layout transfers) and enables SweetBattery for A5XELTE with the 3300 mAh design capacity.
+`j7fg=0` disables it.
+
+**Storage** already works: `A5XELTE eMMC: GPT USERDATA ... writable`, BSD root `emmcroot0`, HFS
+mounted read-write, and the userland above it writes (SpringBoard, the log ring). What is still
+absent is the IOMedia/disk0 layer, which is what DiskArbitration and Settings' storage summary
+enumerate - that is a separate piece of work, not a write path.

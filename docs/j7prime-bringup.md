@@ -298,3 +298,41 @@ S3C2440-layout transfers) and enables SweetBattery for A5XELTE with the 3300 mAh
 mounted read-write, and the userland above it writes (SpringBoard, the log ring). What is still
 absent is the IOMedia/disk0 layer, which is what DiskArbitration and Settings' storage summary
 enumerate - that is a separate piece of work, not a write path.
+
+## 2026-11-11 (third boot) — the battery never probed, and every client chain still dies
+
+**Battery: the class was never matched.** This boot has no `SWEET BATTERY:` line and no
+`A5XELTE FG:` line at all. `iokit/KernelConfigTables.cpp` guards the personality with
+
+```
+#if !defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(ARM64_BOARD_CONFIG_HEROLTE)
+```
+
+so on this board `SweetBattery` was compiled and linked but no personality ever matched it -
+`start()` never ran, so 0336's fuel-gauge probe was never called. 0337 drops that exclusion
+(AppleCLCD keeps its own A5XELTE guard - this board presents through SweetFB). The next log must
+show `SWEET BATTERY:` and either `A5XELTE FG: S2MU004 answers, RSOC=...` or
+`A5XELTE FG: nothing at 0x3b ...`.
+
+**GPU: no client chain reaches the GPU at all.** The 0335 build behaves exactly like the one
+before it: `submit jc=... slot=0 failed status=-1 js=8` for every Mesa chain, while the kernel's
+own client selftest on the same slot reports `round 0 (good) status=0 js=00000000` and its
+deliberate fault reports `status=-3 js=00000008`. The whole 494 KB log contains **one**
+`fault at` line - the selftest's own - so no Mesa chain even reaches the MMU fault path. Also
+notable: 0335 capped the client timeout at 600 us, which silently disabled the dead-slot check
+(it only ran from 2 ms), so this boot timed out blind.
+
+0338 makes the driver answer the question instead of guessing: the first four failed submits print
+JS_STATUS at +0x20 and +0x24, JS_CONFIG_NEXT, JS_COMMAND_NEXT, JOB_IRQ_RAWSTAT plus the next two
+words, MMU_IRQ_RAWSTAT, AS0 fault status and TRANSTAB, and GPU_FAULT_STATUS. The dead-slot check now
+starts at 150 us so it runs inside the cap, and a latched JS_COMMAND_NEXT is cleared after a failure
+so a START the job manager never took cannot wedge the slot.
+
+**Storage.** `disk0` cannot exist yet: this XNU tree has no IOStorageFamily at all - there is no
+`IOMedia.cpp`, no `IOBlockStorageDriver.cpp`, nothing under `iokit/Families/` but IONVRAM and
+IOSystemManagement. `IOService::setRootMedia` only survives because patches 0021/0103 tolerate the
+missing `IOBlockStorageDriver` class. The eMMC block device (`emmcroot0`) is served directly from
+`bsd/dev/a5xelte_emmc.c`, which is why HFS mounts and the userland writes, and why nothing appears
+in DiskArbitration, `df`, or Files' on-device storage: those enumerate IOMedia, which does not exist
+in this kernel. Adding it means porting IOStorageFamily (IOMedia + IOBlockStorageDriver +
+IOMediaBSDClient), not another eMMC patch.

@@ -1,0 +1,27 @@
+From: j7 battery
+Subject: a5xelte: let the SweetBattery personality match on this board
+
+0336 added an S2MU004 fuel-gauge driver and compiled SweetBattery for A5XELTE, but the personality
+itself sits behind `#if !defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(...HEROLTE)` in
+iokit/KernelConfigTables.cpp, so nothing ever matched the class and the probe never ran: the boot
+log has no "SWEET BATTERY:" line at all and powerd keeps its 1 % fallback.  AppleCLCD keeps its own
+A5XELTE guard because this board presents through SweetFB.
+
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index b89b64d..e07d3ae 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -89,7 +89,12 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
+-#if !defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(ARM64_BOARD_CONFIG_HEROLTE)
++/* 0337: this used to read `!defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(...HEROLTE)`,
++ * which is why the J7 Prime showed powerd's 1 % icon: SweetBattery was compiled and linked
++ * but no personality ever matched it, so neither "SWEET BATTERY:" nor the fuel-gauge probe
++ * ran.  AppleCLCD above keeps its own A5XELTE guard because this board presents through
++ * SweetFB instead. */
++#if 1                                                   /* every board, A5XELTE included */
+     "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"

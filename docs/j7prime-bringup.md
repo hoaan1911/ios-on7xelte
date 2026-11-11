@@ -336,3 +336,32 @@ missing `IOBlockStorageDriver` class. The eMMC block device (`emmcroot0`) is ser
 in DiskArbitration, `df`, or Files' on-device storage: those enumerate IOMedia, which does not exist
 in this kernel. Adding it means porting IOStorageFamily (IOMedia + IOBlockStorageDriver +
 IOMediaBSDClient), not another eMMC patch.
+
+## 2026-11-11 (fourth boot) — the dump answers the GPU question, and the gauge ACKs but stalls
+
+**The battery now probes** (`0337` worked): `SWEET BATTERY:` appeared and called the gauge -
+`A5XELTE FG: write of 1 byte(s) failed stat=0xf0 con=0xe1`, then `nothing at 0x3b`. `IICSTAT`
+0xf0 is the address phase with START still asserted and ACK clear at bit 0, and `IICCON` 0xe1 has
+the clock prescaler (bits 1:0) at zero; the touch bus on this phone, which is device verified,
+writes 0xe3 and also sets the SDA filter at 0x10. **0340** uses those values.
+
+**The GPU dump (`0338`) settles where a Mesa chain dies.**
+
+```
+J7 G3D: dump 2 slot=0 rc=-1 js_status(+20)=00000000 js_status(+24)=00000008 js_config(+58)=00003300 js_cmd(+60)=00000000
+J7 G3D: dump 2 job_irq raw=00000000 stat=00000000 mask=00000000 mmu_irq raw=00000000 as_fault=00000000 as_transtab=8336d007 gpu_fault=00000000
+```
+
+- `js_cmd(+60)` reads 0: the START was **taken** by the job manager, not ignored.
+- `js_config(+58)` is 0x3300, exactly the start/end clean+invalidate the submit wrote.
+- `+0x24` is `00000008`, the same word the kernel's deliberate-fault round reports.
+- `JOB_IRQ_RAWSTAT`, `MMU_IRQ_RAWSTAT`, AS0 fault status and `GPU_FAULT_STATUS` are all zero.
+
+So the chain reaches the slot, the slot ends up faulted at **job level**, and no interrupt has
+arrived at the moment the 600 us cap expires. 0335's cap was simply too short to ever see the
+fault: earlier 5 s builds reported `status=-3` for the same chains. **0339** waits 2 ms, and once a
+batch has failed it returns from the next 64 waits without polling - one probe per dead frame
+instead of one per submit, which is the "everything waits for a GPU that never says yes" stutter.
+
+**Storage is unchanged and remains a separate port**: `disk0` needs IOStorageFamily (IOMedia,
+IOBlockStorageDriver, IOMediaBSDClient), which this tree does not contain at all.

@@ -1,0 +1,69 @@
+From: j7 gpu
+Subject: j7 g3d: stop paying a 2 ms probe on every submit of a failing batch
+
+The 0338 dump settles it: for a Mesa chain the start command is taken (JS_COMMAND_NEXT reads 0
+afterwards), JS_CONFIG_NEXT is 0x3300 (start/end clean+invalidate, exactly what was written), the
+job slot reports 00000008 at +0x24 - the same word the kernel's deliberate-fault round reports -
+while JOB_IRQ_RAWSTAT, MMU_IRQ_RAWSTAT, the AS0 fault status and GPU_FAULT_STATUS are all zero.
+So the chain does reach the slot and faults at job level, but the fault interrupt has not arrived
+within 600 us; 0335's cap was too tight to ever see it, which is why every client submit reports
+status=-1 instead of -3.
+
+Wait 2 ms instead, and once a batch has failed, return from the next 64 waits without polling, so
+one dead frame costs one probe instead of one per submit (the "everything waits for a GPU that
+never answers" stutter). A completing batch resets the counter.
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+index 103a58b..89202ba 100644
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -354,6 +354,7 @@ static struct {
+      * again when one of these moved (or every so often, as a safety net). */
+     uint32_t mapGen;
+     uint32_t verifyGen;
++    uint32_t failFast;              /* >0: return from j7m_wait without polling */
+     bool inflight;
+     uint32_t inflightSlot;
+     struct J7MaliBo bos[J7M_MAX_BOS];
+@@ -1176,6 +1177,13 @@ j7m_wait(unsigned timeout_us)
+     if (!gJ7M.inflight) {
+         return 0;
+     }
++    if (gJ7M.failFast) {
++        /* The first chain of a batch pays for the probe; the rest return at once so a GPU that
++         * never answers cannot hold a frame. */
++        gJ7M.failFast--;
++        gJ7M.inflight = false;
++        return -1;
++    }
+     const uint32_t slot = gJ7M.inflightSlot;
+     const uint32_t jsreg = J7M_JS(slot);
+     unsigned repairs = 0;
+@@ -1203,6 +1211,7 @@ j7m_wait(unsigned timeout_us)
+                     a5g3d_write32(gJ7M.gpu, J7M_JOB_IRQ_CLEAR, 0xffffffffu);
+                     a5g3d_write32(gJ7M.gpu, J7M_MMU_IRQ_CLEAR, 0xffffffffu);
+                     gJ7M.inflight = false;
++                    gJ7M.failFast = 64;
+                     return -1;
+                 }
+             }
+@@ -1240,6 +1249,8 @@ j7m_wait(unsigned timeout_us)
+         a5g3d_write32(gJ7M.gpu, J7M_JOB_IRQ_CLEAR, jobIRQ);
+         a5g3d_write32(gJ7M.gpu, J7M_MMU_IRQ_CLEAR, mmuIRQ);
+         gJ7M.inflight = false;
++        /* Completing batches must pay for the probe; failing ones must not. */
++        gJ7M.failFast = (rc == 0) ? 0 : 64;
+         return rc;
+     }
+ }
+@@ -1780,7 +1791,9 @@ J7MaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a
+             const bool wasInflight = gJ7M.inflight;
+             /* 600 us is a frame's worth of GPU work at any useful rate; a client asking for five
+              * seconds only ever waited out a job slot that was already dead. */
+-            const unsigned timeout = static_cast<unsigned>(args->scalarInput[0] > 600 ? 600 : args->scalarInput[0]);
++            /* 2 ms: long enough for the job manager to report a fault (the T830 takes well over
++             * 600 us to walk into one), far short of the client's five seconds. */
++            const unsigned timeout = static_cast<unsigned>(args->scalarInput[0] > 2000 ? 2000 : args->scalarInput[0]);
+             int rc = j7m_wait(timeout);
+             const uint32_t jsReg = a5g3d_read32(gJ7M.gpu, J7M_JS(slot) + 0x20);
+             const uint32_t js = wasInflight ? a5g3d_read32(gJ7M.gpu, J7M_JS(slot) + 0x24) : 0;

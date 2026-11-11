@@ -1,0 +1,33 @@
+From: j7 battery
+Subject: a5xelte: clock the fuel-gauge bus the way the touch bus on this phone is clocked
+
+0337 made the personality match, and the probe ran for the first time:
+`A5XELTE FG: write of 1 byte(s) failed stat=0xf0 con=0xe1` then `nothing at 0x3b`. IICSTAT 0xf0 is
+the address phase with START still asserted and ACK clear at bit 0, and IICCON 0xe1 has the clock
+prescaler (bits 1:0) at zero. a5xelte_touch.c, whose bus is device verified on this phone, writes
+0xe3 and also sets the SDA delay/filter at 0x10. Use the same values and write the filter register.
+
+diff --git a/bsd/dev/a5xelte_battery.c b/bsd/dev/a5xelte_battery.c
+index 41cb900..14e95e8 100644
+--- a/bsd/dev/a5xelte_battery.c
++++ b/bsd/dev/a5xelte_battery.c
+@@ -28,6 +28,7 @@ int a5xelte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah,
+ #define FG_CON          0x00u           /* IICCON */
+ #define FG_STAT         0x04u           /* IICSTAT */
+ #define FG_DS           0x0cu           /* IICDS */
++#define FG_FILTER       0x10u           /* SDA line delay/filter, as a5xelte_touch.c */
+ #define FG_REPSOC       0x08u
+ #define FG_RVBAT        0x04u
+ #define FG_RCUR         0x06u
+@@ -106,7 +107,10 @@ fg_msg(bool receive, uint8_t *bytes, unsigned count)
+ 		}
+ 		delay(1);
+ 	}
+-	fg_wr(FG_CON, 0xe1u);                    /* ACK enable, PCLK/512, IRQ on */
++	/* 0xe3, not 0xe1: bits 1:0 are the clock prescaler (the touch bus on this phone leaves it at
++	 * 3), and the boot log showed a 0xe1 transfer ACKing the address and then never finishing. */
++	fg_wr(FG_CON, 0xe3u);
++	fg_wr(FG_FILTER, 7u);
+ 	fg_wr(FG_DS, FG_ADDR | (receive ? 1u : 0u));
+ 	fg_wr(FG_STAT, receive ? FG_MODE_RX : FG_MODE_TX);
+ 	delay(1);

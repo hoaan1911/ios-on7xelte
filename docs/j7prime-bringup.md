@@ -365,3 +365,29 @@ instead of one per submit, which is the "everything waits for a GPU that never s
 
 **Storage is unchanged and remains a separate port**: `disk0` needs IOStorageFamily (IOMedia,
 IOBlockStorageDriver, IOMediaBSDClient), which this tree does not contain at all.
+
+## 2026-11-11 (fifth boot, six hours up) — the GPU does complete; my probe was lying
+
+The log finally contains the completion the driver had been ignoring:
+
+```
+J7 G3D: dump 2 slot=1 rc=-1 js_status(+20)=00000000 js_status(+24)=00000008 js_config(+58)=00003300 js_cmd(+60)=00000000
+J7 G3D: dump 2 job_irq raw=00000002 stat=00000000 mask=00000000 mmu_irq raw=00000000 as_fault=00000000 as_transtab=833cd007 gpu_fault=00000000
+```
+
+`JOB_IRQ_RAWSTAT = 0x2` is bit 1: the **slot 1 tiler chain completed**. `js_cmd(+60) = 0` means the
+start was taken, `as_fault = 0`, `gpu_fault = 0`, and `js_status(+24) = 8` is the same word the
+selftest's finished chains report. Nothing faulted.
+
+So two of my own changes were the entire wall:
+
+1. the "slot looks stopped" early-out fired at 150 us, i.e. while the slot is legitimately idle
+   *between* the start and the completion interrupt, and reported a live chain as dead;
+2. the counter it armed made the next 64 waits return -1 **without reading RAWSTAT at all**.
+
+**0341** deletes both, waits up to 20 ms but returns the moment the interrupt lands, re-reads
+RAWSTAT once before declaring failure, clears the whole interrupt word so a stale bit cannot fake
+the next chain, and logs the first eight waits with their measured microseconds.
+
+**0342** paints the scanout blue in `AppleCLCD::start()`, so an empty compositor frame is visibly
+different from a dead panel (`sweetfb_bg=0` disables it). The first real frame replaces it.

@@ -1,0 +1,131 @@
+From: j7 gpu
+Subject: j7 g3d: a late completion is not a dead slot (and no fail-fast poison)
+
+The 2026-11-11 log answers it.  The dump taken at the moment the client was told -1 shows
+
+    job_irq raw=00000002 ... js_status(+24)=00000008 js_cmd(+60)=00000000
+
+so the tiler chain *did* complete on slot 1: bit 1 of JOB_IRQ_RAWSTAT was set, the start command had
+been taken, and no fault was recorded anywhere.  Two of my own changes then turned that into a wall
+of failures: the "slot looks stopped" early-out fires at 150 us, before the completion interrupt
+lands, and the fail-fast counter it armed made the next sixty-four waits return -1 without ever
+looking at the register.
+
+Drop both.  Wait up to 20 ms (still returning the instant the interrupt lands), look once more for a
+late completion before failing, clear the whole interrupt word so a stale bit cannot fake the next
+chain, and log the first eight waits with the microseconds they took, so the next log states what a
+real chain costs instead of what a broken probe thinks.
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+index 89202ba..91d41fe 100644
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -354,7 +354,6 @@ static struct {
+      * again when one of these moved (or every so often, as a safety net). */
+     uint32_t mapGen;
+     uint32_t verifyGen;
+-    uint32_t failFast;              /* >0: return from j7m_wait without polling */
+     bool inflight;
+     uint32_t inflightSlot;
+     struct J7MaliBo bos[J7M_MAX_BOS];
+@@ -1177,44 +1176,18 @@ j7m_wait(unsigned timeout_us)
+     if (!gJ7M.inflight) {
+         return 0;
+     }
+-    if (gJ7M.failFast) {
+-        /* The first chain of a batch pays for the probe; the rest return at once so a GPU that
+-         * never answers cannot hold a frame. */
+-        gJ7M.failFast--;
+-        gJ7M.inflight = false;
+-        return -1;
+-    }
+     const uint32_t slot = gJ7M.inflightSlot;
+     const uint32_t jsreg = J7M_JS(slot);
+     unsigned repairs = 0;
+     for (;;) {
+-        uint32_t jobIRQ = 0, mmuIRQ = 0;
++        uint32_t jobIRQ = 0, mmuIRQ = 0, waited = 0;
+         for (unsigned us = 0; us < timeout_us; us += 10) {
++            waited = us + 10;
+             jobIRQ = a5g3d_read32(gJ7M.gpu, J7M_JOB_IRQ_RAWSTAT);
+             mmuIRQ = a5g3d_read32(gJ7M.gpu, J7M_MMU_IRQ_RAWSTAT);
+             if ((jobIRQ & ((1u << slot) | (1u << (slot + 16)))) || mmuIRQ) {
+                 break;
+             }
+-            /* A slot that is no longer active will never raise that interrupt: waiting out the full
+-             * client timeout for it is the "nothing happens for five seconds" stall, so give it 2 ms
+-             * of grace and then report the slot as dead. */
+-            if (us >= 150 && (us % 50) == 0) {
+-                /* JS_STATUS is the word at +0x20 (JOB_HEAD_LO/HI are +0x00/+0x04, the *_NEXT
+-                 * copies +0x40 and up); +0x24 used to be read here and logged as "js", which is
+-                 * only the running head's high half.  Bit 0 is ACTIVE. */
+-                const uint32_t stat = a5g3d_read32(gJ7M.gpu, J7M_JS(slot) + 0x20);
+-                if (!(stat & 1u)) {
+-                    IOLog("J7 G3D: slot %u stopped without an interrupt (js_status=%08x), not waiting\n",
+-                        slot, stat);
+-                    /* The slot will never raise the interrupt: do not leave inflight set, that
+-                     * refused every later submit with kIOReturnBusy. */
+-                    a5g3d_write32(gJ7M.gpu, J7M_JOB_IRQ_CLEAR, 0xffffffffu);
+-                    a5g3d_write32(gJ7M.gpu, J7M_MMU_IRQ_CLEAR, 0xffffffffu);
+-                    gJ7M.inflight = false;
+-                    gJ7M.failFast = 64;
+-                    return -1;
+-                }
+-            }
+             IODelay(10);
+         }
+         int rc = 0;
+@@ -1241,16 +1214,31 @@ j7m_wait(unsigned timeout_us)
+                 }
+             }
+         }
+-        if (rc != 0) {
+-            /* A start command the job manager never took stays latched in JS_COMMAND_NEXT and every
+-             * later submit to that slot is refused; drop it so the slot keeps accepting work. */
+-            a5g3d_write32(gJ7M.gpu, jsreg + 0x60, 0);
++        if (rc == -1) {
++            /* The completion lands just after the last poll often enough to matter: look once more
++             * before calling the chain dead (the 2026-11-11 log shows JOB_IRQ_RAWSTAT = 2 arriving
++             * while the client was already being told -1). */
++            const uint32_t late = a5g3d_read32(gJ7M.gpu, J7M_JOB_IRQ_RAWSTAT);
++            if (late & (1u << slot)) {
++                jobIRQ |= late;
++                rc = 0;
++            } else {
++                /* A start the job manager never took stays latched in JS_COMMAND_NEXT and every
++                 * later submit to that slot is refused; drop it. */
++                a5g3d_write32(gJ7M.gpu, jsreg + 0x60, 0);
++            }
+         }
+-        a5g3d_write32(gJ7M.gpu, J7M_JOB_IRQ_CLEAR, jobIRQ);
+-        a5g3d_write32(gJ7M.gpu, J7M_MMU_IRQ_CLEAR, mmuIRQ);
++        /* Clear everything: a stale slot-done bit would fake a completion for the next chain. */
++        a5g3d_write32(gJ7M.gpu, J7M_JOB_IRQ_CLEAR, 0xffffffffu);
++        a5g3d_write32(gJ7M.gpu, J7M_MMU_IRQ_CLEAR, 0xffffffffu);
+         gJ7M.inflight = false;
+-        /* Completing batches must pay for the probe; failing ones must not. */
+-        gJ7M.failFast = (rc == 0) ? 0 : 64;
++        static unsigned loggedWait;
++        if (loggedWait++ < 8 || rc != 0) {
++            if (loggedWait <= 8) {
++                IOLog("J7 G3D: wait slot=%u rc=%d after %u us (job_irq=%08x mmu_irq=%08x)\n",
++                    slot, rc, waited, jobIRQ, mmuIRQ);
++            }
++        }
+         return rc;
+     }
+ }
+@@ -1791,9 +1779,10 @@ J7MaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a
+             const bool wasInflight = gJ7M.inflight;
+             /* 600 us is a frame's worth of GPU work at any useful rate; a client asking for five
+              * seconds only ever waited out a job slot that was already dead. */
+-            /* 2 ms: long enough for the job manager to report a fault (the T830 takes well over
+-             * 600 us to walk into one), far short of the client's five seconds. */
+-            const unsigned timeout = static_cast<unsigned>(args->scalarInput[0] > 2000 ? 2000 : args->scalarInput[0]);
++            /* 20 ms: a tiled 1242x2208 chain can take longer than 2 ms to raise its interrupt
++             * (the 2026-11-11 log shows the IRQ arriving after the client was already told -1),
++             * and the wait still returns the moment the interrupt lands. */
++            const unsigned timeout = static_cast<unsigned>(args->scalarInput[0] > 20000 ? 20000 : args->scalarInput[0]);
+             int rc = j7m_wait(timeout);
+             const uint32_t jsReg = a5g3d_read32(gJ7M.gpu, J7M_JS(slot) + 0x20);
+             const uint32_t js = wasInflight ? a5g3d_read32(gJ7M.gpu, J7M_JS(slot) + 0x24) : 0;

@@ -1,0 +1,42 @@
+From: j7 gpu
+Subject: j7 g3d: repair the whole faulting BO, not 96 pages of it
+
+The 2026-11-11 log is a fault storm in one BO: `fault at 3904000 in bo 13`, then
+`fault repair: bo=13 ... fixed=1`, then the same BO faults at 0x3963000, 0x3964000 and on.  Each
+repair walks 96 pages, finds exactly one missing, and then flushes the BO's whole range, so every
+fault costs a job stall plus a full flush and the next access simply faults again a page later.
+
+Walk every page of the faulting BO in one pass instead (capped at 16384 pages = 64 MiB).  It is one
+table walk, and it ends the storm rather than moving it a few words along.
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+index 91d41fe..e073bea 100644
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -1117,6 +1117,7 @@ j7m_fault_report(uint32_t jobIRQ, uint32_t mmuIRQ)
+  */
+ #define J7M_REPAIR_LIMIT    64      /* resumed faults per job before a real reset */
+ #define J7M_REPAIR_PAGES    96      /* pages per BO re-walked at fault time */
++#define J7M_REPAIR_MAX      16384   /* hard ceiling for a full-BO repair (64 MiB) */
+ 
+ /* 1 = tables changed (resume), 0 = faulting VA is not ours (the selftest's deliberate fault),
+  * -1 = our BO but nothing to fix: the GPU walked tables that already cover the page. */
+@@ -1132,9 +1133,15 @@ j7m_repair(uint64_t fault)
+         }
+         unsigned fixed = 0, unmappable = 0;
+         uint64_t firstFix = 0;
+-        /* The faulting page first, then the head of the BO: a job chain reads its descriptors all
+-         * over it, so a single repaired page only moves the next fault a few words along. */
+-        for (unsigned n = 0; n < J7M_REPAIR_PAGES; n++) {
++        /* The faulting page first, then every other page of that BO.  The 2026-11-11 log shows the
++         * same BO faulting at 0x3904000, 0x3963000, 0x3964000... one page repaired per fault, each
++         * repair flushing the whole BO: a storm of faults that costs more than the job itself.
++         * Walking the BO once costs a table walk and ends the storm. */
++        uint64_t boPages = bo->size / J7M_PAGE;
++        if (boPages > J7M_REPAIR_MAX) {
++            boPages = J7M_REPAIR_MAX;
++        }
++        for (unsigned n = 0; n < (unsigned)boPages; n++) {
+             const uint64_t at = n == 0 ? page : bo->va + (uint64_t)(n - 1) * J7M_PAGE;
+             if (at >= bo->va + bo->size) {
+                 break;

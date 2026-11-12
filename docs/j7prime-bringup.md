@@ -417,3 +417,23 @@ Two conspicuous costs remain in the log:
   pacing bug, not a rendering cost;
 - the presentation copy is still 8.29 MB of CPU pixels at ~15 ms, and on the 1242x2208 canvas the
   software compositor has 2.7x the pixels of the 750x1334 one.
+
+## 2026-11-11 (seventh boot, 750x1334 canvas) — the GPU completes, the log is a fault storm
+
+The 750x1334 run confirms the GPU path works (`wait slot=0 rc=0`, `slot=1 rc=0`) and shows what is
+left of the slowness:
+
+```
+J7 G3D: fault at 3904000 in bo 13 of 21 (50640 KiB mapped, tables 32/16384): faultstatus=7c2003c3 (translation level 3 write)
+J7 G3D: fault repair: bo=13 va=3963000 fixed=1 first=3963000 unmappable=0 tables=35/16384
+J7 G3D: fault repair: bo=13 va=3964000 fixed=1 first=3964000 unmappable=0 tables=37/16384
+```
+
+One BO faults again and again, one page repaired per fault, and every repair flushes the BO's whole
+range. **0343** walks every page of the faulting BO in one pass (capped at 16k pages), which is one
+table walk instead of a storm of stall+flush cycles.
+
+The 750x1334 canvas also brought the boot console back along the bottom of the panel: `present()`
+mutes it and clears the panel only on the *first* swap, and the console kept drawing afterwards.
+**0344** mutes `sweet_console_muted` and clears the panel as soon as the framebuffer starts when
+`a5fb_noconsole=1` is set; the persistent eMMC log is untouched and panics still draw.

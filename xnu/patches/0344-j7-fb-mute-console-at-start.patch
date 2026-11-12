@@ -1,0 +1,31 @@
+From: j7 fb
+Subject: j7 fb: mute the panel console when the framebuffer starts
+
+present() clears the panel once and sets sweet_console_muted only on the first swap, so with the
+750x1334 canvas the kernel console kept drawing along the bottom of the panel afterwards.  Mute it
+and clear the panel as soon as the framebuffer is up when a5fb_noconsole=1 is set.  The persistent
+eMMC console log is untouched, and panics still draw.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 32ce4b2..c17c4e7 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -267,6 +267,18 @@ AppleCLCD::start(IOService *provider)
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* Mute the panel console here, not on the first swap: present() only clears the panel once,
++	 * and with the 750x1334 canvas boot text reappeared along the bottom because the console kept
++	 * drawing after that single clear.  The persistent eMMC log is unaffected, and panics still
++	 * draw. */
++	int noconsole = 0;
++	if (PE_parse_boot_argn("a5fb_noconsole", &noconsole, sizeof(noconsole)) && noconsole != 0) {
++		sweet_console_muted = 1;
++		memset((void *)fPixels, 0, (size_t)fRowBytes * fHeight);
++		IOLog("A5XELTE FB: console muted at start, panel cleared\n");
++	}
++#endif
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");

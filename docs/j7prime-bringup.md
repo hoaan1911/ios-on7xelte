@@ -391,3 +391,29 @@ the next chain, and logs the first eight waits with their measured microseconds.
 
 **0342** paints the scanout blue in `AppleCLCD::start()`, so an empty compositor frame is visibly
 different from a dead panel (`sweetfb_bg=0` disables it). The first real frame replaces it.
+
+## 2026-11-11 (sixth boot) — submits now complete, and the screen goes to sleep
+
+The wait log confirms 0341 did its job:
+
+```
+J7 G3D: wait slot=1 rc=0 after 20 us (job_irq=00000002 mmu_irq=00000000)
+J7 G3D: wait slot=0 rc=0 after 2490 us (job_irq=00000001 mmu_irq=00000000)
+```
+
+Tiler and fragment chains both complete, in 20 us to 2.5 ms, with no faults. The client's
+`submit ... failed status=-1` lines are gone.
+
+What the panel shows instead is a different problem: the blue fill was my mistake (reverted - the
+wallpaper is a later job), and there is no lock screen because the display was switched off:
+`SWEET FB: display off` appears twice near the end of the run, and presents fall to 0.1-0.3 fps
+(`frames=1 elapsed_ms=5301 ... avg_copy_us=15066` in the same window), so the panel is simply off.
+`a5fb_keep_on=1` (patch 0118) makes the framebuffer ignore those requests.
+
+Two conspicuous costs remain in the log:
+
+- every present is followed by `SWEET SURF: backboardd wrap sel 6 refused: scalars 0 [0x0 0x0]
+  struct in 32, out 2664` - backboardd's swap-wait call is rejected every single frame, which is a
+  pacing bug, not a rendering cost;
+- the presentation copy is still 8.29 MB of CPU pixels at ~15 ms, and on the 1242x2208 canvas the
+  software compositor has 2.7x the pixels of the 750x1334 one.

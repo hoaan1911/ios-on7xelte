@@ -26,9 +26,9 @@ presented size.
 
 Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
 
-diff --git a/xnu/iokit/Kernel/arm/SweetSurface.h b/xnu/iokit/Kernel/arm/SweetSurface.h
---- a/xnu/iokit/Kernel/arm/SweetSurface.h
-+++ b/xnu/iokit/Kernel/arm/SweetSurface.h
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
 @@ -58,6 +58,14 @@
  SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
      uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
@@ -44,9 +44,9 @@ diff --git a/xnu/iokit/Kernel/arm/SweetSurface.h b/xnu/iokit/Kernel/arm/SweetSur
  /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
  mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
  
-diff --git a/xnu/iokit/Kernel/arm/SweetSurface.cpp b/xnu/iokit/Kernel/arm/SweetSurface.cpp
---- a/xnu/iokit/Kernel/arm/SweetSurface.cpp
-+++ b/xnu/iokit/Kernel/arm/SweetSurface.cpp
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
 @@ -228,8 +228,8 @@
  }
  
@@ -88,9 +88,9 @@ diff --git a/xnu/iokit/Kernel/arm/SweetSurface.cpp b/xnu/iokit/Kernel/arm/SweetS
  mach_port_name_t
  sweet_surface_port_in_task(SweetSurface *s, task_t task)
  {
-diff --git a/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp b/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp
---- a/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp
-+++ b/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -257,8 +257,12 @@
  	 * frame buffer, so it stays clamped to the panel even when the presented size is larger. */
  	const uint32_t surfaceW = fScaled && fLogicalW < fWidth ? fLogicalW : fWidth;

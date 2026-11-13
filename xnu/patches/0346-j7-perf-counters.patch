@@ -1,0 +1,162 @@
+From: j7 perf
+Subject: j7 perf: count where a frame's time goes before changing anything else
+
+The 2026-11-13 boot works: no panic, no console text, SpringBoard is up. It is still 0.1-0.3 fps,
+and the log rules out the copy: one present is 13.7 ms of 8.29 MB, yet only 1-2 presents happen
+per 5.3 s window, so the panel copy is ~0.3 % of a frame's time.
+
+Everything else in the kernel path is invisible in that log. The two suspects are the cache
+passes (j7m_cache() walks every mapped BO before each submit and again after each wait) and the
+submit/wait round trip itself. Print a count instead of guessing: submits, microseconds spent in
+the pre-submit clean, in the wait and in the post-wait flush, and the number of wrap selectors
+backboardd asked for (the refusal is logged only four times, so the log cannot say whether it is
+still once per frame).
+
+No behaviour change: the counters are read and cleared by the existing 300-tick perf line.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -28,6 +28,41 @@
+     unsigned int flags);
+ extern "C" void ml_io_unmap(vm_offset_t addr, vm_size_t size);
+ 
++/*
++ * Where a frame's time goes, counted instead of guessed.
++ *
++ * The 2026-11-13 log presents 1-2 frames per 5.3 s while one present costs 13.7 ms, so the copy is
++ * ~0.3 % of the time and the rest is in this driver or above it.  The two cache passes are over
++ * every mapped BO (j7m_cache() at submit and again after the wait) and both walk the whole set for
++ * each chain, so they are the first suspects; these counters settle it.  The framebuffer's perf
++ * line prints and clears them once per window.
++ */
++static uint64_t j7mStatSubmits, j7mStatWaits, j7mStatWaitUs, j7mStatStoreUs, j7mStatFlushUs;
++
++static inline uint64_t
++j7m_now_us(void)
++{
++    uint64_t freq, count;
++    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
++    __asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r"(count));
++    if (freq == 0) {
++        return 0;
++    }
++    return count / (freq / 1000000u);
++}
++
++extern "C" void
++j7m_take_stats(uint64_t *submits, uint64_t *waits, uint64_t *waitUs, uint64_t *storeUs,
++    uint64_t *flushUs)
++{
++    *submits = j7mStatSubmits;
++    *waits = j7mStatWaits;
++    *waitUs = j7mStatWaitUs;
++    *storeUs = j7mStatStoreUs;
++    *flushUs = j7mStatFlushUs;
++    j7mStatSubmits = j7mStatWaits = j7mStatWaitUs = j7mStatStoreUs = j7mStatFlushUs = 0;
++}
++
+ /* Passive probe of the already-powered GPU only. All offsets are from the
+  * native Exynos7580 Linux G3D clock/PMU driver. A powered-off GPU register
+  * access can abort XNU, so the PMU and both CMU gate banks are checked first.
+@@ -1770,7 +1805,12 @@
+             }
+             /* No page-table walk here any more: the map paths verify on change and the whole-AS
+              * audit still runs as a safety net, just not in front of every single submit. */
+-            j7m_cache(kIOMemoryIncoherentIOStore);
++            {
++                const uint64_t t0 = j7m_now_us();
++                j7m_cache(kIOMemoryIncoherentIOStore);
++                j7mStatStoreUs += j7m_now_us() - t0;
++            }
++            j7mStatSubmits++;
+             if (!j7m_submit(static_cast<uint32_t>(slot), jc, &seq)) {
+                 ret = kIOReturnBusy;
+                 break;
+@@ -1790,10 +1830,20 @@
+              * (the 2026-11-11 log shows the IRQ arriving after the client was already told -1),
+              * and the wait still returns the moment the interrupt lands. */
+             const unsigned timeout = static_cast<unsigned>(args->scalarInput[0] > 20000 ? 20000 : args->scalarInput[0]);
+-            int rc = j7m_wait(timeout);
++            int rc;
++            {
++                const uint64_t t0 = j7m_now_us();
++                rc = j7m_wait(timeout);
++                j7mStatWaitUs += j7m_now_us() - t0;
++                j7mStatWaits++;
++            }
+             const uint32_t jsReg = a5g3d_read32(gJ7M.gpu, J7M_JS(slot) + 0x20);
+             const uint32_t js = wasInflight ? a5g3d_read32(gJ7M.gpu, J7M_JS(slot) + 0x24) : 0;
+-            j7m_cache(kIOMemoryIncoherentIOFlush);
++            {
++                const uint64_t t0 = j7m_now_us();
++                j7m_cache(kIOMemoryIncoherentIOFlush);
++                j7mStatFlushUs += j7m_now_us() - t0;
++            }
+             if (rc != 0) {
+                 /* Why did a real client chain never complete?  Dump the job slot and the fault block
+                  * once per boot (four times) instead of guessing: a chain whose START never latched
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -764,6 +764,17 @@
+  * asked is logged (once per selector) for the day it is implemented.
+  */
+ static uint32_t sweet_surf_wraps_logged;
++/* Every selector 6/7 the framework asks for, logged or not: the framebuffer's perf line reports
++ * this count so a log says whether backboardd's swap-wait is still being refused every frame. */
++static uint32_t sweet_surf_wrap_calls;
++
++extern "C" unsigned
++sweet_surface_take_wrap_calls(void)
++{
++	unsigned calls = sweet_surf_wrap_calls;
++	sweet_surf_wrap_calls = 0;
++	return calls;
++}
+ 
+ static void
+ sweet_surf_wrap_refused(uint32_t selector, IOExternalMethodArguments *args)
+@@ -836,6 +847,7 @@
+ 	}
+ 	case kSweetSurfaceWrapClientImage:
+ 	case kSweetSurfaceWrapClientMemory:
++		sweet_surf_wrap_calls++;
+ 		sweet_surf_wrap_refused(selector, args);
+ 		return kIOReturnUnsupported;
+ 	default:
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,11 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++/* iokit/Kernel/arm/A5XELTEGPU.cpp: per-window submit/cache/wait counters, cleared by the read. */
++extern "C" void j7m_take_stats(uint64_t *submits, uint64_t *waits, uint64_t *waitUs,
++    uint64_t *storeUs, uint64_t *flushUs);
++/* iokit/Kernel/arm/SweetSurface.cpp: wrap selectors backboardd asked for, cleared by the read. */
++extern "C" unsigned sweet_surface_take_wrap_calls(void);
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ extern "C" uint64_t a5xelte_power_pressed_at;   /* bsd/dev/a5xelte_keys.c */
+ #endif
+@@ -413,12 +418,17 @@
+ 		uint64_t elapsedNS = 0;
+ 		uint64_t finished = mach_absolute_time();
+ 		absolutetime_to_nanoseconds(finished - fb->fPerfWindowStart, &elapsedNS);
++		uint64_t submits = 0, waits = 0, waitUs = 0, storeUs = 0, flushUs = 0;
++		j7m_take_stats(&submits, &waits, &waitUs, &storeUs, &flushUs);
++		unsigned wraps = sweet_surface_take_wrap_calls();
+ 		if (fb->fPerfFrames != 0 && elapsedNS != 0) {
+ 			uint64_t fpsTenths = fb->fPerfFrames * 10000000000ULL / elapsedNS;
+ 			IOLog("A5XELTE FB: frames=%llu elapsed_ms=%llu fps=%llu.%llu bytes=%llu avg_copy_us=%llu max_copy_us=%llu\n",
+ 			    fb->fPerfFrames, elapsedNS / 1000000, fpsTenths / 10,
+ 			    fpsTenths % 10, fb->fPerfBytes,
+ 			    fb->fPerfNS / fb->fPerfFrames / 1000, fb->fPerfMaxNS / 1000);
++			IOLog("A5XELTE FB: submits=%llu wait_us=%llu store_us=%llu flush_us=%llu wrap=%u\n",
++			    submits, waitUs, storeUs, flushUs, wraps);
+ 		}
+ 		fb->fPerfFrames = fb->fPerfBytes = fb->fPerfNS = fb->fPerfMaxNS = 0;
+ 		fb->fPerfWindowStart = finished;

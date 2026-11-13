@@ -1,24 +1,57 @@
 From: j7 fb
 Subject: j7 fb: make SwapWait wait for the frame it names
 
-The whole frame contract is SwapBegin, SwapEnd, SwapWait, and the wait has always
-answered success immediately without waiting for anything. That leaves the render server
-with no frame interval: it cannot tell when a frame reached the panel, and the log shows it
-committing 22 frames in eleven minutes - the UI updates when something changes and never
-animates, which is what the phone looks like now.
+The frame contract is SwapBegin, SwapEnd, SwapWait, and the wait answered success
+instantly without waiting for anything. That leaves the render server with no frame
+interval: it cannot tell when a frame reached the panel, and the 2026-11-13 log shows it
+committing 22 frames in eleven minutes, so the UI redraws only on state changes and never
+animates.
 
 SwapEnd already knows the first tick that can carry the frame (the next multiple of
-fFlushTicks). Record that tick and wait for it in SwapWait, bounded at 100 ms and cleared
-after the first wait so no swap is waited on twice. j7fb_nowait=1 restores the old
-behaviour. The perf line prints swap_ends, swap_waits and the average wait so the next log
-shows whether the client is running a frame loop or only drawing on state changes.
+fFlushTicks). Record that tick and wait for it in SwapWait, bounded at 100 ms and consumed
+once per swap. j7fb_nowait=1 restores the old behaviour. The perf line reports swap_ends,
+swap_waits and the average wait, so the next log says whether a frame loop exists.
+
+The previous revision of this patch did not compile: the counters were declared after the
+first use and the client cannot read AppleCLCD's protected vsync count, so the wait lives
+in the framebuffer now.
 
 Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
 
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -339,8 +339,14 @@
+@@ -107,6 +107,21 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ 
++/*
++ * SwapWait (selector 6) used to answer success at once, without waiting for
++ * anything. SwapBegin / SwapEnd / SwapWait is the whole frame contract, and the
++ * wait is what paces the render server; answering it instantly leaves the client
++ * with no idea when a frame reached the panel. The 2026-11-13 log shows 22
++ * frames committed in eleven minutes, so the UI only redraws on a state change
++ * and never animates. These counters say which of the two it is.
++ */
++static uint64_t sweet_fb_swap_count;
++static uint64_t sweet_fb_swap_waits;
++static uint64_t sweet_fb_swap_wait_us;
++static bool     sweet_fb_swap_pending;
++static uint64_t sweet_fb_swap_wait_for;
++static int      sweet_fb_nowait;
++
+ class IOMobileFramebufferUserClient;
+ 
+ class AppleCLCD : public IOMobileFramebuffer {
+@@ -149,6 +164,7 @@
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
++	void waitForSwap(void);
+ 	uint64_t present(const uint8_t *rec);
+ 	uint64_t scaledCopy(uintptr_t src, uint32_t srcRowBytes, int32_t dx, int32_t dy,
+ 	    int32_t w, int32_t h);
+@@ -339,8 +355,14 @@
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
  #if defined(ARM64_BOARD_CONFIG_A5XELTE)
@@ -35,77 +68,81 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  #endif
  	return true;
  }
-@@ -430,6 +436,11 @@
+@@ -430,6 +452,11 @@
  			    fb->fPerfNS / fb->fPerfFrames / 1000, fb->fPerfMaxNS / 1000);
  			IOLog("A5XELTE FB: submits=%llu wait_us=%llu store_us=%llu flush_us=%llu wrap=%u cpu_mhz=%u\n",
  			    submits, waitUs, storeUs, flushUs, wraps, j7m_cpu_mhz());
 +			IOLog("A5XELTE FB: swap_ends=%llu swap_waits=%llu avg_swapwait_us=%llu\n",
-+			    sweet_fb_swap_count & 0xffffffffULL, sweet_fb_swap_waits,
++			    sweet_fb_swap_count, sweet_fb_swap_waits,
 +			    sweet_fb_swap_waits ? sweet_fb_swap_wait_us / sweet_fb_swap_waits : 0);
 +			sweet_fb_swap_waits = 0;
 +			sweet_fb_swap_wait_us = 0;
  		}
  		fb->fPerfFrames = fb->fPerfBytes = fb->fPerfNS = fb->fPerfMaxNS = 0;
  		fb->fPerfWindowStart = finished;
-@@ -467,6 +478,19 @@
+@@ -466,7 +493,6 @@
+ }
  
  static uint32_t sweet_fb_swaps_logged;
- static uint64_t sweet_fb_swap_count;
-+/*
-+ * SwapWait (selector 6) used to answer success at once, without waiting for
-+ * anything. SwapBegin/SwapEnd/SwapWait is the whole frame contract: the wait is
-+ * what paces the render server, and answering it instantly means the client has
-+ * no idea when a frame reached the panel. Count what happens so a log says
-+ * whether the client is running a frame loop (many ends, many waits) or only
-+ * drawing on state changes.
-+ */
-+static uint64_t sweet_fb_swap_waits;
-+static uint64_t sweet_fb_swap_wait_us;
-+static bool     sweet_fb_swap_pending;
-+static uint64_t sweet_fb_swap_wait_for;
-+static int      sweet_fb_nowait;
+-static uint64_t sweet_fb_swap_count;
  
  #if defined(ARM64_BOARD_CONFIG_HEROLTE)
  /*
-@@ -591,6 +615,10 @@
+@@ -591,6 +617,10 @@
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
  	IOLockUnlock(fLock);
-+	/* The copy happens on the next tick that is a multiple of fFlushTicks:
-+	 * that is the first tick this frame can be on the panel. */
++	/* present() copies on the next tick that is a multiple of fFlushTicks:
++	 * that is the first tick this frame can reach the panel. */
 +	sweet_fb_swap_wait_for = fVsyncCount + (fFlushTicks ? fFlushTicks : 1);
 +	sweet_fb_swap_pending = true;
  #if defined(ARM64_BOARD_CONFIG_HEROLTE)
  	/* Raw record of the first swaps: offset=value of every non-zero word. */
  	if (sweet_fb_swap_count < 8) {
-@@ -942,6 +970,33 @@
+@@ -616,6 +646,38 @@
+ }
+ 
+ /*
++ * Wait, once per recorded swap, for the tick that presents it. Bounded because
++ * a frame that never arrives must not wedge the calling process, and skipped
++ * entirely with j7fb_nowait=1 so the instant-answer behaviour stays reachable.
++ */
++void
++AppleCLCD::waitForSwap(void)
++{
++	uint64_t startNs = 0, nowNs = 0, endNs = 0, target;
++	bool pending;
++
++	IOLockLock(fLock);
++	pending = sweet_fb_swap_pending;
++	target = sweet_fb_swap_wait_for;
++	sweet_fb_swap_pending = false;
++	IOLockUnlock(fLock);
++	if (!pending || sweet_fb_nowait) {
++		return;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time(), &startNs);
++	while (fVsyncCount < target) {
++		absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
++		if (nowNs - startNs >= 100 * NSEC_PER_MSEC) {
++			break;
++		}
++		IOSleep(1);
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time(), &endNs);
++	sweet_fb_swap_wait_us += (endNs - startNs) / 1000;
++	sweet_fb_swap_waits++;
++}
++
++/*
+  * sweetfb_scale: the logical rect (dx,dy,w,h) at src goes to panel pixels
+  * x1.5, nearest neighbour (two source pixels become three). A panel row
+  * whose source row equals the previous one is copied from it. Called only
+@@ -942,6 +1004,10 @@
  		}
  		break;
  	case kSweetFBSwapWait:
-+		/*
-+		 * Wait for the tick that presents this frame, bounded, and never wait
-+		 * twice for the same swap. Blocking here is what gives the render
-+		 * server a frame interval instead of an instant acknowledgement.
-+		 */
-+		if (sweet_fb_swap_pending && !sweet_fb_nowait) {
-+			uint64_t begin = 0, end = 0, startNs = 0, nowNs = 0;
-+			uint64_t target = sweet_fb_swap_wait_for;
-+
-+			sweet_fb_swap_pending = false;
-+			begin = mach_absolute_time();
-+			absolutetime_to_nanoseconds(begin, &startNs);
-+			while (fFB->fVsyncCount < target) {
-+				absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
-+				if (nowNs - startNs >= 100 * NSEC_PER_MSEC) {
-+					break;
-+				}
-+				IOSleep(1);
-+			}
-+			end = mach_absolute_time();
-+			absolutetime_to_nanoseconds(end, &endNs);
-+			sweet_fb_swap_wait_us += (endNs - startNs) / 1000;
-+			sweet_fb_swap_waits++;
-+		}
++		fFB->waitForSwap();
 +		out[0] = 1;
 +		outCount = 1;
 +		break;

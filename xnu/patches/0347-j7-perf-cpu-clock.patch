@@ -1,0 +1,98 @@
+From: j7 perf
+Subject: j7 perf: report the real core clock, since nothing else does
+
+The counter build settled where the kernel time is not: wait_us, store_us and flush_us are 0
+in every 5 s window, so the GPU submit path is free and the cost is userspace CPU. That
+makes the clock the first thing to check, and this tree has no cpufreq driver at all - the
+cluster stays at whatever rate the bootloader set. Print it: read the architectural cycle
+counter across a 5 ms arch-timer window, with a dependent add chain as the fallback when the
+PMU is not counting. No MMIO and no register writes, so no power-gated block is touched.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -51,6 +51,60 @@
+     return count / (freq / 1000000u);
+ }
+ 
++/* Real core clock. The tree has no cpufreq driver, so the CPU runs at whatever
++ * rate the bootloader left behind and nothing in the system reports it. Read the
++ * architectural cycle counter over a 5 ms arch-timer window; if the PMU is not
++ * counting, fall back to a dependent add chain, which retires one add per cycle
++ * on this core. Diagnostic only: no MMIO, no register writes. */
++extern "C" unsigned
++j7m_cpu_mhz(void)
++{
++    uint64_t freq = 0, t0 = 0, t1 = 0, c0 = 0, c1 = 0;
++    __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(freq));
++    if (freq == 0) {
++        return 0;
++    }
++    __asm__ __volatile__("mrs %0, pmcr_el0" : "=r"(c0));
++    __asm__ __volatile__("msr pmcr_el0, %0" :: "r"(c0 | 1));
++    __asm__ __volatile__("msr pmcntenset_el0, %0" :: "r"(1ULL << 31));
++    __asm__ __volatile__("mrs %0, pmccntr_el0" : "=r"(c0));
++    {
++        uint64_t deadline, now;
++        __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(t0));
++        deadline = t0 + freq / 200;
++        do {
++            __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(now));
++        } while (now < deadline);
++        t1 = now;
++    }
++    __asm__ __volatile__("mrs %0, pmccntr_el0" : "=r"(c1));
++    __asm__ __volatile__("msr pmcr_el0, %0" :: "r"(c0));
++    if (c1 > c0 && t1 > t0) {
++        return (unsigned)(((c1 - c0) * freq) / ((t1 - t0) * 1000000ULL));
++    }
++    {
++        uint64_t n = 0, i, deadline, now;
++        __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(t0));
++        deadline = t0 + freq / 200;
++        do {
++            i = 4096;
++            __asm__ __volatile__(
++                "1:\n"
++                "add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n"
++                "add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n"
++                "subs %1, %1, #1\n b.ne 1b\n"
++                : "+r"(n), "+r"(i) :: "cc");
++            n *= 10; n /= 8;
++            __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(now));
++        } while (now < deadline);
++        t1 = now;
++        if (t1 == t0) {
++            return 0;
++        }
++        return (unsigned)((n * freq) / ((t1 - t0) * 1000000ULL));
++    }
++}
++
+ extern "C" void
+ j7m_take_stats(uint64_t *submits, uint64_t *waits, uint64_t *waitUs, uint64_t *storeUs,
+     uint64_t *flushUs)
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -38,6 +38,7 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ /* iokit/Kernel/arm/A5XELTEGPU.cpp: per-window submit/cache/wait counters, cleared by the read. */
++extern "C" unsigned j7m_cpu_mhz(void);
+ extern "C" void j7m_take_stats(uint64_t *submits, uint64_t *waits, uint64_t *waitUs,
+     uint64_t *storeUs, uint64_t *flushUs);
+ /* iokit/Kernel/arm/SweetSurface.cpp: wrap selectors backboardd asked for, cleared by the read. */
+@@ -427,8 +428,8 @@
+ 			    fb->fPerfFrames, elapsedNS / 1000000, fpsTenths / 10,
+ 			    fpsTenths % 10, fb->fPerfBytes,
+ 			    fb->fPerfNS / fb->fPerfFrames / 1000, fb->fPerfMaxNS / 1000);
+-			IOLog("A5XELTE FB: submits=%llu wait_us=%llu store_us=%llu flush_us=%llu wrap=%u\n",
+-			    submits, waitUs, storeUs, flushUs, wraps);
++			IOLog("A5XELTE FB: submits=%llu wait_us=%llu store_us=%llu flush_us=%llu wrap=%u cpu_mhz=%u\n",
++			    submits, waitUs, storeUs, flushUs, wraps, j7m_cpu_mhz());
+ 		}
+ 		fb->fPerfFrames = fb->fPerfBytes = fb->fPerfNS = fb->fPerfMaxNS = 0;
+ 		fb->fPerfWindowStart = finished;

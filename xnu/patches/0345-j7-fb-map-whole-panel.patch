@@ -1,0 +1,108 @@
+From: j7 fb
+Subject: j7 fb: map the whole panel under a canvas-sized surface
+
+The 2026-11-12 boot panics before the UI comes up:
+
+  Kernel data abort at pc 0xfffffff007b242e4, esr 0x96000047
+  far 0xfffffff6cd5a0000   (x0 = 0xfffffff6cd021000, x2 = 0x269fc0)
+
+esr 0x96000047 is a level-3 translation fault on a *write*, and far is surface base +
+0x57f000, which is exactly round_page(4320 * 1334) - the window this build maps for the
+750x1334 canvas: sweet_surface_create_physical() sizes the mapping from the surface height,
+and 0334/0222 clamp that height to the presented (canvas) part of the panel.
+
+0344 then clears the panel as the whole panel it is:
+
+  memset((void *)fPixels, 0, (size_t)fRowBytes * fHeight);
+
+4320 * 1920 = 8.29 MB into a 5.76 MB mapping, so the clear runs off the end of the surface
+window one page past it. present()'s first-swap clear and scaledCopy()/the fade loop write
+the same panel extent, so this is not one bad memset: the mapping has to cover the panel
+while the surface geometry stays the presented size.
+
+Give sweet_surface_create_physical() a mapped-height sibling and have the framebuffer ask
+for all fHeight panel rows.  Geometry is unchanged, so the swap layers still match the
+presented size.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/xnu/iokit/Kernel/arm/SweetSurface.h b/xnu/iokit/Kernel/arm/SweetSurface.h
+--- a/xnu/iokit/Kernel/arm/SweetSurface.h
++++ b/xnu/iokit/Kernel/arm/SweetSurface.h
+@@ -58,6 +58,14 @@
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
++/*
++ * Same, but the surface maps mappedHeight rows of panel memory while reporting height rows.
++ * The scanner-out is the whole panel, so a surface sized to the presented (canvas) part of it
++ * must still have every panel row it writes to mapped.
++ */
++SweetSurface *sweet_surface_create_physical_len(uint64_t phys, uint32_t width,
++    uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat, uint32_t mappedHeight);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
+diff --git a/xnu/iokit/Kernel/arm/SweetSurface.cpp b/xnu/iokit/Kernel/arm/SweetSurface.cpp
+--- a/xnu/iokit/Kernel/arm/SweetSurface.cpp
++++ b/xnu/iokit/Kernel/arm/SweetSurface.cpp
+@@ -228,8 +228,8 @@
+ }
+ 
+ SweetSurface *
+-sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+-    uint32_t bytesPerRow, uint32_t pixelFormat)
++sweet_surface_create_physical_len(uint64_t phys, uint32_t width, uint32_t height,
++    uint32_t bytesPerRow, uint32_t pixelFormat, uint32_t mappedHeight)
+ {
+ 	SweetSurface *s = sweet_surface_alloc();
+ 	if (s == NULL) {
+@@ -241,7 +241,13 @@
+ 	s->bytesPerElement = 4;
+ 	s->elementWidth = s->elementHeight = 1;
+ 	s->pixelFormat = pixelFormat;
+-	s->allocSize = (uint32_t)round_page(bytesPerRow * height);
++	/* A surface over panel memory is a window onto it: the geometry can be the presented
++	 * (canvas) size while the panel behind it is taller.  Mapping only height rows made every
++	 * panel-extent write run off the end of the window - 2026-11-12, 750x1334 canvas on the
++	 * 1080x1920 panel: memset(fPixels, 0, 4320 * 1920) wrote at base + round_page(4320 * 1334)
++	 * and took a level-3 translation fault on a write (esr 0x96000047). */
++	s->allocSize = (uint32_t)round_page((uint64_t)bytesPerRow *
++	    (mappedHeight > height ? mappedHeight : height));
+ 	s->memory = IOMemoryDescriptor::withPhysicalAddress(phys, s->allocSize, kIODirectionInOut);
+ 	s->mapCache = kIOMapWriteCombineCache;
+ 	if (s->memory == NULL || !sweet_surface_publish(s)) {
+@@ -251,6 +257,14 @@
+ 	return s;
+ }
+ 
++SweetSurface *
++sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
++    uint32_t bytesPerRow, uint32_t pixelFormat)
++{
++	return sweet_surface_create_physical_len(phys, width, height, bytesPerRow, pixelFormat,
++	    height);
++}
++
+ mach_port_name_t
+ sweet_surface_port_in_task(SweetSurface *s, task_t task)
+ {
+diff --git a/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp b/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -257,8 +257,12 @@
+ 	 * frame buffer, so it stays clamped to the panel even when the presented size is larger. */
+ 	const uint32_t surfaceW = fScaled && fLogicalW < fWidth ? fLogicalW : fWidth;
+ 	const uint32_t surfaceH = fScaled && fLogicalH < fHeight ? fLogicalH : fHeight;
+-	fSurface = sweet_surface_create_physical(fPhys, surfaceW, surfaceH, fRowBytes,
+-	    SWEET_FB_FORMAT_BGRA);
++	/* Map all fHeight panel rows even when the surface is only the presented (canvas) part of
++	 * the panel: present() scales the canvas into every panel row and the clears below write
++	 * fRowBytes * fHeight.  A 750x1334 canvas used to map 4320 * 1334 bytes here and the
++	 * start() clear of the panel took a data abort one page past it. */
++	fSurface = sweet_surface_create_physical_len(fPhys, surfaceW, surfaceH, fRowBytes,
++	    SWEET_FB_FORMAT_BGRA, fHeight);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {

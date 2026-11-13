@@ -437,3 +437,37 @@ The 750x1334 canvas also brought the boot console back along the bottom of the p
 mutes it and clears the panel only on the *first* swap, and the console kept drawing afterwards.
 **0344** mutes `sweet_console_muted` and clears the panel as soon as the framebuffer starts when
 `a5fb_noconsole=1` is set; the persistent eMMC log is untouched and panics still draw.
+
+## 2026-11-12 panic on the 750x1334 canvas — the panel clear wrote past the surface window
+
+The panic that comes up right after the framebuffer starts, resolved against the run's own kernel
+binary (`xnu-kernel` artifact, `__TEXT` at `0xfffffff007004000`, `__TEXT_EXEC` at `0xfffffff007264000`):
+
+```
+Kernel data abort at pc 0xfffffff007b242e4, lr 0xfffffff007a460ec
+esr 0x96000047   (EC 0x25 data abort, WnR 1 = write, DFSC 0b000111 = translation fault, level 3)
+far 0xfffffff6cd5a0000      x0 0xfffffff6cd021000   x2 0x269fc0   x3 0xfffffff6cd5a0000
+```
+
+- `far - x0` is `0x57f000` = `round_page(4320 * 1334)`. That is exactly the size of the surface
+  window the framebuffer maps for a 750x1334 canvas: panel stride 4320, surface height clamped to
+  the presented (canvas) part of the panel by 0222/0334, and `x2` is what is left of the write when
+  it reaches the unmapped page. Both the earlier and this boot fault on the same page.
+- A level-3 translation fault on a **write** is a write past the end of a mapping, so the faulting
+  code is the panel clear 0344 added at framebuffer start:
+  `memset(fPixels, 0, (size_t)fRowBytes * fHeight)` = 4320 * 1920 = 8.29 MB into a 5.76 MB window.
+  present()'s first-swap clear and present()'s scaledCopy()/fade loop write the same panel extent,
+  so the mapping is what is wrong, not one line.
+- **"handshake structure not initialized" is not the cause.** That string lives in
+  `osfmk/kdp/kdp_core.c` / `osfmk/kdp/output_stages/out_shmem.c` and is printed when the panic path
+  cannot find `hwsd_info` for a hardware-shmem coredump; the real panic string is the data abort.
+
+**0345** gives `sweet_surface_create_physical()` a mapped-height sibling,
+`sweet_surface_create_physical_len()`, and has the framebuffer map all `fHeight` panel rows while the
+surface geometry stays the presented size (so swap layers still match it). Clears, scaledCopy() and
+the fade loop can then write the whole panel without leaving the mapping.
+
+**Correction.** The `xnu/iokit/Kernel/arm/SweetSurface.cpp` committed on 2026-11-12 ("sweet surface:
+accept wrap selectors") was never compiled: this repository builds only from `xnu/patches/*.patch`,
+which are copied into the builder. The file is removed. The wrap selectors (sel 6/7) are still
+refused by 0320 and the `backboardd wrap sel 6 refused` pacing line is still open.

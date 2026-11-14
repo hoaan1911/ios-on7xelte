@@ -1,32 +1,94 @@
 From: j7 fb
-Subject: j7 fb: give clients a canvas surface instead of the panel
+Subject: j7 fb: hand clients a canvas surface of their own
 
 Selector 3 handed out a view of the scanout buffer, so CoreAnimation rendered half its
-frames straight into panel memory at canvas size. Those frames reached the panel unscaled
-in the top-left corner and present() skipped them, because the layer surface was the panel
-surface itself. On the phone that is the flicker between a correctly scaled frame and a
-raw 750-wide one.
+frames into panel memory at canvas size: those landed unscaled in the top-left corner and
+present() skipped them, which is the flicker between a scaled frame and a raw 750-wide one.
 
-Allocate a canvas-sized surface over its own buffer and hand that out instead. Every
-frame now arrives as an ordinary layer surface and goes through scaledCopy, which maps the
-750x1334 canvas onto all 1080x1920 panel rows. The panel surface stays what it was: the
-scanout memory nothing else writes to.
+The first attempt at this allocated a buffer and published a surface over its physical
+address. That maps one page twice, once cacheable and once write-combined, and it panicked
+in pmap_enter_pv (unexpected PV head) on 2026-11-14. Allocate the pixels through the surface
+subsystem itself instead - one mapping, shared once, the same path a client create uses.
+
+The first eight swap records also print their layer mask and four layer ids now, so a log
+says whether a wallpaper layer exists and what to composite under the UI.
 
 Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
 
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -66,6 +66,15 @@
+ SweetSurface *sweet_surface_create_physical_len(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat, uint32_t mappedHeight);
+ 
++/*
++ * A surface over memory the kernel allocates and shares: what a client-facing
++ * surface must be. Do not build one by mapping a buffer a second time at a
++ * different cache mode - two mappings of one physical page with different
++ * attributes corrupt the pmap PV lists (pmap_enter_pv, 2026-11-14).
++ */
++SweetSurface *sweet_surface_create_owned(uint32_t width, uint32_t height,
++    uint32_t bytesPerRow, uint32_t pixelFormat);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -265,6 +265,39 @@
+ 	    height);
+ }
+ 
++SweetSurface *
++sweet_surface_create_owned(uint32_t width, uint32_t height, uint32_t bytesPerRow,
++    uint32_t pixelFormat)
++{
++	SweetSurface *s = sweet_surface_alloc();
++	IOBufferMemoryDescriptor *mem;
++
++	if (s == NULL) {
++		return NULL;
++	}
++	s->width = width;
++	s->height = height;
++	s->bytesPerRow = bytesPerRow;
++	s->bytesPerElement = 4;
++	s->elementWidth = s->elementHeight = 1;
++	s->pixelFormat = pixelFormat;
++	s->allocSize = (uint32_t)round_page((uint64_t)bytesPerRow * height);
++	mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++	if (mem == NULL) {
++		s->release();
++		return NULL;
++	}
++	bzero(mem->getBytesNoCopy(), s->allocSize);
++	s->memory = mem;
++	s->mapCache = kIOMapDefaultCache;
++	if (!sweet_surface_publish(s)) {
++		s->release();
++		return NULL;
++	}
++	return s;
++}
++
+ mach_port_name_t
+ sweet_surface_port_in_task(SweetSurface *s, task_t task)
+ {
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -142,6 +142,8 @@
+@@ -142,6 +142,7 @@
  	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
  	IOMemoryMap  *fMap;
  	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
 +	SweetSurface *fCanvas;          /* what clients draw and swap into */
-+	IOMemoryDescriptor *fCanvasMem; /* backing store for fCanvas */
  	IOLock       *fLock;            /* swaps and client list */
  	OSArray      *fClients;
  	uint32_t      fSwapID;
-@@ -286,6 +288,34 @@
+@@ -286,6 +287,26 @@
  	fSurface = sweet_surface_create_physical_len(fPhys, surfaceW, surfaceH, fRowBytes,
  	    SWEET_FB_FORMAT_BGRA, fHeight);
  	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
@@ -34,25 +96,17 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	 * Clients must not draw into the panel surface.  They did: selector 3 handed out a view of
 +	 * the scanout buffer, so half of CoreAnimation's frames were rendered straight into panel
 +	 * memory at canvas size, landed unscaled in the top-left corner, and present() skipped them
-+	 * because the layer surface was fSurface.  The visible result was the screen flickering
-+	 * between a correctly scaled frame and a raw 750-wide one.  Hand out a separate canvas
-+	 * surface instead, so every frame goes through the scaler.
++	 * because the layer surface was fSurface.  On the phone that is the flicker between a
++	 * correctly scaled frame and a raw 750-wide one.  Hand out a canvas surface of our own
++	 * instead - allocated and shared once, never remapped at another cache mode, because two
++	 * mappings of the same page with different attributes corrupt the pmap PV lists.
 +	 */
 +	if (fScaled && fLogicalW > 0 && fLogicalH > 0) {
 +		uint32_t stride = (fLogicalW * 4 + 63) & ~63u;
-+		vm_size_t len = (vm_size_t)stride * fLogicalH;
-+		fCanvasMem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-+		    kIODirectionInOut | kIOMemoryKernelUserShared, len, (vm_size_t)page_size);
-+		if (fCanvasMem != NULL) {
-+			IOPhysicalAddress phys = fCanvasMem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
-+			if (phys != 0) {
-+				fCanvas = sweet_surface_create_physical(phys, fLogicalW, fLogicalH, stride,
-+				    SWEET_FB_FORMAT_BGRA);
-+			}
-+		}
++		fCanvas = sweet_surface_create_owned(fLogicalW, fLogicalH, stride,
++		    SWEET_FB_FORMAT_BGRA);
 +		if (fCanvas == NULL) {
 +			IOLog("SWEET FB: no canvas surface, clients keep the panel\n");
-+			OSSafeReleaseNULL(fCanvasMem);
 +		} else {
 +			IOLog("SWEET FB: canvas surface id %u %ux%u stride %u\n",
 +			    fCanvas->id, fLogicalW, fLogicalH, stride);
@@ -61,7 +115,20 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	fWorkLoop = IOWorkLoop::workLoop();
  	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
  		IOLog("SWEET FB: setup failed\n");
-@@ -923,7 +953,8 @@
+@@ -751,6 +772,12 @@
+ 		}
+ 	}
+ 
++	static uint32_t sweet_fb_reclog;
++	if (sweet_fb_reclog < 8) {
++		sweet_fb_reclog++;
++		IOLog("SWEET FB: rec %u mask=0x%x ids %u %u %u %u\n", get32(rec, 0x50), mask,
++		    get32(rec, 0x54), get32(rec, 0x58), get32(rec, 0x5c), get32(rec, 0x60));
++	}
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -923,7 +950,8 @@
  
  	switch (selector) {
  	case kSweetFBGetLayerDefaultSurface:

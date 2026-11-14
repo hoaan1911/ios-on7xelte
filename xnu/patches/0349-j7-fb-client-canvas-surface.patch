@@ -1,0 +1,73 @@
+From: j7 fb
+Subject: j7 fb: give clients a canvas surface instead of the panel
+
+Selector 3 handed out a view of the scanout buffer, so CoreAnimation rendered half its
+frames straight into panel memory at canvas size. Those frames reached the panel unscaled
+in the top-left corner and present() skipped them, because the layer surface was the panel
+surface itself. On the phone that is the flicker between a correctly scaled frame and a
+raw 750-wide one.
+
+Allocate a canvas-sized surface over its own buffer and hand that out instead. Every
+frame now arrives as an ordinary layer surface and goes through scaledCopy, which maps the
+750x1334 canvas onto all 1080x1920 panel rows. The panel surface stays what it was: the
+scanout memory nothing else writes to.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -142,6 +142,8 @@
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
++	SweetSurface *fCanvas;          /* what clients draw and swap into */
++	IOMemoryDescriptor *fCanvasMem; /* backing store for fCanvas */
+ 	IOLock       *fLock;            /* swaps and client list */
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+@@ -286,6 +288,34 @@
+ 	fSurface = sweet_surface_create_physical_len(fPhys, surfaceW, surfaceH, fRowBytes,
+ 	    SWEET_FB_FORMAT_BGRA, fHeight);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++	/*
++	 * Clients must not draw into the panel surface.  They did: selector 3 handed out a view of
++	 * the scanout buffer, so half of CoreAnimation's frames were rendered straight into panel
++	 * memory at canvas size, landed unscaled in the top-left corner, and present() skipped them
++	 * because the layer surface was fSurface.  The visible result was the screen flickering
++	 * between a correctly scaled frame and a raw 750-wide one.  Hand out a separate canvas
++	 * surface instead, so every frame goes through the scaler.
++	 */
++	if (fScaled && fLogicalW > 0 && fLogicalH > 0) {
++		uint32_t stride = (fLogicalW * 4 + 63) & ~63u;
++		vm_size_t len = (vm_size_t)stride * fLogicalH;
++		fCanvasMem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared, len, (vm_size_t)page_size);
++		if (fCanvasMem != NULL) {
++			IOPhysicalAddress phys = fCanvasMem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++			if (phys != 0) {
++				fCanvas = sweet_surface_create_physical(phys, fLogicalW, fLogicalH, stride,
++				    SWEET_FB_FORMAT_BGRA);
++			}
++		}
++		if (fCanvas == NULL) {
++			IOLog("SWEET FB: no canvas surface, clients keep the panel\n");
++			OSSafeReleaseNULL(fCanvasMem);
++		} else {
++			IOLog("SWEET FB: canvas surface id %u %ux%u stride %u\n",
++			    fCanvas->id, fLogicalW, fLogicalH, stride);
++		}
++	}
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+@@ -923,7 +953,8 @@
+ 
+ 	switch (selector) {
+ 	case kSweetFBGetLayerDefaultSurface:
+-		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
++		out[0] = sweet_surface_port_in_task(fFB->fCanvas != NULL ?
++		    fFB->fCanvas : fFB->fSurface, fTask);
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBSwapBegin:

@@ -1,0 +1,33 @@
+From: j7 fb
+Subject: j7 fb: stop overshooting the swap wait by a whole frame
+
+SwapWait now blocks until the recorded frame is presented, which is what gave the device a
+frame loop at all. But it aimed at the next tick that is a multiple of fFlushTicks, and a
+present takes about 34 ms while fFlushTicks is 2: by the time the caller checked, its target
+had usually passed and it blocked another full cycle. The 2026-11-14 log shows 66 ms average
+waits on a 34 ms copy, in a 70 ms frame.
+
+Wait for the very next tick instead. Worst case is one 16.7 ms tick, the caller resumes as
+soon as a tick passes, and the render loop is no longer paying two ticks for one frame.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -638,9 +638,12 @@
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
+-	/* present() copies on the next tick that is a multiple of fFlushTicks:
+-	 * that is the first tick this frame can reach the panel. */
+-	sweet_fb_swap_wait_for = fVsyncCount + (fFlushTicks ? fFlushTicks : 1);
++	/* Wait for the very next tick, not the next present tick. A present costs about
++	 * 34 ms and fFlushTicks is 2, so aiming at a multiple of fFlushTicks made the
++	 * caller miss its own target and block for a second full cycle: the 2026-11-14
++	 * log shows a 66 ms average wait on a 34 ms copy, which is most of a 70 ms
++	 * frame. One tick is the shortest honest answer. */
++	sweet_fb_swap_wait_for = fVsyncCount + 1;
+ 	sweet_fb_swap_pending = true;
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 	/* Raw record of the first swaps: offset=value of every non-zero word. */

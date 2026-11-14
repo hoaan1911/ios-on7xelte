@@ -1,0 +1,78 @@
+From: j7 fb
+Subject: j7: let a boot arg refuse the daemons launchd respawns in a loop
+
+The 2026-11-14 console ends in hundreds of consecutive exec xpcproxy / fairplayd.H2 / 
+bluetoothd triples with nothing else happening: both daemons exit at once on this phone (no 
+Bluetooth transport, no DRM helper) and launchd starts them again immediately. 
+j7nospawn=name[,name...] refuses those execs, so the job fails once and falls into 
+launchd's respawn throttle. Exact name match, opt-in, no effect when the argument is absent.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -515,6 +515,47 @@
+ 	}
+ 	return 0;
+ }
++
++/*
++ * Boot-arg j7nospawn=name[,name...] refuses exec of those file names.
++ *
++ * On this phone bluetoothd (no Bluetooth transport driver) and fairplayd.H2
++ * (no DRM helper it can initialise) exit as soon as they start, and launchd
++ * respawns the pair back to back: the 2026-11-14 console ends in hundreds of
++ * consecutive "exec xpcproxy / exec fairplayd.H2 / exec bluetoothd" triples
++ * with nothing else happening, which is userland CPU spent on nothing while
++ * SpringBoard is trying to draw. Refusing the exec makes the job fail once and
++ * fall into launchd's respawn throttle instead of spinning.
++ *
++ * Opt-in, exact file-name match, empty list means no change.
++ */
++static boolean_t
++sweet_exec_denied(const char *name)
++{
++	static char spec[256];
++	static int state;
++
++	if (state == 0) {
++		state = PE_parse_boot_argn("j7nospawn", spec, sizeof(spec)) && spec[0] ? 2 : 1;
++	}
++	if (state != 2 || name == NULL || name[0] == '\0') {
++		return FALSE;
++	}
++	for (const char *p = spec; *p; ) {
++		size_t len = 0;
++		while (p[len] && p[len] != ',') {
++			len++;
++		}
++		if (len > 0 && strlen(name) == len && strncmp(p, name, len) == 0) {
++			return TRUE;
++		}
++		p += len;
++		if (*p == ',') {
++			p++;
++		}
++	}
++	return FALSE;
++}
+ #endif
+ 
+ /*
+@@ -7490,6 +7531,15 @@
+ 				error = EACCES;
+ 				goto done;
+ 			}
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(ARM64_BOARD_CONFIG_HEROLTE)
++			if (sweet_exec_denied(p->p_name)) {
++				printf("exec %s refused by j7nospawn\n", p->p_name);
++				signature_failure_reason = os_reason_create(OS_REASON_EXEC,
++				    EXEC_EXIT_REASON_SECURITY_POLICY);
++				error = EPERM;
++				goto done;
++			}
++#endif
+ #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 			/* A short line keeps the persistent console ring useful. */
+ 			printf("exec %s\n", p->p_name);

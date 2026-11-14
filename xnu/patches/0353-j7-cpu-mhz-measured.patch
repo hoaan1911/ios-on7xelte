@@ -1,0 +1,147 @@
+From: j7 fb
+Subject: j7: measure the core clock instead of reporting zero
+
+cntfrq_el0 reads zero on this firmware, so the perf line has printed cpu_mhz=0
+since the probe was added and nothing in the system says what the CPU is
+actually running at. mach_absolute_time works here (every other number in that
+line comes from it), so measure against it, counting cycles with a dependent
+add chain as on Cortex-A53. Timing the same chain with an 8-add and a 16-add
+body cancels the loop overhead instead of estimating it. No MMIO, no PMU, no
+privileged register writes, and the result is cached after the first window.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -27,6 +27,10 @@
+ extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size,
+     unsigned int flags);
+ extern "C" void ml_io_unmap(vm_offset_t addr, vm_size_t size);
++/* Timebase helpers: linkage specs are only legal at file scope. */
++extern "C" uint64_t mach_absolute_time(void);
++extern "C" void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *nsecs);
++extern "C" void nanoseconds_to_absolutetime(uint64_t nsecs, uint64_t *abstime);
+ 
+ /*
+  * Where a frame's time goes, counted instead of guessed.
+@@ -52,57 +56,77 @@
+ }
+ 
+ /* Real core clock. The tree has no cpufreq driver, so the CPU runs at whatever
+- * rate the bootloader left behind and nothing in the system reports it. Read the
+- * architectural cycle counter over a 5 ms arch-timer window; if the PMU is not
+- * counting, fall back to a dependent add chain, which retires one add per cycle
+- * on this core. Diagnostic only: no MMIO, no register writes. */
++ * rate the bootloader left behind and nothing in the system reports it.
++ *
++ * The first version timed a loop against cntfrq_el0/cntvct_el0 and printed
++ * cpu_mhz=0 for every window, because this firmware leaves cntfrq_el0 at zero.
++ * mach_absolute_time() does work here - every other number in the perf line
++ * comes from it - so measure against that instead, and count cycles with a
++ * dependent add chain, which retires one add per cycle on Cortex-A53.
++ *
++ * Loop overhead is not guessed away: the same chain is timed with an 8-add and
++ * a 16-add body, so with T = n*a + (n/u)*b for u adds per iteration the
++ * per-add cost a falls out exactly:
++ *     a = T * (2/n16 - 1/n8),  freq = 1/a
++ * Diagnostic only: no MMIO, no privileged register writes, no PMU. The result
++ * is cached after the first successful measurement.
++ */
+ extern "C" unsigned
+ j7m_cpu_mhz(void)
+ {
+-    uint64_t freq = 0, t0 = 0, t1 = 0, c0 = 0, c1 = 0;
+-    __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(freq));
+-    if (freq == 0) {
+-        return 0;
+-    }
+-    __asm__ __volatile__("mrs %0, pmcr_el0" : "=r"(c0));
+-    __asm__ __volatile__("msr pmcr_el0, %0" :: "r"(c0 | 1));
+-    __asm__ __volatile__("msr pmcntenset_el0, %0" :: "r"(1ULL << 31));
+-    __asm__ __volatile__("mrs %0, pmccntr_el0" : "=r"(c0));
+-    {
+-        uint64_t deadline, now;
+-        __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(t0));
+-        deadline = t0 + freq / 200;
+-        do {
+-            __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(now));
+-        } while (now < deadline);
+-        t1 = now;
++    static unsigned cached;
++
++    if (cached) {
++        return cached;
+     }
+-    __asm__ __volatile__("mrs %0, pmccntr_el0" : "=r"(c1));
+-    __asm__ __volatile__("msr pmcr_el0, %0" :: "r"(c0));
+-    if (c1 > c0 && t1 > t0) {
+-        return (unsigned)(((c1 - c0) * freq) / ((t1 - t0) * 1000000ULL));
++
++    uint64_t window, t0, t1, n8 = 0, n16 = 0, ns = 0;
++    nanoseconds_to_absolutetime(2000000ULL, &window);
++
++    t0 = mach_absolute_time();
++    do {
++        uint64_t acc = 0, i = 2048;
++        __asm__ __volatile__(
++            "1:\n"
++            "add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n"
++            "add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n"
++            "subs %1, %1, #1\n"
++            "b.ne 1b\n"
++            : "+r"(acc), "+r"(i) :: "cc");
++        n8 += 2048ULL * 8;
++        t1 = mach_absolute_time();
++    } while (t1 - t0 < window);
++
++    t0 = mach_absolute_time();
++    do {
++        uint64_t acc = 0, i = 2048;
++        __asm__ __volatile__(
++            "1:\n"
++            "add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n"
++            "add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n"
++            "add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n"
++            "add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n"
++            "subs %1, %1, #1\n"
++            "b.ne 1b\n"
++            : "+r"(acc), "+r"(i) :: "cc");
++        n16 += 2048ULL * 16;
++        t1 = mach_absolute_time();
++    } while (t1 - t0 < window);
++
++    absolutetime_to_nanoseconds(t1 - t0, &ns);
++    if (ns == 0 || n8 == 0 || n16 == 0) {
++        return 0;
+     }
++
++    /* per-add nanoseconds = ns * (2/n16 - 1/n8) */
+     {
+-        uint64_t n = 0, i, deadline, now;
+-        __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(t0));
+-        deadline = t0 + freq / 200;
+-        do {
+-            i = 4096;
+-            __asm__ __volatile__(
+-                "1:\n"
+-                "add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n"
+-                "add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n add %0, %0, #1\n"
+-                "subs %1, %1, #1\n b.ne 1b\n"
+-                : "+r"(n), "+r"(i) :: "cc");
+-            n *= 10; n /= 8;
+-            __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(now));
+-        } while (now < deadline);
+-        t1 = now;
+-        if (t1 == t0) {
++        uint64_t delta = (2ULL * ns * 1000ULL) / n16 - (ns * 1000ULL) / n8;
++        if (delta == 0) {
+             return 0;
+         }
+-        return (unsigned)((n * freq) / ((t1 - t0) * 1000000ULL));
++        cached = (unsigned)(1000000ULL / delta);
+     }
++    return cached;
+ }
+ 
+ extern "C" void

@@ -1,0 +1,66 @@
+From: j7 fb
+Subject: j7 fb: fill a cacheable row, then copy it to the panel once
+
+With clients drawing into the canvas surface there is finally a frame loop - swap_ends
+went from 2 to 471 in one boot - and the copy is now the largest cost we control: 28 ms per
+750x1334 -> 1080x1920 frame, up from 14 ms when it only ran twice a window.
+
+It writes one pixel at a time straight into fPixels, which is the write-combined panel
+mapping, the most expensive place to do single 4-byte stores. Build the row in a cacheable
+buffer instead and copy it in one sequential pass, and write each run of identical output
+pixels from a single source read rather than gathering per output pixel.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -688,6 +688,10 @@
+     int32_t w, int32_t h)
+ {
+ 	static uint16_t column[2048];
++	/* One cacheable destination row. fPixels is write-combined panel memory, where a
++	 * per-pixel store costs far more than filling a normal row and copying it once: the
++	 * 750x1334 -> 1080x1920 frame measured 28 ms done pixel by pixel. */
++	static uint32_t row[2048];
+ 	/* panel / logical ratio, whatever the logical size is (1.5 for 2/3 of the panel, 1.44 for 750x1334) */
+ 	int32_t px0 = dx * (int32_t)fWidth / (int32_t)fLogicalW, px1 = (dx + w) * (int32_t)fWidth / (int32_t)fLogicalW;
+ 	int32_t py0 = dy * (int32_t)fHeight / (int32_t)fLogicalH, py1 = (dy + h) * (int32_t)fHeight / (int32_t)fLogicalH;
+@@ -706,21 +710,30 @@
+ 		column[x] = (uint16_t)(c < 0 ? 0 : (c >= w ? w - 1 : c));
+ 	}
+ 	int32_t previous = -1;
+-	uint32_t *prevRow = NULL;
+ 	for (int32_t py = py0; py < py1; py++) {
+ 		int32_t r = py * (int32_t)fLogicalH / (int32_t)fHeight - dy;
+ 		r = r < 0 ? 0 : (r >= h ? h - 1 : r);
+ 		uint32_t *out = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes + (uint64_t)px0 * 4);
+-		if (r == previous && prevRow != NULL) {
+-			memcpy(out, prevRow, (size_t)pw * 4);
+-		} else {
++		if (r != previous) {
+ 			const uint32_t *in = (const uint32_t *)(src + (uint64_t)r * srcRowBytes);
+-			for (int32_t x = 0; x < pw; x++) {
+-				out[x] = in[column[x]];
++			/* One source pixel becomes one or two output pixels: write the run, not the
++			 * output pixel, so the source is read once per pixel instead of gathered. */
++			int32_t x = 0;
++			while (x < pw) {
++				int32_t c = column[x];
++				int32_t end = x + 1;
++				uint32_t v;
++				while (end < pw && column[end] == c) {
++					end++;
++				}
++				v = in[c];
++				for (; x < end; x++) {
++					row[x] = v;
++				}
+ 			}
+ 			previous = r;
+ 		}
+-		prevRow = out;
++		memcpy(out, row, (size_t)pw * 4);
+ 	}
+ 	return (uint64_t)pw * (uint64_t)(py1 - py0) * 4;
+ }

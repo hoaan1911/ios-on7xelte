@@ -1,0 +1,56 @@
+From: j7 fb
+Subject: j7 fb: skip panel rows that did not change
+
+The log after the canvas-surface change shows 8,294,400 bytes presented per frame - the
+whole panel - where the old path presented half of it, and 42 ms per frame with it. The
+row-buffer rewrite is faster per byte, but the work doubled, so the visible number went up.
+
+Keep a copy of the canvas as last presented and compare each source row against it before
+scaling. A row that did not change already has the right pixels on the panel, so it is
+skipped entirely. A static screen then costs almost nothing to present and only changed rows
+pay the write-combined cost; a full-screen animation still changes every row, which is the
+honest worst case.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -143,6 +143,7 @@
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+ 	SweetSurface *fCanvas;          /* what clients draw and swap into */
++	uint32_t     *fShadow;          /* canvas as last presented, for row skipping */
+ 	IOLock       *fLock;            /* swaps and client list */
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+@@ -300,6 +301,10 @@
+ 		uint32_t stride = (fLogicalW * 4 + 63) & ~63u;
+ 		fCanvas = sweet_surface_create_owned(fLogicalW, fLogicalH, stride,
+ 		    SWEET_FB_FORMAT_BGRA);
++		fShadow = (uint32_t *)IOMallocData((vm_size_t)fLogicalW * fLogicalH * 4);
++		if (fShadow != NULL) {
++			bzero(fShadow, (vm_size_t)fLogicalW * fLogicalH * 4);
++		}
+ 		if (fCanvas == NULL) {
+ 			IOLog("SWEET FB: no canvas surface, clients keep the panel\n");
+ 		} else {
+@@ -735,8 +740,17 @@
+ 		int32_t r = py * (int32_t)fLogicalH / (int32_t)fHeight - dy;
+ 		r = r < 0 ? 0 : (r >= h ? h - 1 : r);
+ 		uint32_t *out = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes + (uint64_t)px0 * 4);
++		const uint32_t *in = (const uint32_t *)(src + (uint64_t)r * srcRowBytes);
++		if (r != previous && fShadow != NULL &&
++		    memcmp(fShadow + (uint64_t)r * fLogicalW, in, (size_t)w * 4) == 0) {
++			/* Unchanged since the last present: the panel rows already hold it. */
++			previous = r;
++			continue;
++		}
+ 		if (r != previous) {
+-			const uint32_t *in = (const uint32_t *)(src + (uint64_t)r * srcRowBytes);
++			if (fShadow != NULL) {
++				memcpy(fShadow + (uint64_t)r * fLogicalW, in, (size_t)w * 4);
++			}
+ 			/* One source pixel becomes one or two output pixels: write the run, not the
+ 			 * output pixel, so the source is read once per pixel instead of gathered. */
+ 			int32_t x = 0;

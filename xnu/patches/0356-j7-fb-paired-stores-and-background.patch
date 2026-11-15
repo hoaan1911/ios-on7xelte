@@ -1,0 +1,89 @@
+From: j7 fb
+Subject: j7 fb: halve the panel store count and paint a background
+
+The present copy measured 34 ms for 8.29 MB, which is about 15 cycles per
+four-byte store: the panel map costs one bus transaction per store and never
+merges them, so the copy is transaction bound, not bandwidth bound. Write two
+pixels per store.
+
+The same loop now looks at the alpha channel. Every swap record carries a single
+non-zero layer id, so the compositor never hands us a desktop layer to composite
+and the wallpaper area arrives fully transparent, which the panel shows as black.
+Replace fully transparent pixels with a cheap vertical background and log how
+many there were, so the next log says whether that was the reason. Pixels the
+client actually wrote are untouched.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -39,6 +39,9 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ /* iokit/Kernel/arm/A5XELTEGPU.cpp: per-window submit/cache/wait counters, cleared by the read. */
+ extern "C" unsigned j7m_cpu_mhz(void);
++/* set by scaledCopy(): pixels the client left fully transparent in the last present */
++static uint32_t sweet_fb_alpha0;
++static uint32_t sweet_fb_alpha0_logged;
+ extern "C" void j7m_take_stats(uint64_t *submits, uint64_t *waits, uint64_t *waitUs,
+     uint64_t *storeUs, uint64_t *flushUs);
+ /* iokit/Kernel/arm/SweetSurface.cpp: wrap selectors backboardd asked for, cleared by the read. */
+@@ -720,7 +723,7 @@
+ 	/* One cacheable destination row. fPixels is write-combined panel memory, where a
+ 	 * per-pixel store costs far more than filling a normal row and copying it once: the
+ 	 * 750x1334 -> 1080x1920 frame measured 28 ms done pixel by pixel. */
+-	static uint32_t row[2048];
++	static uint32_t row[2048] __attribute__((aligned(16)));
+ 	/* panel / logical ratio, whatever the logical size is (1.5 for 2/3 of the panel, 1.44 for 750x1334) */
+ 	int32_t px0 = dx * (int32_t)fWidth / (int32_t)fLogicalW, px1 = (dx + w) * (int32_t)fWidth / (int32_t)fLogicalW;
+ 	int32_t py0 = dy * (int32_t)fHeight / (int32_t)fLogicalH, py1 = (dy + h) * (int32_t)fHeight / (int32_t)fLogicalH;
+@@ -744,6 +747,13 @@
+ 		r = r < 0 ? 0 : (r >= h ? h - 1 : r);
+ 		uint32_t *out = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes + (uint64_t)px0 * 4);
+ 		const uint32_t *in = (const uint32_t *)(src + (uint64_t)r * srcRowBytes);
++		/* What the client leaves fully transparent is what the panel used to show as black: every
++		 * swap record carries a single non-zero layer id, so the compositor never hands us the
++		 * desktop behind the icons and there is nothing to composite. Paint a cheap vertical
++		 * background into those pixels instead of leaving zeroes. Client pixels are untouched. */
++		const uint32_t ramp = (uint32_t)py * 256u / (uint32_t)(fHeight ? fHeight : 1);
++		const uint32_t bg = 0xff000000u | ((12u + (ramp * 40u >> 8)) << 16) |
++		    ((16u + (ramp * 26u >> 8)) << 8) | (40u + (ramp * 70u >> 8));
+ 		if (r != previous && fShadow != NULL &&
+ 		    memcmp(fShadow + (uint64_t)r * fLogicalW, in, (size_t)w * 4) == 0) {
+ 			/* Unchanged since the last present: the panel rows already hold it. */
+@@ -765,13 +775,34 @@
+ 					end++;
+ 				}
+ 				v = in[c];
++				if ((v & 0xff000000u) == 0) {
++					v = bg;
++					sweet_fb_alpha0 += (uint32_t)(end - x);
++				}
+ 				for (; x < end; x++) {
+ 					row[x] = v;
+ 				}
+ 			}
+ 			previous = r;
+ 		}
+-		memcpy(out, row, (size_t)pw * 4);
++		/* Two pixels per store. The present copy measured 34 ms for 8.29 MB, which is about
++		 * 15 cycles per four-byte store: the panel map costs one bus transaction per store and
++		 * never merges them, so this is transaction bound, not bandwidth bound. */
++		{
++			uint64_t *out64 = (uint64_t *)out;
++			const uint64_t *row64 = (const uint64_t *)row;
++			int32_t i, pairs = pw >> 1;
++			for (i = 0; i < pairs; i++) {
++				out64[i] = row64[i];
++			}
++			if (pw & 1) {
++				out[pw - 1] = row[pw - 1];
++			}
++		}
++	}
++	if (sweet_fb_alpha0 != 0 && !sweet_fb_alpha0_logged) {
++		sweet_fb_alpha0_logged = 1;
++		IOLog("A5XELTE FB: %u transparent pixels replaced with a background\n", sweet_fb_alpha0);
+ 	}
+ 	return (uint64_t)pw * (uint64_t)(py1 - py0) * 4;
+ }

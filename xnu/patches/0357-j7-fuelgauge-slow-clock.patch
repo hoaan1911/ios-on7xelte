@@ -1,0 +1,28 @@
+From: j7 fb
+Subject: j7: clock the fuel gauge slower; prescaler 1 never finished a byte
+
+The gauge ACKs its address at 7-bit 0x3b and then never completes a transfer, and the 
+prescaler written as 3 read back as 1, so the bus is running faster than the gauge can 
+follow. Use the slowest prescaler. The register map is unchanged: RSOC 0x08, RVBAT 0x04, 
+RCUR 0x06, all word reads.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/bsd/dev/a5xelte_battery.c b/bsd/dev/a5xelte_battery.c
+--- a/bsd/dev/a5xelte_battery.c
++++ b/bsd/dev/a5xelte_battery.c
+@@ -107,9 +107,11 @@
+ 		}
+ 		delay(1);
+ 	}
+-	/* 0xe3, not 0xe1: bits 1:0 are the clock prescaler (the touch bus on this phone leaves it at
+-	 * 3), and the boot log showed a 0xe1 transfer ACKing the address and then never finishing. */
+-	fg_wr(FG_CON, 0xe3u);
++	/* Bits 3:0 are the clock prescaler. 0xe1 (prescaler 1) ACKed the address and then never
++	 * finished, and the read-back of 0xe3 also came back as 0xe1, so try the slowest step first:
++	 * a gauge that answers but cannot complete a byte is usually clocking faster than it can
++	 * follow, and 16*(15+1) divides the bus clock far harder than 16*(3+1). */
++	fg_wr(FG_CON, 0xefu);
+ 	fg_wr(FG_FILTER, 7u);
+ 	fg_wr(FG_DS, FG_ADDR | (receive ? 1u : 0u));
+ 	fg_wr(FG_STAT, receive ? FG_MODE_RX : FG_MODE_TX);

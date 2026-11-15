@@ -1,0 +1,35 @@
+From: j7 fb
+Subject: j7: do not print a crash report for a SIGKILLed spawn
+
+j7nospawn stops bluetoothd and fairplayd.H2 from running, but every refused
+exec leaves a process that the spawn machinery kills with SIGKILL, and the
+console crash reporter dumps its registers and a backtrace each time. Those
+registers belong to the image that never loaded, so the report says nothing.
+The console is the 115200-baud UART, so a few dozen lines per attempt costs
+more than the attempt itself - the 2026-11-14 log is dominated by it.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -843,6 +843,19 @@
+ 	arm_saved_state_t *ss = find_user_regs(thread);
+ 	uint64_t slide = 0, mh = task->mach_header_vm_address;
+ 
++	/*
++	 * A process killed with SIGKILL and no signal code has no fault to
++	 * report: the registers it would print belong to the image it failed to
++	 * become. On this phone that is exactly the spawn machinery tearing down
++	 * a refused exec, and the 2026-11-14 log spends most of its console on
++	 * it - a few dozen lines per attempt, over the 115200-baud UART, while
++	 * SpringBoard is waiting for the CPU. Skip that case and keep the report
++	 * for real faults.
++	 */
++	if (sig == 9 /* SIGKILL */ && code == 0) {
++		return;
++	}
++
+ 	vm_shared_region_t sr = vm_shared_region_get(task);
+ 	if (sr != NULL) {
+ 		slide = sr->sr_slide;

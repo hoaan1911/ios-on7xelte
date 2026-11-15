@@ -1,0 +1,123 @@
+From: j7 fb
+Subject: j7 fb: store the panel four rows at a time, keep the mapping that boots
+
+The default-cache mapping of the panel took an alignment fault on the first bulk store and 
+panicked the phone (esr 0x96000061, DFSC 0x21, far 0xfffffff9bbb1e040, immediately after 
+the canvas was created), so that range is device memory and the write-combining mapping 
+stays the default. j7fb_cache=1 still asks for the other one.
+fRowBytes is 4320, which is 67.5 cache lines: a row's stores start 32 bytes into a line and 
+finish 32 bytes into another, so write-combining emits two partial lines for every row, 
+3840 of them a frame. Stage four rows and store them as one run of 17280 bytes - 270 whole 
+lines - starting on an even row so both ends are aligned.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -75,9 +75,14 @@
+  * mapping charges every store on its own: 8.29 MB into the 1080x1920 panel measured
+  * 34 ms, about 16 ns a word, which is store latency rather than memory bandwidth.
+  * Let those writes land in the cache and clean them once the rows are done instead.
+- * j7fb_cache=0 restores the write-combining mapping.
++ *
++ * Off by default: kIOMapDefaultCache on this physical range is device memory, not
++ * cacheable normal memory, and the first bulk store to it panicked the phone with an
++ * alignment fault (2026-11-15: esr 0x96000061, DFSC 0x21, far 0xfffffff9bbb1e040, right
++ * after "canvas surface id 2"). j7fb_cache=1 still asks for it, for a trial that can
++ * bring its own mapping.
+  */
+-extern "C" int sweet_surface_panel_cacheable = 1;
++extern "C" int sweet_surface_panel_cacheable = 0;
+ 
+ static IOLock       *sweet_surface_lock;
+ static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -292,9 +292,9 @@
+ 	 * every swap layer empty); scaled, it is the panel's top-left part.  It is a view of the panel
+ 	 * frame buffer, so it stays clamped to the panel even when the presented size is larger. */
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+-	/* j7fb_cache=1 (default): the panel is mapped cacheable, and the band that present()
+-	 * writes is cleaned once, before the display controller scans it. */
+-	int panel_cache = 1;
++	/* j7fb_cache=1: map the panel cacheable and clean the band once. Off by default - the
++	 * default-cache mapping of this physical range is device memory and faulted. */
++	int panel_cache = 0;
+ 	PE_parse_boot_argn("j7fb_cache", &panel_cache, sizeof(panel_cache));
+ 	sweet_surface_panel_cacheable = panel_cache != 0;
+ #endif
+@@ -743,6 +743,12 @@
+ 	 * per-pixel store costs far more than filling a normal row and copying it once: the
+ 	 * 750x1334 -> 1080x1920 frame measured 28 ms done pixel by pixel. */
+ 	static uint32_t row[2048] __attribute__((aligned(16)));
++	/* Four panel rows staged and stored as one contiguous run. fRowBytes is 4320, which is
++	 * 67.5 cache lines: a row's stores start 32 bytes into a line and end 32 bytes into
++	 * another, so a write-combining mapping flushes two partial lines per row. Four rows are
++	 * 17280 bytes, 270 whole lines, and a band that starts on an even row is 64-byte aligned
++	 * at both ends, so nothing is partial. */
++	static uint32_t band[4][2048] __attribute__((aligned(64)));
+ 	/* panel / logical ratio, whatever the logical size is (1.5 for 2/3 of the panel, 1.44 for 750x1334) */
+ 	int32_t px0 = dx * (int32_t)fWidth / (int32_t)fLogicalW, px1 = (dx + w) * (int32_t)fWidth / (int32_t)fLogicalW;
+ 	int32_t py0 = dy * (int32_t)fHeight / (int32_t)fLogicalH, py1 = (dy + h) * (int32_t)fHeight / (int32_t)fLogicalH;
+@@ -762,6 +768,9 @@
+ 	}
+ 	int32_t previous = -1;
+ 	uint64_t buildStart = 0, storeStart = 0;
++	/* Whole rows, and a band boundary that keeps the run aligned: see band[] above. */
++	const bool banded = (px0 == 0 && pw * 4 == (int32_t)fRowBytes);
++	int32_t bandRows = 0, bandFirst = 0;
+ 	for (int32_t py = py0; py < py1; py++) {
+ 		int32_t r = py * (int32_t)fLogicalH / (int32_t)fHeight - dy;
+ 		r = r < 0 ? 0 : (r >= h ? h - 1 : r);
+@@ -778,6 +787,11 @@
+ 		if (r != previous && fShadow != NULL &&
+ 		    memcmp(fShadow + (uint64_t)r * fLogicalW, in, (size_t)w * 4) == 0) {
+ 			/* Unchanged since the last present: the panel rows already hold it. */
++			if (bandRows > 0) {
++				memcpy((void *)(fPixels + (uint64_t)bandFirst * fRowBytes),
++				    band, (size_t)bandRows * fRowBytes);
++				bandRows = 0;
++			}
+ 			previous = r;
+ 			continue;
+ 		}
+@@ -816,16 +830,18 @@
+ 		/* Two pixels per store. The present copy measured 34 ms for 8.29 MB, which is about
+ 		 * 15 cycles per four-byte store: the panel map costs one bus transaction per store and
+ 		 * never merges them, so this is transaction bound, not bandwidth bound. */
+-		{
+-			uint64_t *out64 = (uint64_t *)out;
+-			const uint64_t *row64 = (const uint64_t *)row;
+-			int32_t i, pairs = pw >> 1;
+-			for (i = 0; i < pairs; i++) {
+-				out64[i] = row64[i];
++		if (banded && (bandRows > 0 || (py & 1) == 0)) {
++			if (bandRows == 0) {
++				bandFirst = py;
+ 			}
+-			if (pw & 1) {
+-				out[pw - 1] = row[pw - 1];
++			memcpy(band[bandRows], row, (size_t)pw * 4);
++			if (++bandRows == 4 || py == py1 - 1) {
++				memcpy((void *)(fPixels + (uint64_t)bandFirst * fRowBytes),
++				    band, (size_t)bandRows * fRowBytes);
++				bandRows = 0;
+ 			}
++		} else {
++			memcpy(out, row, (size_t)pw * 4);
+ 		}
+ 		{
+ 			uint64_t ns = 0;
+@@ -833,6 +849,10 @@
+ 			sweet_fb_store_ns += ns;
+ 		}
+ 	}
++	if (bandRows > 0) {
++		memcpy((void *)(fPixels + (uint64_t)bandFirst * fRowBytes),
++		    band, (size_t)bandRows * fRowBytes);
++	}
+ 	if (sweet_fb_alpha0 != 0 && !sweet_fb_alpha0_logged) {
+ 		sweet_fb_alpha0_logged = 1;
+ 		IOLog("A5XELTE FB: %u black pixels replaced with a background\n", sweet_fb_alpha0);

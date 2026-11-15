@@ -1,0 +1,92 @@
+From: j7 fb
+Subject: j7 fb: copy into a cacheable panel and clean it once
+
+8.29 MB into the 1080x1920 panel took 34 ms, about 16 ns a word, which is store latency and 
+not memory bandwidth: the write-combining mapping charges every store on its own. Map the 
+panel cacheable and clean the written band once, before the display controller scans it. 
+j7fb_cache=0 puts the old mapping back.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -70,6 +70,15 @@
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
+ #define kIOSurfaceLockReadOnly          0x1
+ 
++/*
++ * The panel surface is written once per frame from the kernel, and a write-combining
++ * mapping charges every store on its own: 8.29 MB into the 1080x1920 panel measured
++ * 34 ms, about 16 ns a word, which is store latency rather than memory bandwidth.
++ * Let those writes land in the cache and clean them once the rows are done instead.
++ * j7fb_cache=0 restores the write-combining mapping.
++ */
++extern "C" int sweet_surface_panel_cacheable = 1;
++
+ static IOLock       *sweet_surface_lock;
+ static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+@@ -101,7 +110,7 @@
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache);
++		kernelMap = memory->map(mapCache);
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -249,7 +258,7 @@
+ 	s->allocSize = (uint32_t)round_page((uint64_t)bytesPerRow *
+ 	    (mappedHeight > height ? mappedHeight : height));
+ 	s->memory = IOMemoryDescriptor::withPhysicalAddress(phys, s->allocSize, kIODirectionInOut);
+-	s->mapCache = kIOMapWriteCombineCache;
++	s->mapCache = sweet_surface_panel_cacheable ? kIOMapDefaultCache : kIOMapWriteCombineCache;
+ 	if (s->memory == NULL || !sweet_surface_publish(s)) {
+ 		s->release();
+ 		return NULL;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -49,6 +49,12 @@
+     uint64_t *storeUs, uint64_t *flushUs);
+ /* iokit/Kernel/arm/SweetSurface.cpp: wrap selectors backboardd asked for, cleared by the read. */
+ extern "C" unsigned sweet_surface_take_wrap_calls(void);
++/* iokit/Kernel/arm/SweetSurface.cpp: the panel mapping's cache mode, and the clean that
++ * has to go with a cacheable one. */
++extern "C" int sweet_surface_panel_cacheable;
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++extern "C" void flush_dcache64(addr64_t addr, unsigned length, boolean_t phys);
++#endif
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ extern "C" uint64_t a5xelte_power_pressed_at;   /* bsd/dev/a5xelte_keys.c */
+ #endif
+@@ -285,6 +291,13 @@
+ 	/* The default surface must have the presented size (a mismatch left
+ 	 * every swap layer empty); scaled, it is the panel's top-left part.  It is a view of the panel
+ 	 * frame buffer, so it stays clamped to the panel even when the presented size is larger. */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* j7fb_cache=1 (default): the panel is mapped cacheable, and the band that present()
++	 * writes is cleaned once, before the display controller scans it. */
++	int panel_cache = 1;
++	PE_parse_boot_argn("j7fb_cache", &panel_cache, sizeof(panel_cache));
++	sweet_surface_panel_cacheable = panel_cache != 0;
++#endif
+ 	const uint32_t surfaceW = fScaled && fLogicalW < fWidth ? fLogicalW : fWidth;
+ 	const uint32_t surfaceH = fScaled && fLogicalH < fHeight ? fLogicalH : fHeight;
+ 	/* Map all fHeight panel rows even when the surface is only the presented (canvas) part of
+@@ -824,6 +837,14 @@
+ 		sweet_fb_alpha0_logged = 1;
+ 		IOLog("A5XELTE FB: %u black pixels replaced with a background\n", sweet_fb_alpha0);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	if (sweet_surface_panel_cacheable) {
++		/* One clean for the whole band: the display controller reads memory, not this
++		 * cache, so the dirty lines have to reach it before the next scanout. */
++		flush_dcache64((addr64_t)(uintptr_t)(fPixels + (uint64_t)py0 * fRowBytes),
++		    (unsigned)((py1 - py0) * (int32_t)fRowBytes), FALSE);
++	}
++#endif
+ 	return (uint64_t)pw * (uint64_t)(py1 - py0) * 4;
+ }
+ 

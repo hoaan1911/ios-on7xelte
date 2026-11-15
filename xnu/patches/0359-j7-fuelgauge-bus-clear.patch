@@ -1,0 +1,31 @@
+From: j7 fb
+Subject: j7: clear the stuck gauge bus before the address byte
+
+Prescaler 3 completed the register-pointer write; the slowest step made even that fail, so 
+the bus is already as slow as it wants to be. The failure is IICSTAT bit 5 never dropping, 
+so issue an explicit STOP and let the lines settle before the address byte.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/bsd/dev/a5xelte_battery.c b/bsd/dev/a5xelte_battery.c
+--- a/bsd/dev/a5xelte_battery.c
++++ b/bsd/dev/a5xelte_battery.c
+@@ -107,11 +107,13 @@
+ 		}
+ 		delay(1);
+ 	}
+-	/* Bits 3:0 are the clock prescaler. 0xe1 (prescaler 1) ACKed the address and then never
+-	 * finished, and the read-back of 0xe3 also came back as 0xe1, so try the slowest step first:
+-	 * a gauge that answers but cannot complete a byte is usually clocking faster than it can
+-	 * follow, and 16*(15+1) divides the bus clock far harder than 16*(3+1). */
+-	fg_wr(FG_CON, 0xefu);
++	/* Prescaler 3: the register-pointer write completed at this rate, and the slowest step
++	 * (0xef) made even that fail, so the bus is already as slow as it wants to be. */
++	fg_wr(FG_CON, 0xe3u);
++	/* The failure is IICSTAT bit 5 never dropping, so issue an explicit STOP and let the
++	 * lines settle before the address byte instead of charging into a busy bus. */
++	fg_stop();
++	delay(200);
+ 	fg_wr(FG_FILTER, 7u);
+ 	fg_wr(FG_DS, FG_ADDR | (receive ? 1u : 0u));
+ 	fg_wr(FG_STAT, receive ? FG_MODE_RX : FG_MODE_TX);

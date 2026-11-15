@@ -1,0 +1,106 @@
+From: j7 fb
+Subject: j7 fb: replace wide black runs, and split the copy timing
+
+The alpha test settled the wallpaper question: a whole frame carried only 4320 fully 
+transparent pixels, so the desktop is not sent as transparency and there is no second layer 
+to composite. It arrives as opaque black. Replace wide runs of opaque black instead - a 
+wallpaper area is hundreds of pixels across and a glyph stem is one or two - so text and 
+icons survive.
+
+The paired stores did not move the 34 ms copy, so stop guessing: time the row build and the 
+panel stores separately and print both.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -39,6 +39,9 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ /* iokit/Kernel/arm/A5XELTEGPU.cpp: per-window submit/cache/wait counters, cleared by the read. */
+ extern "C" unsigned j7m_cpu_mhz(void);
++
++/* scaledCopy(): row build (index, background) versus panel stores, nanoseconds */
++static uint64_t sweet_fb_build_ns, sweet_fb_store_ns;
+ /* set by scaledCopy(): pixels the client left fully transparent in the last present */
+ static uint32_t sweet_fb_alpha0;
+ static uint32_t sweet_fb_alpha0_logged;
+@@ -481,6 +484,9 @@
+ 			    fb->fPerfNS / fb->fPerfFrames / 1000, fb->fPerfMaxNS / 1000);
+ 			IOLog("A5XELTE FB: submits=%llu wait_us=%llu store_us=%llu flush_us=%llu wrap=%u cpu_mhz=%u\n",
+ 			    submits, waitUs, storeUs, flushUs, wraps, j7m_cpu_mhz());
++			IOLog("A5XELTE FB: copy split build_ms=%llu store_ms=%llu\n",
++			    sweet_fb_build_ns / 1000000, sweet_fb_store_ns / 1000000);
++			sweet_fb_build_ns = sweet_fb_store_ns = 0;
+ 			IOLog("A5XELTE FB: swap_ends=%llu swap_waits=%llu avg_swapwait_us=%llu\n",
+ 			    sweet_fb_swap_count, sweet_fb_swap_waits,
+ 			    sweet_fb_swap_waits ? sweet_fb_swap_wait_us / sweet_fb_swap_waits : 0);
+@@ -742,15 +748,17 @@
+ 		column[x] = (uint16_t)(c < 0 ? 0 : (c >= w ? w - 1 : c));
+ 	}
+ 	int32_t previous = -1;
++	uint64_t buildStart = 0, storeStart = 0;
+ 	for (int32_t py = py0; py < py1; py++) {
+ 		int32_t r = py * (int32_t)fLogicalH / (int32_t)fHeight - dy;
+ 		r = r < 0 ? 0 : (r >= h ? h - 1 : r);
+ 		uint32_t *out = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes + (uint64_t)px0 * 4);
+ 		const uint32_t *in = (const uint32_t *)(src + (uint64_t)r * srcRowBytes);
+-		/* What the client leaves fully transparent is what the panel used to show as black: every
+-		 * swap record carries a single non-zero layer id, so the compositor never hands us the
+-		 * desktop behind the icons and there is nothing to composite. Paint a cheap vertical
+-		 * background into those pixels instead of leaving zeroes. Client pixels are untouched. */
++		/* The desktop behind the icons arrives as opaque black, not as transparency: a whole frame
++		 * carried only 4320 fully transparent pixels, and every swap record carries a single
++		 * non-zero layer id, so there is no wallpaper layer to composite. Replace wide runs of
++		 * opaque black instead - a wallpaper area is hundreds of pixels across, a glyph stem is
++		 * one or two - so text and icons survive. */
+ 		const uint32_t ramp = (uint32_t)py * 256u / (uint32_t)(fHeight ? fHeight : 1);
+ 		const uint32_t bg = 0xff000000u | ((12u + (ramp * 40u >> 8)) << 16) |
+ 		    ((16u + (ramp * 26u >> 8)) << 8) | (40u + (ramp * 70u >> 8));
+@@ -761,6 +769,7 @@
+ 			continue;
+ 		}
+ 		if (r != previous) {
++			buildStart = mach_absolute_time();
+ 			if (fShadow != NULL) {
+ 				memcpy(fShadow + (uint64_t)r * fLogicalW, in, (size_t)w * 4);
+ 			}
+@@ -775,7 +784,7 @@
+ 					end++;
+ 				}
+ 				v = in[c];
+-				if ((v & 0xff000000u) == 0) {
++				if (v == 0xff000000u && (end - x) >= 48) {
+ 					v = bg;
+ 					sweet_fb_alpha0 += (uint32_t)(end - x);
+ 				}
+@@ -784,6 +793,12 @@
+ 				}
+ 			}
+ 			previous = r;
++			{
++				uint64_t ns = 0;
++				absolutetime_to_nanoseconds(mach_absolute_time() - buildStart, &ns);
++				sweet_fb_build_ns += ns;
++			}
++			storeStart = mach_absolute_time();
+ 		}
+ 		/* Two pixels per store. The present copy measured 34 ms for 8.29 MB, which is about
+ 		 * 15 cycles per four-byte store: the panel map costs one bus transaction per store and
+@@ -799,10 +814,15 @@
+ 				out[pw - 1] = row[pw - 1];
+ 			}
+ 		}
++		{
++			uint64_t ns = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time() - storeStart, &ns);
++			sweet_fb_store_ns += ns;
++		}
+ 	}
+ 	if (sweet_fb_alpha0 != 0 && !sweet_fb_alpha0_logged) {
+ 		sweet_fb_alpha0_logged = 1;
+-		IOLog("A5XELTE FB: %u transparent pixels replaced with a background\n", sweet_fb_alpha0);
++		IOLog("A5XELTE FB: %u black pixels replaced with a background\n", sweet_fb_alpha0);
+ 	}
+ 	return (uint64_t)pw * (uint64_t)(py1 - py0) * 4;
+ }

@@ -1,0 +1,98 @@
+From: j7 fb
+Subject: j7 fb: fix the copy split timing and read the display controller state
+
+The split reported store_ms=126239656 because the store clock was only started when a row 
+was rebuilt: a stored row that reused the previous row's pixels measured 
+mach_absolute_time() minus zero. Start it for every stored row and report microseconds.
+The bandwidth result stands - avg_copy_us fell from 34-47 ms to 14 ms in one window with 
+four-row bands - but writing under a live scanout tears. Before double buffering the panel 
+and flipping at vsync, read the display controller's window 0 state so the flip is 
+programmed against real values. j7fb_band=0 stores row by row again; j7decon=0 skips the 
+read.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -42,6 +42,8 @@
+ 
+ /* scaledCopy(): row build (index, background) versus panel stores, nanoseconds */
+ static uint64_t sweet_fb_build_ns, sweet_fb_store_ns;
++/* j7fb_band=0 stores one panel row at a time instead of four. */
++static int sweet_fb_band = 1;
+ /* set by scaledCopy(): pixels the client left fully transparent in the last present */
+ static uint32_t sweet_fb_alpha0;
+ static uint32_t sweet_fb_alpha0_logged;
+@@ -401,6 +403,38 @@
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	{
++		int band = 1;
++		if (PE_parse_boot_argn("j7fb_band", &band, sizeof(band))) {
++			sweet_fb_band = band != 0;
++		}
++		IOLog("A5XELTE FB: row bands %s\n", sweet_fb_band ? "on" : "off");
++	}
++	{
++		/* The display controller the loader left running is what scans the panel memory
++		 * this class writes, and every write lands under a live scanout: that is the
++		 * tearing. Read its window 0 state before touching it, so a double buffer and a
++		 * flip at vsync can be programmed against real values instead of guesses. */
++		int decon = 1;
++		if (PE_parse_boot_argn("j7decon", &decon, sizeof(decon)) && decon != 0) {
++			IOMemoryDescriptor *desc = IOMemoryDescriptor::withPhysicalAddress(
++			    0x14830000ULL, 0x1000, kIODirectionNone);
++			IOMemoryMap *map = desc != NULL ? desc->map(kIOMapInhibitCache) : NULL;
++			if (map != NULL) {
++				volatile uint32_t *d = (volatile uint32_t *)map->getVirtualAddress();
++				IOLog("A5XELTE DECON: VIDCON0=%08x VIDCON1=%08x SHADOWCON=%08x WINCHMAP0=%08x\n",
++				    d[0x000 / 4], d[0x004 / 4], d[0x030 / 4], d[0x040 / 4]);
++				IOLog("A5XELTE DECON: WINCON0=%08x WHOLE_X=%u WHOLE_Y=%u OFF_X=%u OFF_Y=%u\n",
++				    d[0x050 / 4], d[0x130 / 4], d[0x134 / 4], d[0x170 / 4], d[0x174 / 4]);
++				IOLog("A5XELTE DECON: OSDA=%08x OSDB=%08x ADD0=%08x UPDATE=%08x TRIGCON=%08x\n",
++				    d[0x230 / 4], d[0x234 / 4], d[0x880 / 4], d[0x710 / 4], d[0x6b0 / 4]);
++			} else {
++				IOLog("A5XELTE DECON: no map\n");
++			}
++			OSSafeReleaseNULL(map);
++			OSSafeReleaseNULL(desc);
++		}
++	}
++	{
+ 		int nowait = 0;
+ 		if (PE_parse_boot_argn("j7fb_nowait", &nowait, sizeof(nowait))) {
+ 			sweet_fb_nowait = nowait != 0;
+@@ -497,8 +531,8 @@
+ 			    fb->fPerfNS / fb->fPerfFrames / 1000, fb->fPerfMaxNS / 1000);
+ 			IOLog("A5XELTE FB: submits=%llu wait_us=%llu store_us=%llu flush_us=%llu wrap=%u cpu_mhz=%u\n",
+ 			    submits, waitUs, storeUs, flushUs, wraps, j7m_cpu_mhz());
+-			IOLog("A5XELTE FB: copy split build_ms=%llu store_ms=%llu\n",
+-			    sweet_fb_build_ns / 1000000, sweet_fb_store_ns / 1000000);
++			IOLog("A5XELTE FB: copy split build_us=%llu store_us=%llu\n",
++			    sweet_fb_build_ns / 1000, sweet_fb_store_ns / 1000);
+ 			sweet_fb_build_ns = sweet_fb_store_ns = 0;
+ 			IOLog("A5XELTE FB: swap_ends=%llu swap_waits=%llu avg_swapwait_us=%llu\n",
+ 			    sweet_fb_swap_count, sweet_fb_swap_waits,
+@@ -769,7 +803,7 @@
+ 	int32_t previous = -1;
+ 	uint64_t buildStart = 0, storeStart = 0;
+ 	/* Whole rows, and a band boundary that keeps the run aligned: see band[] above. */
+-	const bool banded = (px0 == 0 && pw * 4 == (int32_t)fRowBytes);
++	const bool banded = sweet_fb_band && px0 == 0 && pw * 4 == (int32_t)fRowBytes;
+ 	int32_t bandRows = 0, bandFirst = 0;
+ 	for (int32_t py = py0; py < py1; py++) {
+ 		int32_t r = py * (int32_t)fLogicalH / (int32_t)fHeight - dy;
+@@ -825,11 +859,11 @@
+ 				absolutetime_to_nanoseconds(mach_absolute_time() - buildStart, &ns);
+ 				sweet_fb_build_ns += ns;
+ 			}
+-			storeStart = mach_absolute_time();
+ 		}
+ 		/* Two pixels per store. The present copy measured 34 ms for 8.29 MB, which is about
+ 		 * 15 cycles per four-byte store: the panel map costs one bus transaction per store and
+ 		 * never merges them, so this is transaction bound, not bandwidth bound. */
++		storeStart = mach_absolute_time();
+ 		if (banded && (bandRows > 0 || (py & 1) == 0)) {
+ 			if (bandRows == 0) {
+ 				bandFirst = py;

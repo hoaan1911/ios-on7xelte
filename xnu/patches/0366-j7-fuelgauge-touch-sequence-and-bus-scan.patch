@@ -1,39 +1,47 @@
-From: j7
+From: j7 fb
 Subject: j7: use the touch driver's I2C sequence and find the fuel gauge bus
 
-IICSTAT on the fuel-gauge driver read back exactly the 0xf0 it had just written, which
+IICSTAT read back exactly the 0xf0 that had just been written, and the bus stayed
 
-means no transfer ever started: the bytes went in after the mode byte and the prescaler
+busy through a STOP and a settle: that is a transfer that never started, not one
 
-was 0xef. a5xelte_touch.c proves the sequence on this SoC (control 0xe3, filter 7,
+that failed. a5xelte_touch.c proves the sequence on this SoC - control, filter,
 
-address, mode, mode|ENABLE) on two different buses, so use that, and probe each S3C I2C
+mode, address, mode|ENABLE - on two different buses, so use it, and probe each
 
-controller for the gauge instead of trusting one address. Read-only registers only.
+S3C I2C controller for the gauge instead of trusting one address. Read-only
+
+registers only; the scan logs one line per bus.
 
 Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
 
 diff --git a/bsd/dev/a5xelte_battery.c b/bsd/dev/a5xelte_battery.c
 --- a/bsd/dev/a5xelte_battery.c
 +++ b/bsd/dev/a5xelte_battery.c
-@@ -107,11 +107,11 @@
+@@ -107,16 +107,15 @@
  		}
  		delay(1);
  	}
--	/* Bits 3:0 are the clock prescaler. 0xe1 (prescaler 1) ACKed the address and then never
--	 * finished, and the read-back of 0xe3 also came back as 0xe1, so try the slowest step first:
--	 * a gauge that answers but cannot complete a byte is usually clocking faster than it can
--	 * follow, and 16*(15+1) divides the bus clock far harder than 16*(3+1). */
--	fg_wr(FG_CON, 0xefu);
-+	/* Exactly the sequence a5xelte_touch.c proves on this SoC: control and filter, the
-+	 * address into IICDS, the mode byte into IICSTAT, then the same byte with ENABLE. The
-+	 * prescaler is 0xe3 (the touch driver's value); 0xef with the bytes in the other order
-+	 * left IICSTAT reading back the 0xf0 just written, i.e. no transfer ever started. */
-+	fg_wr(FG_CON, 0xe3u);
+-	/* Prescaler 3: the register-pointer write completed at this rate, and the slowest step
+-	 * (0xef) made even that fail, so the bus is already as slow as it wants to be. */
++	/* The order and the values are a5xelte_touch.c's, which are the ones that answer on this
++	 * SoC: control and filter, address into IICDS, the mode byte into IICSTAT, then the same
++	 * byte with ENABLE. Written address-then-mode with a STOP in between, IICSTAT read back
++	 * exactly the 0xf0 just written, which is a transfer that never started rather than one
++	 * that failed. */
+ 	fg_wr(FG_CON, 0xe3u);
+-	/* The failure is IICSTAT bit 5 never dropping, so issue an explicit STOP and let the
+-	 * lines settle before the address byte instead of charging into a busy bus. */
+-	fg_stop();
+-	delay(200);
  	fg_wr(FG_FILTER, 7u);
- 	fg_wr(FG_DS, FG_ADDR | (receive ? 1u : 0u));
+-	fg_wr(FG_DS, FG_ADDR | (receive ? 1u : 0u));
  	fg_wr(FG_STAT, receive ? FG_MODE_RX : FG_MODE_TX);
-@@ -174,17 +174,31 @@
++	fg_wr(FG_DS, FG_ADDR | (receive ? 1u : 0u));
+ 	delay(1);
+ 	fg_wr(FG_STAT, (receive ? FG_MODE_RX : FG_MODE_TX) | 0x20u);
+ 	if (!fg_wait() || (fg_rd(FG_STAT) & 1u)) {
+@@ -176,17 +175,31 @@
  	if (!enabled) {
  		return -1;
  	}
@@ -45,10 +53,10 @@ diff --git a/bsd/dev/a5xelte_battery.c b/bsd/dev/a5xelte_battery.c
 -	if (!fg_word(FG_REPSOC, &soc)) {
 -		printf("A5XELTE FG: nothing at 0x3b on the i2c@13830000 bus\n");
 -		return -1;
-+	/* The gauge is somewhere on the S3C-style I2C controllers, and Samsung's own tree does
-+	 * not agree between the 7870 boards about which one: the touch driver here already proves
-+	 * two of them answer (0x13840000 and 0x13850000). Ask every bus for the same read-only
-+	 * register and keep the one that ACKs, instead of trusting one address. */
++	/* Samsung's own tree does not agree between the 7870 boards about which controller the
++	 * gauge hangs off, and the touch driver here already proves two of them answer
++	 * (0x13840000 and 0x13850000). Ask every S3C I2C controller for the same read-only
++	 * register and keep the one that ACKs instead of trusting a single address. */
 +	static const uint32_t buses[] = {
 +		0x13830000u, 0x13860000u, 0x13870000u, 0x13880000u, 0x13890000u,
 +	};

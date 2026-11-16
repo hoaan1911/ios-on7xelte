@@ -1,0 +1,44 @@
+From: j7 fb
+Subject: j7: refuse a denied spawn the way a missing binary is refused
+
+Refusing bluetoothd and fairplayd.H2 with EPERM plus an EXEC security reason made
+
+the crash reporter build a corpse and print "Process[N] crashed" for every retry,
+
+and launchd retries them all boot: hundreds of reports, each one a block of text
+
+on a 115200-baud console, spent on a job that can never work on this phone.
+
+A spawn that cannot find its program gets ENOENT and no reason instead, which is
+
+what launchd asks for when the executable really is missing. Keep the name match
+
+and the boot argument exactly as they are.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7533,10 +7533,17 @@
+ 			}
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 			if (sweet_exec_denied(p->p_name)) {
+-				printf("exec %s refused by j7nospawn\n", p->p_name);
+-				signature_failure_reason = os_reason_create(OS_REASON_EXEC,
+-				    EXEC_EXIT_REASON_SECURITY_POLICY);
+-				error = EPERM;
++				/* Answer the way a missing binary would: no signature reason, ENOENT,
++				 * and one line each for the first few. Creating an EXEC reason for every
++				 * refusal is what puts a corpse and a "Process[N] crashed" report in the
++				 * log for each retry, and launchd retries these jobs for the whole boot -
++				 * hundreds of reports before the GUI even appears. */
++				static int denied_logged;
++				if (denied_logged < 3) {
++					denied_logged++;
++					printf("exec %s refused by j7nospawn\n", p->p_name);
++				}
++				error = ENOENT;
+ 				goto done;
+ 			}
+ #endif

@@ -1,0 +1,62 @@
+From: j7 fb
+Subject: j7: compute the GPU PLL multiplier the right way round
+
+The last image read back CON0 a1000d01, an empty M field: the code multiplied the
+
+target by P instead of dividing, integer-divided 23400 by 26000 and wrote zero.
+
+That took the core from 343 MHz to 256, not to 900.
+
+Fout = 26 MHz * M / (P << S), so M = Fout * (P << S) / 26 MHz, and j7gpuclk is
+
+now in MHz. M is range-checked before anything is written, the resulting VCO is
+
+logged, and the value is read back and decoded afterwards.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -519,16 +519,31 @@
+ 				    want <= 1000 && (uint32_t)want != pll) {
+ 					uint32_t gp_p = (gp != 0) ? gp : 13u;
+ 					uint32_t gp_s = gs;
+-					uint32_t m = (uint32_t)(((uint64_t)want << gp_s) * gp_p / 26000ULL);
+-					uint32_t con0new = (con0 & 0xff000000u) | ((m & 0x3ffu) << 16) |
+-					    ((gp_p & 0x3fu) << 8) | (gp_s & 0x7u);
+-					g[0x100 / 4] = con0new;
+-					IODelay(200);
+-					uint32_t back = g[0x100 / 4];
+-					uint32_t bm = (back >> 16) & 0x3ff;
+-					uint64_t now = (gp_p != 0) ? 26000ULL * bm / ((uint64_t)gp_p << gp_s) : 0;
+-					IOLog("A5XELTE CLK: G3D set %d kHz: CON0 %08x -> %08x, reads %llu kHz\n",
+-					    want, con0, back, now);
++					/* Fout = 26 MHz * M / (P << S), so M = Fout * (P << S) / 26 MHz.
++					 * The first version multiplied by P instead of dividing, wrote M = 0,
++					 * and took the core from 343 MHz down to 256: the register read back
++					 * as a1000d01 with an empty M field. j7gpuclk is in MHz. */
++					uint64_t m64 = ((uint64_t)want * 1000000ULL *
++					    ((uint64_t)gp_p << gp_s)) / 26000000ULL;
++					if (m64 < 10 || m64 > 1023) {
++						IOLog("A5XELTE CLK: G3D %d MHz needs M=%llu, out of range\n",
++						    want, m64);
++					} else {
++						uint32_t m = (uint32_t)m64;
++						uint32_t con0new = (con0 & 0xff000000u) | ((m & 0x3ffu) << 16) |
++						    ((gp_p & 0x3fu) << 8) | (gp_s & 0x7u);
++						IOLog("A5XELTE CLK: G3D %d MHz -> M=%u P=%u S=%u CON0 %08x -> %08x "
++						    "(VCO %llu kHz)\n", want, m, gp_p, gp_s, con0, con0new,
++						    26000ULL * m / gp_p);
++						g[0x100 / 4] = con0new;
++						IODelay(200);
++						uint32_t back = g[0x100 / 4];
++						uint32_t bm = (back >> 16) & 0x3ff;
++						uint64_t now = (gp_p != 0) ?
++						    26000ULL * bm / ((uint64_t)gp_p << gp_s) : 0;
++						IOLog("A5XELTE CLK: G3D reads back %08x -> %llu kHz\n",
++						    back, now);
++					}
+ 				}
+ 			} else {
+ 				IOLog("A5XELTE CLK: no G3D map\n");

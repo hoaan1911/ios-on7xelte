@@ -1,0 +1,35 @@
+From: j7 fb
+Subject: j7: look for the gauge on the two buses that actually answer
+
+Opening the I2C0 clock gate changed nothing: CMU_PERI 0x0810 already read 0x3fffffff,
+
+so every gate was open and the clock was never the problem.
+
+The scan order was the problem. It walked 0x13830000 and 0x13860000..90000 and
+
+skipped 0x13840000 and 0x13850000 - the two controllers that are known live, because
+
+they already carry the touch controller. A second device at address 0x76 on a working
+
+bus costs nothing, so probe those first.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/bsd/dev/a5xelte_battery.c b/bsd/dev/a5xelte_battery.c
+--- a/bsd/dev/a5xelte_battery.c
++++ b/bsd/dev/a5xelte_battery.c
+@@ -212,8 +212,13 @@
+ 	 * gauge hangs off, and the touch driver here already proves two of them answer
+ 	 * (0x13840000 and 0x13850000). Ask every S3C I2C controller for the same read-only
+ 	 * register and keep the one that ACKs instead of trusting a single address. */
++	/* All six S3C I2C controllers, and the two that are known to answer first: 0x13840000
++	 * and 0x13850000 already carry the touch controller, so their clocks and pin muxes are
++	 * live, and every earlier scan skipped exactly those two. The gauge is addressed as
++	 * 0x76, which touches nothing else on the bus. */
+ 	static const uint32_t buses[] = {
+-		0x13830000u, 0x13860000u, 0x13870000u, 0x13880000u, 0x13890000u,
++		0x13840000u, 0x13850000u, 0x13830000u, 0x13860000u, 0x13870000u,
++		0x13880000u, 0x13890000u,
+ 	};
+ 	for (unsigned i = 0; i < sizeof(buses) / sizeof(buses[0]); i++) {
+ 		uint16_t soc = 0xffff;

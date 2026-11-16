@@ -1,0 +1,52 @@
+From: j7 fb
+Subject: j7: raise the GPU PLL, which is running at 343 MHz
+
+The G3D probe finally read the numbers: PLL_CON0 = a1570d01 is M=343, P=13, S=1
+
+-> 343 MHz, and CLK_CON_DIV_G3D_BUS is 0, so the core is at the PLL and cannot go
+
+faster by dividing less. 343 MHz is where the GPU has been all along, which is why
+
+every frame the shim renders takes a second.
+
+j7gpuclk=<kHz> reprograms PLL_CON0 by writing M alone, keeping the P and S the
+
+loader chose: at P=13, S=1 the output is exactly M MHz, so 900 is M=900 with a
+
+1800 MHz VCO. Bits above the M field are preserved because they are undocumented,
+
+and the value is read back and decoded into the log.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -509,6 +509,27 @@
+ 				    con0, gm, gp, gs, (con0 >> 31) & 1, pll);
+ 				IOLog("A5XELTE CLK: G3D MUX=%08x DIV_BUS=%08x DIV_APB=%08x -> %llu kHz\n",
+ 				    g[0x208 / 4], g[0x400 / 4], g[0x404 / 4], pll / (uint64_t)(div + 1));
++				/* The core runs at pll / (div + 1) and the divider is already 0, so the
++				 * only way up is the PLL itself: 343 MHz, against a T830 rated far higher.
++				 * j7gpuclk=<kHz> reprograms PLL_CON0 - M 343 -> 900 at the same P 13, S 1,
++				 * which is 1800 MHz in the VCO and 900 out. The top byte of CON0 is kept
++				 * because what those bits mean is not documented. */
++				int want = 0;
++				if (PE_parse_boot_argn("j7gpuclk", &want, sizeof(want)) && want >= 200 &&
++				    want <= 1000 && (uint32_t)want != pll) {
++					uint32_t gp_p = (gp != 0) ? gp : 13u;
++					uint32_t gp_s = gs;
++					uint32_t m = (uint32_t)(((uint64_t)want << gp_s) * gp_p / 26000ULL);
++					uint32_t con0new = (con0 & 0xff000000u) | ((m & 0x3ffu) << 16) |
++					    ((gp_p & 0x3fu) << 8) | (gp_s & 0x7u);
++					g[0x100 / 4] = con0new;
++					IODelay(200);
++					uint32_t back = g[0x100 / 4];
++					uint32_t bm = (back >> 16) & 0x3ff;
++					uint64_t now = (gp_p != 0) ? 26000ULL * bm / ((uint64_t)gp_p << gp_s) : 0;
++					IOLog("A5XELTE CLK: G3D set %d kHz: CON0 %08x -> %08x, reads %llu kHz\n",
++					    want, con0, back, now);
++				}
+ 			} else {
+ 				IOLog("A5XELTE CLK: no G3D map\n");
+ 			}

@@ -1,0 +1,67 @@
+From: j7 fb
+Subject: j7: open the I2C0 clock gate before asking the fuel gauge
+
+All five probes read back exactly the IICSTAT byte they had written, which is not a
+
+NACK: it is a controller that never started, because its peripheral clock is off.
+
+The touch buses answer for the same reason their gates are already open.
+
+CMU_PERI 0x0810 carries the gates: bit 3 for PERIC0 and bit 21 for I2C0, with
+
+I2C1 at 23 and I2C2 at 22. Set them read-modify-write (never clearing a bit) and
+
+log before, wanted and after, then probe the buses as before.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/bsd/dev/a5xelte_battery.c b/bsd/dev/a5xelte_battery.c
+--- a/bsd/dev/a5xelte_battery.c
++++ b/bsd/dev/a5xelte_battery.c
+@@ -166,6 +166,38 @@
+ 	return false;
+ }
+ 
++/* CMU_PERI at 0x101f0000. CLK_CON_GAT_PERI_BUSP1_PERIC0_HCLK is 0x0810 bit 3 and
++ * CLK_CON_GAT_PERI_I2C0_PCLK is 0x0810 bit 21 (the same register carries I2C1..I2C8
++ * at bits 23, 22, 20, 17..19, 24, 25). The touch buses answer because their gates
++ * are already open; on an unclocked block every transfer reads back exactly the
++ * IICSTAT value that was written, which is what all five probes logged. */
++#define FG_CMU_PERI     0x101f0000u
++#define FG_PERI_GATES   0x0810u
++#define FG_GATE_PERIC0   (1u << 3)
++#define FG_GATE_I2C0     (1u << 21)
++#define FG_GATE_I2C1     (1u << 23)
++#define FG_GATE_I2C2     (1u << 22)
++
++static void
++fg_clock_on(void)
++{
++	vm_offset_t cmu = ml_io_map(FG_CMU_PERI, 0x1000);
++
++	if (!cmu) {
++		printf("A5XELTE FG: no CMU_PERI map\n");
++		return;
++	}
++	uint32_t before = *(volatile uint32_t *)(cmu + FG_PERI_GATES);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	uint32_t want = before | FG_GATE_PERIC0 | FG_GATE_I2C0 | FG_GATE_I2C1 | FG_GATE_I2C2;
++	*(volatile uint32_t *)(cmu + FG_PERI_GATES) = want;
++	__asm__ volatile ("dsb osh" ::: "memory");
++	delay(100);
++	uint32_t after = *(volatile uint32_t *)(cmu + FG_PERI_GATES);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	printf("A5XELTE FG: CMU_PERI gates 0x%08x -> 0x%08x -> 0x%08x\n", before, want, after);
++}
++
+ int
+ a5xelte_fg_init(void)
+ {
+@@ -175,6 +207,7 @@
+ 	if (!enabled) {
+ 		return -1;
+ 	}
++	fg_clock_on();
+ 	/* Samsung's own tree does not agree between the 7870 boards about which controller the
+ 	 * gauge hangs off, and the touch driver here already proves two of them answer
+ 	 * (0x13840000 and 0x13850000). Ask every S3C I2C controller for the same read-only

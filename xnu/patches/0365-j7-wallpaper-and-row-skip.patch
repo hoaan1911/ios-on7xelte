@@ -1,0 +1,141 @@
+From: j7
+Subject: j7 fb: paint a real wallpaper and stop rewriting duplicate rows
+
+The swap records carry one opaque desktop layer and no wallpaper, so the pixels have to
+
+be supplied: a raw BGRA image at the logical display size is read once from the data
+
+volume (j7wall=<path>, default /var/mobile/j7wall.raw) and painted wherever the desktop
+
+is wide-run opaque black or fully transparent. The gradient stays as the fallback.
+
+1334 logical rows over 1920 panel rows means 586 panel rows are exact copies of the row
+
+above; they are now skipped instead of stored again.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -75,6 +75,11 @@
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <sys/proc.h>
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#include <sys/vnode.h>
++#include <sys/kauth.h>
++#include <sys/vfs_context.h>
++#endif
+ 
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ static void sweet_fb_copy_init(void);
+@@ -818,6 +823,56 @@
+ }
+ 
+ /*
++ * Wallpaper. The swap records this driver is handed carry one opaque desktop layer and no
++ * wallpaper layer at all, so the only way to show one is to supply the pixels: a raw BGRA
++ * image at the logical display size, read once from the data volume (the root is the iOS
++ * user data volume, rootrw=1). j7wall=<path> overrides /var/mobile/j7wall.raw.
++ */
++static uint32_t *sweet_fb_wall;
++static int32_t sweet_fb_wall_w, sweet_fb_wall_h;
++static int sweet_fb_wall_tried;
++
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++static void
++sweet_fb_wall_load(int32_t w, int32_t h)
++{
++	char path[96] = "/var/mobile/j7wall.raw";
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULL;
++	int32_t size = w * h * 4;
++
++	sweet_fb_wall_tried = 1;
++	(void)PE_parse_boot_argn("j7wall", path, sizeof(path));
++	if (size <= 0) {
++		return;
++	}
++	sweet_fb_wall = (uint32_t *)IOMallocData((vm_size_t)size);
++	if (sweet_fb_wall == NULL) {
++		IOLog("A5XELTE FB: no memory for a wallpaper\n");
++		return;
++	}
++	if (vnode_open(path, FREAD, 0, 0, &vp, ctx) != 0 || vp == NULL) {
++		IOLog("A5XELTE FB: no wallpaper at %s\n", path);
++		IOFreeData(sweet_fb_wall, (vm_size_t)size);
++		sweet_fb_wall = NULL;
++		return;
++	}
++	int error = vn_rdwr(UIO_READ, vp, (caddr_t)sweet_fb_wall, size, 0, UIO_SYSSPACE,
++	    IO_NODELOCKED | IO_NOCACHE, kauth_cred_get(), NULL, NULL);
++	vnode_close(vp, FREAD, ctx);
++	if (error != 0) {
++		IOLog("A5XELTE FB: wallpaper read %d\n", error);
++		IOFreeData(sweet_fb_wall, (vm_size_t)size);
++		sweet_fb_wall = NULL;
++		return;
++	}
++	sweet_fb_wall_w = w;
++	sweet_fb_wall_h = h;
++	IOLog("A5XELTE FB: wallpaper %dx%d from %s\n", w, h, path);
++}
++#endif
++
++/*
+  * sweetfb_scale: the logical rect (dx,dy,w,h) at src goes to panel pixels
+  * x1.5, nearest neighbour (two source pixels become three). A panel row
+  * whose source row equals the previous one is copied from it. Called only
+@@ -863,6 +918,17 @@
+ 	for (int32_t py = py0; py < py1; py++) {
+ 		int32_t r = py * (int32_t)fLogicalH / (int32_t)fHeight - dy;
+ 		r = r < 0 ? 0 : (r >= h ? h - 1 : r);
++		if (r == previous) {
++			/* 1334 logical rows into 1920 panel rows: 586 of them are the row above. The
++			 * panel row copied last already holds exactly these pixels, so skip it
++			 * instead of storing 4320 bytes a second time. */
++			if (bandRows > 0) {
++				memcpy((void *)(fPixels + (uint64_t)bandFirst * fRowBytes),
++				    band, (size_t)bandRows * fRowBytes);
++				bandRows = 0;
++			}
++			continue;
++		}
+ 		uint32_t *out = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes + (uint64_t)px0 * 4);
+ 		const uint32_t *in = (const uint32_t *)(src + (uint64_t)r * srcRowBytes);
+ 		/* The desktop behind the icons arrives as opaque black, not as transparency: a whole frame
+@@ -901,8 +967,19 @@
+ 				}
+ 				v = in[c];
+ 				if (v == 0xff000000u && (end - x) >= 48) {
+-					v = bg;
++					/* A wallpaper area is hundreds of pixels across, a glyph stem is one
++					 * or two, so wide runs of opaque black are background. Paint the
++					 * image there when one is loaded, the gradient when it is not. */
++					if (sweet_fb_wall != NULL && sweet_fb_wall_w == w &&
++					    sweet_fb_wall_h == h) {
++						v = sweet_fb_wall[(uint64_t)r * (uint64_t)w + (uint64_t)c];
++					} else {
++						v = bg;
++					}
+ 					sweet_fb_alpha0 += (uint32_t)(end - x);
++				} else if (v == 0u && sweet_fb_wall != NULL &&
++				    sweet_fb_wall_w == w && sweet_fb_wall_h == h) {
++					v = sweet_fb_wall[(uint64_t)r * (uint64_t)w + (uint64_t)c];
+ 				}
+ 				for (; x < end; x++) {
+ 					row[x] = v;
+@@ -983,6 +1060,12 @@
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	if (!sweet_fb_wall_tried && fScaled && fLogicalW > 0 && fLogicalH > 0) {
++		sweet_fb_wall_load((int32_t)fLogicalW, (int32_t)fLogicalH);
++	}
++#endif
++
+ 	static uint32_t sweet_fb_reclog;
+ 	if (sweet_fb_reclog < 8) {
+ 		sweet_fb_reclog++;

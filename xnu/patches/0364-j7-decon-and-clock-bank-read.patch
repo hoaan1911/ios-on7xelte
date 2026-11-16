@@ -1,0 +1,63 @@
+From: j7
+Subject: j7: read the display controller and the whole clock bank
+
+The display controller dump never printed: it was guarded by (parsed && decon), and
+
+PE_parse_boot_argn() returns false when the argument is absent, so the default of 1
+
+could never turn it on. The tearing fix needs those registers.
+
+The clock PLLs read 1804/1332/1599 MHz while the CPU measures 899, which is the memory
+
+PLL halved, so the ARM clock is a mux and a divider somewhere in CMU_MIF. No driver in
+
+this tree publishes which register, so dump the whole 4 KB and read it off. Also log
+
+whether the row shadow exists: without it every present rewrites all 1920 rows.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -326,6 +326,9 @@
+ 		if (fShadow != NULL) {
+ 			bzero(fShadow, (vm_size_t)fLogicalW * fLogicalH * 4);
+ 		}
++		/* Without it every present rebuilds and restores all 1920 panel rows even when the
++		 * frame did not change, which is most of a copy that measured 35 ms. */
++		IOLog("A5XELTE FB: row shadow %s\n", fShadow != NULL ? "on" : "off");
+ 		if (fCanvas == NULL) {
+ 			IOLog("SWEET FB: no canvas surface, clients keep the panel\n");
+ 		} else {
+@@ -415,7 +418,10 @@
+ 		 * tearing. Read its window 0 state before touching it, so a double buffer and a
+ 		 * flip at vsync can be programmed against real values instead of guesses. */
+ 		int decon = 1;
+-		if (PE_parse_boot_argn("j7decon", &decon, sizeof(decon)) && decon != 0) {
++		/* Default on: PE_parse_boot_argn() returns false when the argument is absent, so
++		 * "parsed && decon" left the dump off on every boot that did not pass it. */
++		PE_parse_boot_argn("j7decon", &decon, sizeof(decon));
++		if (decon != 0) {
+ 			IOMemoryDescriptor *desc = IOMemoryDescriptor::withPhysicalAddress(
+ 			    0x14830000ULL, 0x1000, kIODirectionNone);
+ 			IOMemoryMap *map = desc != NULL ? desc->map(kIOMapInhibitCache) : NULL;
+@@ -464,6 +470,18 @@
+ 					IOLog("A5XELTE CLK: %s PLL_CON0=%08x M=%u P=%u S=%u en=%u -> %llu kHz\n",
+ 					    plls[i].name, con0, m, pd, s, (con0 >> 31) & 1, khz);
+ 				}
++				/* The three PLLs are 1804/1332/1599 MHz and the CPU measures 899, which is
++				 * the memory PLL halved: the ARM clock is a mux and a divider somewhere in
++				 * this bank, and no driver in this tree publishes which. Dump the whole
++				 * 4 KB so the mux and divisor can be read off real values. */
++				for (uint32_t o = 0; o < 0x1000; o += 0x40) {
++					IOLog("A5XELTE CLK: %03x %08x %08x %08x %08x %08x %08x %08x %08x "
++					    "%08x %08x %08x %08x %08x %08x %08x %08x\n", o,
++					    c[o / 4 + 0], c[o / 4 + 1], c[o / 4 + 2], c[o / 4 + 3],
++					    c[o / 4 + 4], c[o / 4 + 5], c[o / 4 + 6], c[o / 4 + 7],
++					    c[o / 4 + 8], c[o / 4 + 9], c[o / 4 + 10], c[o / 4 + 11],
++					    c[o / 4 + 12], c[o / 4 + 13], c[o / 4 + 14], c[o / 4 + 15]);
++				}
+ 			} else {
+ 				IOLog("A5XELTE CLK: no map\n");
+ 			}

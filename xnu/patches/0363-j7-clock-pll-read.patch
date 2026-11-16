@@ -1,0 +1,59 @@
+From: j7 fb
+Subject: j7: read the clock controller PLLs when asked to
+
+The CPU has been measured at 900 MHz against a rated 1586 MHz, and nothing in this fork can 
+change it: there is no PLL or divider code to enable. Before any is written, the M/P/S 
+values the bootloader left have to be known, so read the three PLLs the mainline driver 
+documents in CMU_MIF and decode their output.
+Read only, and off by default: part of at least one CMU bank is unmapped - the G3D probe 
+took a synchronous abort on CMU+0x004 - so this is j7clk=1, not the default.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -435,6 +435,43 @@
+ 		}
+ 	}
+ 	{
++		/* j7clk=1 reads - and only reads - the clock controller bank the mainline driver
++		 * documents for this SoC (CMU_MIF 0x10460000, PLL_CON0 of the memory, media and
++		 * bus PLLs at +0x100/+0x120/+0x140). The CPU has been measured at 900 MHz against
++		 * a rated 1586 MHz, and no PLL or divider may be written until the M/P/S values
++		 * the bootloader left are known. Off by default: an address in an unmapped part
++		 * of a CMU bank raises a synchronous abort, as the G3D probe found. */
++		int clk = 0;
++		if (PE_parse_boot_argn("j7clk", &clk, sizeof(clk)) && clk != 0) {
++			IOMemoryDescriptor *desc = IOMemoryDescriptor::withPhysicalAddress(
++			    0x10460000ULL, 0x1000, kIODirectionNone);
++			IOMemoryMap *map = desc != NULL ? desc->map(kIOMapInhibitCache) : NULL;
++			if (map != NULL) {
++				volatile uint32_t *c = (volatile uint32_t *)map->getVirtualAddress();
++				static const struct { uint32_t off; const char *name; } plls[] = {
++					{ 0x100, "MEM" }, { 0x120, "MEDIA" }, { 0x140, "BUS" },
++				};
++				IOLog("A5XELTE CLK: CMU_MIF word0=%08x\n", c[0]);
++				for (unsigned i = 0; i < sizeof(plls) / sizeof(plls[0]); i++) {
++					uint32_t con0 = c[plls[i].off / 4];
++					uint32_t m = (con0 >> 16) & 0x3ff;
++					uint32_t pd = (con0 >> 8) & 0x3f;
++					uint32_t s = con0 & 0x7;
++					uint64_t khz = 0;
++					if (pd != 0 && s < 7) {
++						khz = 26000ULL * m / ((uint64_t)pd << s);
++					}
++					IOLog("A5XELTE CLK: %s PLL_CON0=%08x M=%u P=%u S=%u en=%u -> %llu kHz\n",
++					    plls[i].name, con0, m, pd, s, (con0 >> 31) & 1, khz);
++				}
++			} else {
++				IOLog("A5XELTE CLK: no map\n");
++			}
++			OSSafeReleaseNULL(map);
++			OSSafeReleaseNULL(desc);
++		}
++	}
++	{
+ 		int nowait = 0;
+ 		if (PE_parse_boot_argn("j7fb_nowait", &nowait, sizeof(nowait))) {
+ 			sweet_fb_nowait = nowait != 0;

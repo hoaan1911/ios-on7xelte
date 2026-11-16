@@ -1,0 +1,79 @@
+From: j7 fb
+Subject: j7: stop walking the clock bank, read only documented offsets
+
+The 4 KB CMU_MIF dump panicked the phone: 0x10460004 is unimplemented, and a read
+
+there is a synchronous external abort (esr 0x96000210, far = map base + 4) that
+
+takes the machine down before anything can be logged. A register bank is not
+
+memory and cannot be walked.
+
+Read only the offsets the mainline exynos7870 driver defines, and use the same
+
+rule on CMU_G3D (0x11460000), where PLL_CON0, the mux and the bus divider are
+
+documented: those two numbers are what a 900 MHz GPU needs.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -475,21 +475,45 @@
+ 					IOLog("A5XELTE CLK: %s PLL_CON0=%08x M=%u P=%u S=%u en=%u -> %llu kHz\n",
+ 					    plls[i].name, con0, m, pd, s, (con0 >> 31) & 1, khz);
+ 				}
+-				/* The three PLLs are 1804/1332/1599 MHz and the CPU measures 899, which is
+-				 * the memory PLL halved: the ARM clock is a mux and a divider somewhere in
+-				 * this bank, and no driver in this tree publishes which. Dump the whole
+-				 * 4 KB so the mux and divisor can be read off real values. */
+-				for (uint32_t o = 0; o < 0x1000; o += 0x40) {
+-					IOLog("A5XELTE CLK: %03x %08x %08x %08x %08x %08x %08x %08x %08x "
+-					    "%08x %08x %08x %08x %08x %08x %08x %08x\n", o,
+-					    c[o / 4 + 0], c[o / 4 + 1], c[o / 4 + 2], c[o / 4 + 3],
+-					    c[o / 4 + 4], c[o / 4 + 5], c[o / 4 + 6], c[o / 4 + 7],
+-					    c[o / 4 + 8], c[o / 4 + 9], c[o / 4 + 10], c[o / 4 + 11],
+-					    c[o / 4 + 12], c[o / 4 + 13], c[o / 4 + 14], c[o / 4 + 15]);
++				/* Never walk a CMU bank. 0x10460004 is unimplemented, and a read of it is a
++				 * synchronous external abort (esr 0x96000210, far = base + 4) that takes the
++				 * machine down before it can log, which is exactly what a full 4 KB dump did.
++				 * Read only the offsets the mainline driver defines. */
++				static const struct { uint32_t off; const char *name; } mif[] = {
++					{ 0x200, "GAT_MUX_MEM_PLL" }, { 0x204, "GAT_MUX_MEDIA_PLL" },
++					{ 0x208, "GAT_MUX_BUS_PLL" }, { 0x220, "MUX_BUSD" },
++					{ 0x420, "DIV_BUSD" }, { 0x424, "DIV_APB" },
++					{ 0x460, "DIV_G3D_SWITCH" },
++				};
++				for (unsigned i = 0; i < sizeof(mif) / sizeof(mif[0]); i++) {
++					IOLog("A5XELTE CLK: MIF %s=%08x\n", mif[i].name, c[mif[i].off / 4]);
+ 				}
+ 			} else {
+ 				IOLog("A5XELTE CLK: no map\n");
+ 			}
++			/* CMU_G3D (0x11460000), documented offsets only. The GPU core runs from this
++			 * PLL through CLK_CON_DIV_G3D_BUS, so both numbers are needed before its
++			 * frequency can be raised: the divider is 0-based, result = pll / (div + 1). */
++			IOMemoryDescriptor *gdesc = IOMemoryDescriptor::withPhysicalAddress(
++			    0x11460000ULL, 0x1000, kIODirectionNone);
++			IOMemoryMap *gmap = gdesc != NULL ? gdesc->map(kIOMapInhibitCache) : NULL;
++			if (gmap != NULL) {
++				volatile uint32_t *g = (volatile uint32_t *)gmap->getVirtualAddress();
++				uint32_t con0 = g[0x100 / 4];
++				uint32_t gm = (con0 >> 16) & 0x3ff;
++				uint32_t gp = (con0 >> 8) & 0x3f;
++				uint32_t gs = con0 & 0x7;
++				uint32_t div = g[0x400 / 4] & 0x7u;
++				uint64_t pll = (gp != 0 && gs < 7) ? 26000ULL * gm / ((uint64_t)gp << gs) : 0;
++				IOLog("A5XELTE CLK: G3D PLL_CON0=%08x M=%u P=%u S=%u en=%u -> %llu kHz\n",
++				    con0, gm, gp, gs, (con0 >> 31) & 1, pll);
++				IOLog("A5XELTE CLK: G3D MUX=%08x DIV_BUS=%08x DIV_APB=%08x -> %llu kHz\n",
++				    g[0x208 / 4], g[0x400 / 4], g[0x404 / 4], pll / (uint64_t)(div + 1));
++			} else {
++				IOLog("A5XELTE CLK: no G3D map\n");
++			}
++			OSSafeReleaseNULL(gmap);
++			OSSafeReleaseNULL(gdesc);
+ 			OSSafeReleaseNULL(map);
+ 			OSSafeReleaseNULL(desc);
+ 		}

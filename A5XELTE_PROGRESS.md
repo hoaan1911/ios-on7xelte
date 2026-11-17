@@ -242,3 +242,14 @@ Stage the iPhone 8 Plus userland in an exact-size HFSX USERDATA image, select it
   `A5XELTE FB: wall 750x1334 px0=… mid=… took N background pixels last frame` six times.
 - Image `artifacts/j7-boot-44033362935/j7-xnu-boot.img`, 17,164,304 bytes,
   sha256 `b321d008992783669e247da315d53b6d05b140472520380a867927fdf20b1506`. Not yet flashed.
+# 2026-11-17 — J7 speed: the 33 ms was a whole-panel dcache clean
+
+- Trace off worked: fps went from 0.1–0.3 to a sustained 5–10 (`frames=80 elapsed_ms=8033
+  fps=9.9`), so the pandecode decode was most of the old 5.3 s frame.
+- `avg_copy_us` stayed pinned at 33 ms while `build_us` was 1–2 ms per frame and
+  `store_us` 0.07 ms, i.e. the time was in neither the row build nor the stores. It was the
+  single `flush_dcache64` over the whole scanout at the end of `scaledCopy()`: 8.29 MB per
+  present regardless of content. 0376 flushes each 4-row band (17 KB, 64-byte aligned) as it
+  is stored and drops the whole-panel clean; a skipped row is already clean in memory.
+- Image `artifacts/j7-boot-44075613366/j7-xnu-boot.img`, 17,164,304 bytes,
+  sha256 `97d2b17ed3a255b46d17f50e07c8eb48e6a1481ee2fefb8681b9dd76a04ccaeb`. Not yet flashed.

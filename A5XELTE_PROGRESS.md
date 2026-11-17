@@ -198,3 +198,23 @@ Stage the iPhone 8 Plus userland in an exact-size HFSX USERDATA image, select it
   L3 table when its whole 2 MiB window is empty, and syncs only the tables that exist.
 - `0328-j7-g3d-verify-every-page.patch` was never applied (build log: `Skipping patch`); it is
   removed so `0328-j7-g3d-verify-every-page-and-mute-console.patch` is the single 0328 again.
+# 2026-11-17 — J7: 0373 panicked, 0374 refuses the job at spawn time
+
+- **Device result:** the image built from 0370–0373 (kernel run `43977272777`, boot run
+  `43980361019`, sha256 `2058edb1…38b71e`) **panicked at boot**:
+  `kern_exec.c:7713 Assertion failed: signature_failure_reason != OS_REASON_NULL`
+  — "handshake structure not initialized". Cause: 0373 returned `ENOENT` from the exec-time
+  refusal inside `process_signature()`, and that function's common exit tail asserts that any
+  failure leaving it carries an `os_reason`. The refusal cannot be quiet there: the same
+  reason is what produces the crash report, so dropping it trips the assert.
+- **0374** (`xnu/patches/0374-j7-refuse-spawn-before-it-is-built.patch`, commit `8f82f3b` on
+  `main`) refuses the listed names at the top of `posix_spawn()`, matched against the path
+  launchd passes (basename, exact, from `j7nospawn=`), returning `ENOENT` before `__spawn_data`,
+  before the task and before any reason exists. The old exec-time branch is restored to
+  `EPERM` + `EXEC_EXIT_REASON_SECURITY_POLICY` as a backstop.
+- **Build:** kernel run `44017738607` success, no `037x` skipped, `refused spawn` string present
+  (kernel 17,689,896 bytes). Boot run `44018785107` success.
+- Image `artifacts/j7-boot-44018785107/j7-xnu-boot.img`, 17,162,256 bytes,
+  sha256 `ab23b11459b76a45c29bd4985722952e431abb512f22db8da7b6ca9e17af147f`. Not yet flashed
+  when this entry was written: the panic is fixed by inspection and by the restored assert
+  contract, not yet by device evidence.

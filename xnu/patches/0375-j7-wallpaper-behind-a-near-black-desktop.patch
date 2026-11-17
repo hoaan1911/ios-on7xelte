@@ -1,0 +1,85 @@
+From: j7 fb
+Subject: j7: show the picture behind a near-black desktop
+
+The wallpaper never appeared because the test that decides what is background used
+
+an exact compare against 0xff000000, and neither the lock screen nor the home
+
+screen paints exactly black - they paint a near-black such as 0xff0a0a0a - so
+
+every frame was copied through untouched. Treat any opaque colour whose brightest
+
+channel is nearly nil as background, and shorten the run that qualifies from 48
+
+pixels to 32 for the same reason: the UI is a field of dark panels, not one flat
+
+sheet, so most runs are now a few hundred pixels rather than a full row.
+
+The picture itself is unchanged and still travels compiled into the kernel.
+
+The present now also reports the picture's size and its first and middle pixel and
+
+how many background pixels it replaced, six times. The only evidence until now was
+
+the screen, which cannot distinguish "no picture loaded" from "picture loaded, no
+
+dark pixel ever drawn".
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -894,6 +894,8 @@
+ static uint32_t *sweet_fb_wall;
+ static int32_t sweet_fb_wall_w, sweet_fb_wall_h;
+ static int sweet_fb_wall_tried;
++static uint64_t sweet_fb_wall_px;   /* pixels the last present took from the picture */
++static int sweet_fb_wall_reports;
+ 
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ /*
+@@ -1059,13 +1061,20 @@
+ 					end++;
+ 				}
+ 				v = in[c];
+-				if (v == 0xff000000u && (end - x) >= 48) {
++				/* The desktop is not exactly black: the lock screen and the home screen
++				 * paint a near-black (0xff0a0a0a and friends), which the exact test used
++				 * to miss, so no wallpaper ever appeared. Any opaque colour whose
++				 * brightest channel is almost nil is background. */
++				const uint32_t cr = (v >> 16) & 0xffu, cg = (v >> 8) & 0xffu, cb = v & 0xffu;
++				const uint32_t cmax = cr > cg ? (cr > cb ? cr : cb) : (cg > cb ? cg : cb);
++				if ((v >> 24) == 0xffu && cmax <= 0x14u && (end - x) >= 32) {
+ 					/* A wallpaper area is hundreds of pixels across, a glyph stem is one
+-					 * or two, so wide runs of opaque black are background. Paint the
+-					 * image there when one is loaded, the gradient when it is not. */
++					 * or two, so wide dark runs are background. Paint the image there
++					 * when one is loaded, the gradient when it is not. */
+ 					if (sweet_fb_wall != NULL && sweet_fb_wall_w == w &&
+ 					    sweet_fb_wall_h == h) {
+ 						v = sweet_fb_wall[(uint64_t)r * (uint64_t)w + (uint64_t)c];
++						sweet_fb_wall_px += (uint32_t)(end - x);
+ 					} else {
+ 						v = bg;
+ 					}
+@@ -1158,6 +1167,19 @@
+ 		sweet_fb_wall_load((int32_t)fLogicalW, (int32_t)fLogicalH);
+ 	}
+ #endif
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* Say what the picture is and how much of the panel it replaced: without this the
++	 * only evidence was the screen, and a dark frame could mean either "no picture" or
++	 * "the client never drew a dark pixel". */
++	if (sweet_fb_wall != NULL && sweet_fb_wall_reports < 6) {
++		sweet_fb_wall_reports++;
++		IOLog("A5XELTE FB: wall %dx%d px0=%08x mid=%08x took %llu background pixels last frame\n",
++		    sweet_fb_wall_w, sweet_fb_wall_h, sweet_fb_wall[0],
++		    sweet_fb_wall[(uint64_t)(sweet_fb_wall_h / 2) * (uint64_t)sweet_fb_wall_w +
++		    sweet_fb_wall_w / 2], (unsigned long long)sweet_fb_wall_px);
++		sweet_fb_wall_px = 0;
++	}
++#endif
+ 
+ 	static uint32_t sweet_fb_reclog;
+ 	if (sweet_fb_reclog < 8) {

@@ -1,0 +1,140 @@
+From: j7 fb
+Subject: j7: refuse a dead job before posix_spawn builds it
+
+The previous attempt (0373) returned ENOENT from the exec-time refusal in
+
+process_signature(), which panicked on this device: kern_exec.c:7713 asserts that
+
+any failure leaving that function carries an os_reason ("handshake structure not
+
+initialized"), and it was left NULL. That assert is not optional - the corpse and
+
+the crash report come from the same reason, so the refusal cannot be quiet there.
+
+posix_spawn() is the only caller that reaches that code on this phone, so refuse
+
+the job at the top of posix_spawn() instead, before __spawn_data, before the task
+
+and before any reason exists, and answer ENOENT - the error a missing file gives,
+
+which launchd records as a failed job rather than a crash. The old exec-time
+
+refusal is restored to EPERM plus a reason so that nothing else can leave that
+
+function without one.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -556,6 +556,57 @@
+ 	}
+ 	return FALSE;
+ }
++
++/*
++ * The same list, matched against the path posix_spawn() was handed.
++ *
++ * Refusing at exec time is too late: by then a task exists and the common
++ * failure tail of process_signature() requires an os_reason, which is the
++ * corpse and the "Process[N] crashed" report launchd used to print for every
++ * retry. posix_spawn() is the only caller that reaches that code, so refuse
++ * there instead - before __spawn_data, before the task, before any reason
++ * exists - and answer ENOENT, exactly what a missing file gives.
++ */
++static boolean_t
++sweet_spawn_denied(user_addr_t upath)
++{
++	static char spec[256];
++	static int state;
++	char buf[256];
++	size_t len = 0;
++	const char *base = buf;
++	const char *p;
++
++	if (state == 0) {
++		state = PE_parse_boot_argn("j7nospawn", spec, sizeof(spec)) && spec[0] ? 2 : 1;
++	}
++	if (state != 2 || upath == USER_ADDR_NULL) {
++		return FALSE;
++	}
++	if (copyinstr(upath, buf, sizeof(buf), &len) != 0 || len == 0) {
++		return FALSE;
++	}
++	for (p = buf; *p; p++) {
++		if (*p == '/') {
++			base = p + 1;
++		}
++	}
++	len = strlen(base);
++	for (p = spec; *p; ) {
++		size_t n = 0;
++		while (p[n] && p[n] != ',') {
++			n++;
++		}
++		if (n > 0 && len == n && strncmp(base, p, n) == 0) {
++			return TRUE;
++		}
++		p += n;
++		if (*p == ',') {
++			p++;
++		}
++	}
++	return FALSE;
++}
+ #endif
+ 
+ /*
+@@ -3529,6 +3580,24 @@
+ 		struct vnode_attr origva;
+ 	} *__spawn_data;
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/*
++	 * A job that cannot work on this phone is refused here, before a task, a
++	 * crash reason or a corpse exists, with the error a missing file gives.
++	 * launchd then fails the job quietly instead of reporting a crash for every
++	 * respawn, which is what filled the console and the boot with bluetoothd.
++	 */
++	if (sweet_spawn_denied(uap->path)) {
++		static int refused_logged;
++
++		if (refused_logged < 3) {
++			refused_logged++;
++			printf("j7nospawn: refused spawn %s (ENOENT)\n", p->p_comm);
++		}
++		return ENOENT;
++	}
++#endif
++
+ 	/*
+ 	 * Allocate a big chunk for locals instead of using stack since these
+ 	 * structures are pretty big.
+@@ -7533,17 +7602,15 @@
+ 			}
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 			if (sweet_exec_denied(p->p_name)) {
+-				/* Answer the way a missing binary would: no signature reason, ENOENT,
+-				 * and one line each for the first few. Creating an EXEC reason for every
+-				 * refusal is what puts a corpse and a "Process[N] crashed" report in the
+-				 * log for each retry, and launchd retries these jobs for the whole boot -
+-				 * hundreds of reports before the GUI even appears. */
+-				static int denied_logged;
+-				if (denied_logged < 3) {
+-					denied_logged++;
+-					printf("exec %s refused by j7nospawn\n", p->p_name);
+-				}
+-				error = ENOENT;
++				/* Must carry a reason: the common exit tail below asserts on one. The
++				 * panic "kern_exec.c:7713 signature_failure_reason != OS_REASON_NULL"
++				 * was this branch returning ENOENT with no reason. posix_spawn()
++				 * now refuses these names before it gets here, so this never runs
++				 * for them; it stays as the backstop for any other caller. */
++				printf("exec %s refused by j7nospawn\n", p->p_name);
++				signature_failure_reason = os_reason_create(OS_REASON_EXEC,
++				    EXEC_EXIT_REASON_SECURITY_POLICY);
++				error = EPERM;
+ 				goto done;
+ 			}
+ #endif

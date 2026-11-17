@@ -218,3 +218,27 @@ Stage the iPhone 8 Plus userland in an exact-size HFSX USERDATA image, select it
   sha256 `ab23b11459b76a45c29bd4985722952e431abb512f22db8da7b6ca9e17af147f`. Not yet flashed
   when this entry was written: the panic is fixed by inspection and by the restored assert
   contract, not yet by device evidence.
+# 2026-11-17 — J7: the 5.3 s frame was the job trace, and why no wallpaper
+
+- **Device result (0374 image, sha256 `ab23b114…af147f`):** no panic, boot completes.
+  `A5XELTE CLK: G3D 900 MHz -> M=900 P=13 S=1 CON0 a1570d01 -> a3840d01` and
+  `G3D reads back … 900000 kHz` — the GPU PLL fix works. `j7nospawn: refused spawn
+  xpcproxy (ENOENT)` (the caller is xpcproxy; the refused *path* is bluetoothd/fairplayd.H2)
+  and the corpse spam is gone.
+- **Still 5.3 s per frame** (`frames=1 elapsed_ms=5332`), with `submits` 20–58 per present and
+  `avg_copy_us` 33 ms: the copy is not the cost. The console carries `J7 G3D client: t: …`
+  lines — `tools/sweetgl-mali/sweet_trace.c` sets `PAN_MESA_DEBUG=trace`, so panfrost's
+  pandecode decodes **every job chain, for the life of the process**, and each line is pushed
+  through the kernel log. `sweet_trace_start()` honours `SWEET_TRACE=0`, and `sweetenv=`
+  accepts several `VAR=VAL` per name, so the boot cmdline now carries
+  `sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib,SWEET_TRACE=0`.
+  No kernel change; expect the boot log to lose the trace and `SWEET ENV: backboardd += SWEET_TRACE=0`
+  to appear.
+- **Wallpaper:** the picture loads (`no wallpaper at /var/mobile/j7wall.raw, using the built-in
+  picture` — 25 % of the 375x667 RGB565 image is black letterbox, mean RGB 105/96/74, so the
+  data is sound). `scaledCopy()` substitutes background pixels with it, but the test was an
+  exact `v == 0xff000000u`: iOS paints a near-black, so nothing was ever replaced. 0375 accepts
+  any opaque colour with `max(r,g,b) <= 0x14` and a run of 32+ pixels, and logs
+  `A5XELTE FB: wall 750x1334 px0=… mid=… took N background pixels last frame` six times.
+- Image `artifacts/j7-boot-44033362935/j7-xnu-boot.img`, 17,164,304 bytes,
+  sha256 `b321d008992783669e247da315d53b6d05b140472520380a867927fdf20b1506`. Not yet flashed.

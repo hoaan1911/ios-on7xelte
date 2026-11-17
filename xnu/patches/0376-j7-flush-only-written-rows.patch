@@ -1,0 +1,84 @@
+From: j7 fb
+Subject: j7: clean only the rows that were written, not the whole panel
+
+Every present ended with one dcache clean over the whole scanout (py1-py0 rows,
+8.29 MB). That single flush was the constant 33 ms in avg_copy_us: the row build
+measured 1-2 ms and the panel stores 0.07 ms, and the number never moved with the
+content, which is what a fixed-size flush looks like - not what a copy of the
+changed rows looks like. At 10 fps it was a third of the frame.
+
+The panel is mapped cacheable, so a row that is never stored is still clean in
+memory from the frame that wrote it; only the rows written this time have to be
+cleaned. Flush each band right after it is stored (17 KB, 64-byte aligned at both
+ends) and drop the whole-panel clean. A static screen now writes and cleans almost
+nothing, and an animated one pays only for the rows it actually changed.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1020,6 +1020,12 @@
+ 			if (bandRows > 0) {
+ 				memcpy((void *)(fPixels + (uint64_t)bandFirst * fRowBytes),
+ 				    band, (size_t)bandRows * fRowBytes);
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++				if (sweet_surface_panel_cacheable) {
++					flush_dcache64((addr64_t)(uintptr_t)(fPixels + (uint64_t)bandFirst * fRowBytes),
++					    (unsigned)(bandRows * (int32_t)fRowBytes), FALSE);
++				}
++#endif
+ 				bandRows = 0;
+ 			}
+ 			continue;
+@@ -1106,10 +1112,21 @@
+ 			if (++bandRows == 4 || py == py1 - 1) {
+ 				memcpy((void *)(fPixels + (uint64_t)bandFirst * fRowBytes),
+ 				    band, (size_t)bandRows * fRowBytes);
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++				if (sweet_surface_panel_cacheable) {
++					flush_dcache64((addr64_t)(uintptr_t)(fPixels + (uint64_t)bandFirst * fRowBytes),
++					    (unsigned)(bandRows * (int32_t)fRowBytes), FALSE);
++				}
++#endif
+ 				bandRows = 0;
+ 			}
+ 		} else {
+ 			memcpy(out, row, (size_t)pw * 4);
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++			if (sweet_surface_panel_cacheable) {
++				flush_dcache64((addr64_t)(uintptr_t)out, (unsigned)(pw * 4), FALSE);
++			}
++#endif
+ 		}
+ 		{
+ 			uint64_t ns = 0;
+@@ -1120,18 +1137,22 @@
+ 	if (bandRows > 0) {
+ 		memcpy((void *)(fPixels + (uint64_t)bandFirst * fRowBytes),
+ 		    band, (size_t)bandRows * fRowBytes);
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++		if (sweet_surface_panel_cacheable) {
++			flush_dcache64((addr64_t)(uintptr_t)(fPixels + (uint64_t)bandFirst * fRowBytes),
++			    (unsigned)(bandRows * (int32_t)fRowBytes), FALSE);
++		}
++#endif
+ 	}
+ 	if (sweet_fb_alpha0 != 0 && !sweet_fb_alpha0_logged) {
+ 		sweet_fb_alpha0_logged = 1;
+ 		IOLog("A5XELTE FB: %u black pixels replaced with a background\n", sweet_fb_alpha0);
+ 	}
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+-	if (sweet_surface_panel_cacheable) {
+-		/* One clean for the whole band: the display controller reads memory, not this
+-		 * cache, so the dirty lines have to reach it before the next scanout. */
+-		flush_dcache64((addr64_t)(uintptr_t)(fPixels + (uint64_t)py0 * fRowBytes),
+-		    (unsigned)((py1 - py0) * (int32_t)fRowBytes), FALSE);
+-	}
++	/* Every row that was stored has already been cleaned, row band by row band. The
++	 * scanout needs those lines in memory, not the ones belonging to rows that were
++	 * skipped because they did not change: cleaning the whole 8.29 MB panel here took
++	 * 33 ms of every present, which was a third of a frame at 10 fps. */
+ #endif
+ 	return (uint64_t)pw * (uint64_t)(py1 - py0) * 4;
+ }

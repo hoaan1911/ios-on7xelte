@@ -1,0 +1,295 @@
+From: j7
+Subject: j7: double buffer the panel, and flip to the finished frame
+
+The panel scans 0x67000000 continuously and present() wrote every row straight into it, so every
+frame was torn and every store cost a bus transaction: 8.29 MB measured 34 ms, about 15 cycles a
+word, which is store latency and not memory bandwidth.
+
+Two contiguous scanout buffers in ordinary cacheable memory, painted alternately, cleaning the
+finished one once and pointing the display controller's window 0 base at it. The controller reads
+that base when it starts a frame, so the frame in flight keeps its own buffer and the next one
+starts on the new one. Tearing goes, and the CPU writes at cache speed instead of one transaction
+per word. The row shadow skip is off while flipping - the back buffer holds the frame from two
+presents ago, not what is on the panel - and the power-off fade paints the buffer that is on
+screen. j7fb_flip=0 keeps the loader's single buffer.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -183,6 +183,17 @@
+ #endif
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* Double buffering: present() paints the buffer the panel is not scanning. */
++	void         *fBackMem[2];    /* cacheable contiguous scanout buffers */
++	uint64_t      fBackPhys[2];
++	uintptr_t     fBack[2];
++	uint32_t      fBackSize;
++	int           fBackIndex;     /* the one on screen */
++	int           fFlip;
++	uintptr_t     fTarget;        /* what present() writes: back buffer, or the panel */
++	volatile uint32_t *fDecon;    /* DECON-F window 0 */
++#endif
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -192,6 +203,9 @@
+ 	uint64_t present(const uint8_t *rec);
+ 	uint64_t scaledCopy(uintptr_t src, uint32_t srcRowBytes, int32_t dx, int32_t dy,
+ 	    int32_t w, int32_t h);
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	void flip(void);
++#endif
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -507,6 +521,76 @@
+ 		memset((void *)fPixels, 0, (size_t)fRowBytes * fHeight);
+ 		IOLog("A5XELTE FB: console muted at start, panel cleared\n");
+ 	}
++	{
++		/*
++		 * Two scanout buffers instead of the loader's one.
++		 *
++		 * The panel scans 0x67000000 continuously, and every store present() made
++		 * landed under that live scanout: that is the tearing, and it is also why the
++		 * copy cost 34 ms - a write-combining mapping charges every store on its own
++		 * (about 15 cycles a word), which is store latency, not memory bandwidth.
++		 *
++		 * Allocate two contiguous buffers in normal cacheable memory, paint the one
++		 * that is not on screen, clean it once, and point the display controller's
++		 * window base at it.  The panel never sees a half-written frame, and the CPU
++		 * writes at cache speed.  j7fb_flip=0 keeps the loader's single buffer.
++		 */
++		int flip = 1;
++		PE_parse_boot_argn("j7fb_flip", &flip, sizeof(flip));
++		fFlip = flip != 0 && fScaled;
++		fTarget = fPixels;
++		if (fFlip) {
++			vm_size_t size = ((vm_size_t)fRowBytes * fHeight + 0x7fffu) & ~(vm_size_t)0x7fffu;
++			bool made = true;
++			fBackMem[0] = fBackMem[1] = NULL;
++			for (unsigned i = 0; i < 2; i++) {
++				uint64_t pa = 0;
++				fBackMem[i] = IOMallocContiguous(size, 0x8000, &pa);
++				if (fBackMem[i] == NULL) {
++					made = false;
++					break;
++				}
++				fBack[i] = (uintptr_t)fBackMem[i];
++				fBackPhys[i] = pa;
++				bzero(fBackMem[i], size);
++			}
++			if (!made) {
++				fFlip = 0;
++				IOLog("A5XELTE FB: no flip, no scanout buffer\n");
++				for (unsigned i = 0; i < 2; i++) {
++					if (fBackMem[i] != NULL) {
++						IOFreeContiguous(fBackMem[i], size);
++						fBackMem[i] = NULL;
++					}
++				}
++			} else {
++				fBackSize = (uint32_t)size;
++				fBackIndex = 0;
++				IOMemoryDescriptor *desc = IOMemoryDescriptor::withPhysicalAddress(
++				    0x14830000ULL, 0x1000, kIODirectionNone);
++				IOMemoryMap *map = desc != NULL ? desc->map(kIOMapInhibitCache) : NULL;
++				if (map == NULL) {
++					fFlip = 0;
++					IOLog("A5XELTE FB: no flip, no display controller map\n");
++					for (unsigned i = 0; i < 2; i++) {
++						IOFreeContiguous(fBackMem[i], size);
++						fBackMem[i] = NULL;
++					}
++				} else {
++					fDecon = (volatile uint32_t *)map->getVirtualAddress();
++					/* Window 0's own base, and the update request that latches the
++					 * shadowed window registers at the next frame boundary. */
++					fDecon[0x880 / 4] = (uint32_t)fBackPhys[0];
++					fDecon[0x710 / 4] = 1u;
++					__asm__ volatile ("dsb sy" ::: "memory");
++					IOLog("A5XELTE FB: double buffer on, scanout 0x%llx and 0x%llx, ADD0 now %08x\n",
++					    fBackPhys[0], fBackPhys[1], fDecon[0x880 / 4]);
++				}
++			}
++		} else {
++			IOLog("A5XELTE FB: double buffer off, the panel keeps 0x%llx\n", fPhys);
++		}
++	}
+ #endif
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+@@ -761,12 +845,23 @@
+ 		}
+ 		IOLockUnlock(fb->fLock);
+ 		if (step <= 6) {
++			/* The scanout buffer, not the loader's: that one is not on screen once
++			 * the display is double buffered. */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++			uintptr_t fade = fb->fFlip ? fb->fBack[fb->fBackIndex] : fb->fPixels;
++#else
++			uintptr_t fade = fb->fPixels;
++#endif
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++				volatile uint32_t *row = (volatile uint32_t *)(fade + (uint64_t)y * fb->fRowBytes);
+ 				for (uint32_t x = 0; x < fb->fWidth; x++) {
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+ 			}
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++			flush_dcache64((addr64_t)fade, fb->fBackSize ? fb->fBackSize : fb->fRowBytes * fb->fHeight, FALSE);
++			__asm__ volatile ("dsb sy" ::: "memory");
++#endif
+ 		}
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+@@ -1249,8 +1344,23 @@
+ 	}
+ 	int32_t previous = -1;
+ 	uint64_t buildStart = 0, storeStart = 0;
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* With a double buffer the row skip is wrong - the back buffer holds the frame from
++	 * two presents ago, not what is on the panel - and the band staging is pointless,
++	 * because the destination is cacheable memory where a row copy is one store per
++	 * cache line instead of one store per word. */
++	const uintptr_t target = fTarget != 0 ? fTarget : fPixels;
++	bool skipUnchanged = !fFlip;
++#else
++	const uintptr_t target = fPixels;
++	const bool skipUnchanged = true;
++#endif
+ 	/* Whole rows, and a band boundary that keeps the run aligned: see band[] above. */
+-	const bool banded = sweet_fb_band && px0 == 0 && pw * 4 == (int32_t)fRowBytes;
++	const bool banded = sweet_fb_band && px0 == 0 && pw * 4 == (int32_t)fRowBytes
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	    && !fFlip
++#endif
++	    ;
+ 	int32_t bandRows = 0, bandFirst = 0;
+ 	for (int32_t py = py0; py < py1; py++) {
+ 		int32_t r = py * (int32_t)fLogicalH / (int32_t)fHeight - dy;
+@@ -1260,11 +1370,11 @@
+ 			 * panel row copied last already holds exactly these pixels, so skip it
+ 			 * instead of storing 4320 bytes a second time. */
+ 			if (bandRows > 0) {
+-				memcpy((void *)(fPixels + (uint64_t)bandFirst * fRowBytes),
++				memcpy((void *)(target + (uint64_t)bandFirst * fRowBytes),
+ 				    band, (size_t)bandRows * fRowBytes);
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 				if (sweet_surface_panel_cacheable) {
+-					flush_dcache64((addr64_t)(uintptr_t)(fPixels + (uint64_t)bandFirst * fRowBytes),
++					flush_dcache64((addr64_t)(uintptr_t)(target + (uint64_t)bandFirst * fRowBytes),
+ 					    (unsigned)(bandRows * (int32_t)fRowBytes), FALSE);
+ 				}
+ #endif
+@@ -1272,7 +1382,7 @@
+ 			}
+ 			continue;
+ 		}
+-		uint32_t *out = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes + (uint64_t)px0 * 4);
++		uint32_t *out = (uint32_t *)(target + (uint64_t)py * fRowBytes + (uint64_t)px0 * 4);
+ 		const uint32_t *in = (const uint32_t *)(src + (uint64_t)r * srcRowBytes);
+ 		/* The desktop behind the icons arrives as opaque black, not as transparency: a whole frame
+ 		 * carried only 4320 fully transparent pixels, and every swap record carries a single
+@@ -1282,11 +1392,11 @@
+ 		const uint32_t ramp = (uint32_t)py * 256u / (uint32_t)(fHeight ? fHeight : 1);
+ 		const uint32_t bg = 0xff000000u | ((12u + (ramp * 40u >> 8)) << 16) |
+ 		    ((16u + (ramp * 26u >> 8)) << 8) | (40u + (ramp * 70u >> 8));
+-		if (r != previous && fShadow != NULL &&
++		if (r != previous && skipUnchanged && fShadow != NULL &&
+ 		    memcmp(fShadow + (uint64_t)r * fLogicalW, in, (size_t)w * 4) == 0) {
+ 			/* Unchanged since the last present: the panel rows already hold it. */
+ 			if (bandRows > 0) {
+-				memcpy((void *)(fPixels + (uint64_t)bandFirst * fRowBytes),
++				memcpy((void *)(target + (uint64_t)bandFirst * fRowBytes),
+ 				    band, (size_t)bandRows * fRowBytes);
+ 				bandRows = 0;
+ 			}
+@@ -1363,11 +1473,11 @@
+ 			}
+ 			memcpy(band[bandRows], row, (size_t)pw * 4);
+ 			if (++bandRows == 4 || py == py1 - 1) {
+-				memcpy((void *)(fPixels + (uint64_t)bandFirst * fRowBytes),
++				memcpy((void *)(target + (uint64_t)bandFirst * fRowBytes),
+ 				    band, (size_t)bandRows * fRowBytes);
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 				if (sweet_surface_panel_cacheable) {
+-					flush_dcache64((addr64_t)(uintptr_t)(fPixels + (uint64_t)bandFirst * fRowBytes),
++					flush_dcache64((addr64_t)(uintptr_t)(target + (uint64_t)bandFirst * fRowBytes),
+ 					    (unsigned)(bandRows * (int32_t)fRowBytes), FALSE);
+ 				}
+ #endif
+@@ -1388,11 +1498,11 @@
+ 		}
+ 	}
+ 	if (bandRows > 0) {
+-		memcpy((void *)(fPixels + (uint64_t)bandFirst * fRowBytes),
++		memcpy((void *)(target + (uint64_t)bandFirst * fRowBytes),
+ 		    band, (size_t)bandRows * fRowBytes);
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 		if (sweet_surface_panel_cacheable) {
+-			flush_dcache64((addr64_t)(uintptr_t)(fPixels + (uint64_t)bandFirst * fRowBytes),
++			flush_dcache64((addr64_t)(uintptr_t)(target + (uint64_t)bandFirst * fRowBytes),
+ 			    (unsigned)(bandRows * (int32_t)fRowBytes), FALSE);
+ 		}
+ #endif
+@@ -1416,6 +1526,9 @@
+ 	uint32_t mask = get32(rec, 0x104);
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	sweet_fb_bg_wanted = 1;
++	/* Paint the buffer the panel is not scanning, then hand that one to the
++	 * controller once it is complete. */
++	fTarget = fFlip ? fBack[fBackIndex ^ 1] : fPixels;
+ #endif
+ 	uint64_t copied = 0;
+ 
+@@ -1552,6 +1665,17 @@
+ 		}
+ 		s->release();
+ 	}
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	if (fFlip) {
++		/* The panel reads this buffer directly, so every dirty line goes to memory
++		 * before the base moves: one clean of the whole frame instead of a per-store
++		 * bus transaction for every fourth of a million pixels. */
++		flush_dcache64((addr64_t)(uintptr_t)fTarget, fBackSize, FALSE);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		fBackIndex ^= 1;
++		flip();
++	}
++#endif
+ 	return copied;
+ }
+ 
+@@ -1608,6 +1732,27 @@
+ 	return kIOReturnSuccess;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++/*
++ * Point window 0 at the buffer present() just finished. The controller reads this
++ * base when it starts a frame, so a single store cannot tear: the frame in flight
++ * keeps its own base and the next one starts on the new buffer. The update request
++ * after it costs nothing when the window is unprotected and latches the base when
++ * it is shadowed.
++ */
++void
++AppleCLCD::flip(void)
++{
++	if (!fFlip || fDecon == NULL) {
++		return;
++	}
++	fDecon[0x880 / 4] = (uint32_t)fBackPhys[fBackIndex];
++	__asm__ volatile ("dsb sy" ::: "memory");
++	fDecon[0x710 / 4] = 1u;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++#endif
++
+ /* Called with the framebuffer lock held. */
+ void
+ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uint32_t count)

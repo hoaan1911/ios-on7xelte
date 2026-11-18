@@ -1,0 +1,120 @@
+From: j7
+Subject: j7: pass the CPU rate in kHz, and ask for 1794 MHz
+
+Every boot logged "A5XELTE CPU: 1586 kHz is outside the PLL range" and stayed at 902 MHz: the
+default handed 1586 - a rate in MHz - to a function that takes kHz, so the multiplier worked out
+to zero and the whole clock change was skipped. Take a small boot-arg value as MHz, default to
+1794 MHz (cl0_max_support_idx, the highest step the vendor DVFS table allows), and fall back to
+1586 MHz when that PLL will not lock. j7_cpu_clock() now reports whether it landed, and the log
+line for each cluster reads the rate back out of the programmed PLL and dividers instead of
+repeating the request.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -242,7 +242,7 @@
+  * then is ARMCLK switched back.  Every wait is bounded, and a PLL that never locks leaves the
+  * cores on the switch clock with a log line instead of hanging the phone.
+  */
+-static void
++static bool
+ j7_cpu_clock(unsigned khz)
+ {
+ 	static const struct { uint64_t cmu; const char *name; uint32_t gate, swdiv; } cpu[] = {
+@@ -255,7 +255,7 @@
+ 
+ 	if (m < 64 || m > 0x3ffu) {
+ 		IOLog("A5XELTE CPU: %u kHz is outside the PLL range\n", khz);
+-		return;
++		return false;
+ 	}
+ 	IOMemoryDescriptor *mifDesc = IOMemoryDescriptor::withPhysicalAddress(
+ 	    0x10460000ULL, 0x1000, kIODirectionNone);
+@@ -263,9 +263,10 @@
+ 	if (mifMap == NULL) {
+ 		IOLog("A5XELTE CPU: no CMU_MIF map\n");
+ 		OSSafeReleaseNULL(mifDesc);
+-		return;
++		return false;
+ 	}
+ 	volatile uint32_t *mif = (volatile uint32_t *)mifMap->getVirtualAddress();
++	bool ok = true;
+ 	for (unsigned i = 0; i < sizeof(cpu) / sizeof(cpu[0]); i++) {
+ 		IOMemoryDescriptor *desc = IOMemoryDescriptor::withPhysicalAddress(
+ 		    cpu[i].cmu, 0x1000, kIODirectionNone);
+@@ -273,6 +274,7 @@
+ 		if (map == NULL) {
+ 			IOLog("A5XELTE CPU: no %s map\n", cpu[i].name);
+ 			OSSafeReleaseNULL(desc);
++			ok = false;
+ 			continue;
+ 		}
+ 		volatile uint32_t *c = (volatile uint32_t *)map->getVirtualAddress();
+@@ -309,6 +311,7 @@
+ 			IOLog("A5XELTE CPU: %s did not leave the PLL, left alone\n", cpu[i].name);
+ 			OSSafeReleaseNULL(map);
+ 			OSSafeReleaseNULL(desc);
++			ok = false;
+ 			continue;
+ 		}
+ 		/* Dividers to /1 while the cores are not on this path. */
+@@ -329,6 +332,7 @@
+ 			    cpu[i].name, c[0x100 / 4]);
+ 			OSSafeReleaseNULL(map);
+ 			OSSafeReleaseNULL(desc);
++			ok = false;
+ 			continue;
+ 		}
+ 		IOSleep(1);
+@@ -340,13 +344,23 @@
+ 			}
+ 			IOSleep(1);
+ 		}
+-		IOLog("A5XELTE CPU: %s on PLL_CON0=%08x, mux %u\n",
+-		    cpu[i].name, c[0x100 / 4], (c[0x608 / 4] >> 12) & 3u);
++		const uint32_t run = c[0x100 / 4];
++		const uint32_t rm = (run >> 16) & 0x3ffu, rp = (run >> 8) & 0x3fu, rs = run & 7u;
++		const uint64_t got = (rp != 0 && rs < 7)
++		    ? 26000ULL * rm / ((uint64_t)rp << rs) /
++		      ((uint64_t)((c[0x400 / 4] & 7u) + 1) * (uint64_t)((c[0x404 / 4] & 7u) + 1))
++		    : 0;
++		IOLog("A5XELTE CPU: %s on PLL_CON0=%08x, mux %u -> %llu kHz\n",
++		    cpu[i].name, run, (c[0x608 / 4] >> 12) & 3u, got);
++		if (got < khz * 9 / 10) {
++			ok = false;
++		}
+ 		OSSafeReleaseNULL(map);
+ 		OSSafeReleaseNULL(desc);
+ 	}
+ 	OSSafeReleaseNULL(mifMap);
+ 	OSSafeReleaseNULL(mifDesc);
++	return ok;
+ }
+ #endif
+ 
+@@ -583,10 +597,21 @@
+ 		/* j7cpu=<kHz> raises both clusters: every perf line said cpu_mhz=900 because the
+ 		 * bootloader leaves them at the 902 MHz operating point and nothing here ever
+ 		 * changes that.  0 keeps the bootloader's rate. */
+-		int cpu = 1586;
++		/* j7cpu is a rate in kHz, and the old default passed 1586 - which is MHz - so
++		 * every boot logged "1586 kHz is outside the PLL range" and stayed at 902 MHz.
++		 * Take a small value as MHz, and default to 1794 MHz: cl0_max_support_idx in the
++		 * vendor DVFS table, its highest usable step (2002 MHz is table entry 0 only).
++		 * If that PLL will not lock, fall back to 1586 MHz, the top official step. */
++		int cpu = 1794;
+ 		PE_parse_boot_argn("j7cpu", &cpu, sizeof(cpu));
+-		if (cpu > 0) {
+-			j7_cpu_clock((unsigned)cpu);
++		if (cpu > 0 && cpu < 100000) {
++			cpu *= 1000;
++		}
++		if (cpu > 0 && !j7_cpu_clock((unsigned)cpu)) {
++			if (cpu > 1586000) {
++				IOLog("A5XELTE CPU: retrying at 1586000 kHz\n");
++				j7_cpu_clock(1586000u);
++			}
+ 		}
+ 	}
+ 	{

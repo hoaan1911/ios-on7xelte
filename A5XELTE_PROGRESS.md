@@ -280,3 +280,36 @@ Stage the iPhone 8 Plus userland in an exact-size HFSX USERDATA image, select it
   assuming the first, which is why the percentage never matched.
 - Image `artifacts/j7-boot-44238348399/j7-xnu-boot.img`, 17,164,304 bytes,
   sha256 `7aac66ad8a9a44f41f1b1264396d704f632048d03ce072ae016364bd14778bf2`. Not yet flashed.
+
+## 2026-11-18 — the clock never ran, and the panel is now double buffered
+
+The 2026-11-18 boot log of the 0377/0378/0379 image says, one line after the DECON dump:
+
+    A5XELTE CPU: 1586 kHz is outside the PLL range
+
+0377 handed the MHz figure to a function that takes kHz, the multiplier came out as 0, and the
+whole clock change returned early. `j7m_cpu_mhz()` still measured 900 in every perf window, which
+is the bootloader's 902 MHz operating point. 0380 takes a small `j7cpu` value as MHz, defaults to
+1794 MHz (`cl0_max_support_idx`, the highest step the vendor table allows), falls back to 1586 MHz
+if that PLL will not lock, and reads the rate back out of the programmed PLL and dividers.
+
+The same log has `avg_copy_us=35000` on 8.29 MB frames: 15 cycles per 4-byte store, which is store
+latency on the write-combining panel map, not bandwidth. Every one of those stores also landed
+under the live scanout — that is the tearing. 0381 allocates two contiguous scanout buffers in
+ordinary cacheable memory, paints the one the panel is not scanning, cleans it once, and points
+DECON window 0 (0x14830000 + 0x880, base 0x67000000, WHOLE 1080x1920 from the dump) at the
+finished one. `j7fb_flip=0` keeps the loader's single buffer. The row-shadow skip is disabled
+while flipping because the back buffer is two frames old.
+
+0382: `wall ... took 0 background pixels` on every frame. The near-black test allowed 0x14; the
+home screen paints 0xff1c1c1e. Up to 0x28 now, the transparent path counts its pixels too, and
+the log carries the dominant colour.
+
+0383: every gauge probe logged `stat=0xf0 con=0xe3` — exactly the bytes written to IICSTAT/IICCON,
+read back. Those addresses (0x13860000 and up) are the Exynos high-speed I2C, not the S3C2440
+controller the touch driver answers on, and the S2MPU05/S2MU005 pair sits on it at 0x66/0x3b. The
+patch adds the high-speed sequence and scans 0x13860000-0x138c0000 as well.
+
+Expected in the next log: `A5XELTE CPU: CPUCL0 ... -> 1794000 kHz` (or 1586000), `cpu_mhz=1794`
+in the perf windows, `A5XELTE FB: double buffer on, scanout 0x... and 0x...`, a copy time far
+below 35 ms, and `A5XELTE FG: gauge on 0x... (hsi2c) at 0x3b`.

@@ -1,0 +1,51 @@
+From: j7
+Subject: j7: paint the wallpaper over a dark-but-not-black background
+
+"took 0 background pixels" on every frame: the home screen and the lock screen paint 0xff1c1c1e
+and friends, a good deal brighter than the 0x14 the near-black test allowed, so no run of
+background ever matched and the picture was never drawn. Accept up to 0x28, count the pixels the
+transparent path fills as well, report the dominant colour the frame painted, and keep reporting
+for the first minute of frames instead of the first six.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1425,7 +1425,9 @@
+ 				 * brightest channel is almost nil is background. */
+ 				const uint32_t cr = (v >> 16) & 0xffu, cg = (v >> 8) & 0xffu, cb = v & 0xffu;
+ 				const uint32_t cmax = cr > cg ? (cr > cb ? cr : cb) : (cg > cb ? cg : cb);
+-				bool isbg = cmax <= 0x14u;
++				/* 0x14 was too tight: the lock screen and the home screen paint
++				 * 0xff1c1c1e and friends, which stayed on screen as black. */
++				bool isbg = cmax <= 0x28u;
+ 				/* The exact and near-black tests both found nothing on this phone: each
+ 				 * screen paints its own dark colour.  Anything close to the frame's own
+ 				 * dominant colour (sweet_fb_dominant) is background too. */
+@@ -1450,7 +1452,10 @@
+ 					sweet_fb_alpha0 += (uint32_t)(end - x);
+ 				} else if (v == 0u && sweet_fb_wall != NULL &&
+ 				    sweet_fb_wall_w == w && sweet_fb_wall_h == h) {
++					/* The client left this pixel transparent, so nothing else draws
++					 * there: the picture goes in, and it counts. */
+ 					v = sweet_fb_wall[(uint64_t)r * (uint64_t)w + (uint64_t)c];
++					sweet_fb_wall_px += (uint32_t)(end - x);
+ 				}
+ 				for (; x < end; x++) {
+ 					row[x] = v;
+@@ -1561,12 +1566,12 @@
+ 	/* Say what the picture is and how much of the panel it replaced: without this the
+ 	 * only evidence was the screen, and a dark frame could mean either "no picture" or
+ 	 * "the client never drew a dark pixel". */
+-	if (sweet_fb_wall != NULL && sweet_fb_wall_reports < 6) {
++	if (sweet_fb_wall != NULL && sweet_fb_wall_reports < 60) {
+ 		sweet_fb_wall_reports++;
+-		IOLog("A5XELTE FB: wall %dx%d px0=%08x mid=%08x took %llu background pixels last frame\n",
++		IOLog("A5XELTE FB: wall %dx%d px0=%08x mid=%08x bg=%08x took %llu background pixels last frame\n",
+ 		    sweet_fb_wall_w, sweet_fb_wall_h, sweet_fb_wall[0],
+ 		    sweet_fb_wall[(uint64_t)(sweet_fb_wall_h / 2) * (uint64_t)sweet_fb_wall_w +
+-		    sweet_fb_wall_w / 2], (unsigned long long)sweet_fb_wall_px);
++		    sweet_fb_wall_w / 2], sweet_fb_bg, (unsigned long long)sweet_fb_wall_px);
+ 		sweet_fb_wall_px = 0;
+ 	}
+ #endif

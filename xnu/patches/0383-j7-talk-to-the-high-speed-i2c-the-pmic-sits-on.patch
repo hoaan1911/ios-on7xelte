@@ -1,0 +1,216 @@
+From: j7
+Subject: j7: talk to the high-speed I2C the PMIC sits on
+
+Every gauge probe logged stat=0xf0 con=0xe3 on six buses: 0xf0 is the byte that was written to
+IICSTAT, read straight back. Those six addresses are the high-speed controller, not the S3C2440
+one the touch driver answers on, and the S2MPU05 PMIC and its S2MU005 fuel gauge at 0x3b live on
+it. Add the Exynos high-speed sequence - direction and master in HSI2C_CTL, one byte per
+HSI2C_TX_FIFO word, the address byte starts the transfer, INT_STAT for ACK/NAK - and scan the
+high-speed blocks 0x13860000 through 0x138c0000 that the old scan never reached, as well as the
+three S3C ones.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/bsd/dev/a5xelte_battery.c
++++ b/bsd/dev/a5xelte_battery.c
+@@ -37,6 +37,44 @@
+ #define FG_MODE_TX      0xd0u           /* master transmit, START */
+ #define FG_MODE_RX      0x90u           /* master receive, START */
+ 
++/*
++ * The high-speed I2C blocks (0x13860000 and up) are a different controller from the
++ * S3C2440-layout one at 0x13830000-0x13850000, and the PMIC pair - S2MPU05 at 0x66
++ * and the S2MU005 fuel gauge at 0x3b - sits on the first of them.  Writing the S3C
++ * register layout there read back exactly the value written (stat=0xf0, the byte
++ * itself) on every bus, which is why the gauge scan never found anything.  The
++ * register map and the start sequence are the ones in Samsung's exynos5-hsi2c:
++ * direction and master in HSI2C_CTL, one byte per HSI2C_TX_FIFO word, and writing
++ * the address byte to the FIFO is what starts the transfer.
++ */
++#define HSI2C_CTL       0x00u
++#define HSI2C_FIFO_CTL  0x04u
++#define HSI2C_TRAILING  0x08u
++#define HSI2C_INT_EN    0x10u
++#define HSI2C_INT_STAT  0x14u
++#define HSI2C_TX_FIFO   0x1cu
++#define HSI2C_RX_FIFO   0x20u
++
++#define HSI2C_CTL_FUNC_I2C  (1u << 0)
++#define HSI2C_CTL_MASTER    (1u << 3)
++#define HSI2C_CTL_RXCHON    (1u << 6)
++#define HSI2C_CTL_TXCHON    (1u << 7)
++#define HSI2C_CTL_SW_RST    (1u << 31)
++
++#define HSI2C_INT_RX_READY  (1u << 0)
++#define HSI2C_INT_TX_READY  (1u << 1)
++#define HSI2C_INT_RX_NAK    (1u << 2)
++#define HSI2C_INT_TX_NAK    (1u << 3)
++#define HSI2C_INT_ARB_LOST  (1u << 4)
++#define HSI2C_INT_STOP      (1u << 5)
++#define HSI2C_INT_ADDR_NAK  (1u << 6)
++#define HSI2C_INT_ADDR_ACK  (1u << 7)
++
++#define HSI2C_FIFO_RX_RDY   (1u << 0)
++#define HSI2C_FIFO_TX_RDY   (1u << 4)
++
++static int fg_hsi2c;
++
+ static vm_offset_t fg_i2c;
+ static unsigned fg_errors;
+ 
+@@ -150,6 +188,96 @@
+ 	return ok;
+ }
+ 
++/* Waits for one of `mask` in HSI2C_INT_STAT, bounded; leaves the status in *st. */
++static bool
++fg_hsi2c_wait(uint32_t mask, uint32_t *st)
++{
++	for (unsigned n = 0; n < 2000; n++) {
++		*st = fg_rd(HSI2C_INT_STAT);
++		if (*st & mask) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* One message on the high-speed controller; bytes[0] is the register pointer. */
++static bool
++fg_hsi2c_msg(bool receive, uint8_t *bytes, unsigned count)
++{
++	uint32_t ctl = HSI2C_CTL_FUNC_I2C | HSI2C_CTL_MASTER;
++	uint32_t st = 0;
++	bool ok = false;
++
++	if (!count || count > 4) {
++		return false;
++	}
++	fg_wr(HSI2C_CTL, ctl | HSI2C_CTL_SW_RST);
++	delay(1);
++	fg_wr(HSI2C_CTL, ctl | (receive ? HSI2C_CTL_RXCHON : HSI2C_CTL_TXCHON));
++	fg_wr(HSI2C_FIFO_CTL, HSI2C_FIFO_RX_RDY | HSI2C_FIFO_TX_RDY);
++	fg_wr(HSI2C_TRAILING, receive ? (count - 1) : 0);
++	fg_wr(HSI2C_INT_STAT, 0xffffffffu);
++	fg_wr(HSI2C_INT_EN, HSI2C_INT_ADDR_ACK | HSI2C_INT_ADDR_NAK | HSI2C_INT_TX_NAK |
++	    HSI2C_INT_RX_NAK | (receive ? HSI2C_INT_RX_READY : HSI2C_INT_TX_READY));
++	/* The address byte is what starts the transfer. */
++	fg_wr(HSI2C_TX_FIFO, (uint32_t)((fg_addr & 0xfeu) | (receive ? 1u : 0u)));
++	if (!fg_hsi2c_wait(HSI2C_INT_ADDR_ACK | HSI2C_INT_ADDR_NAK, &st) ||
++	    (st & HSI2C_INT_ADDR_NAK)) {
++		goto out;
++	}
++	if (receive) {
++		for (unsigned n = 0; n < count; n++) {
++			if (!fg_hsi2c_wait(HSI2C_INT_RX_READY, &st)) {
++				goto out;
++			}
++			bytes[n] = (uint8_t)fg_rd(HSI2C_RX_FIFO);
++		}
++	} else {
++		for (unsigned n = 0; n < count; n++) {
++			if (!fg_hsi2c_wait(HSI2C_INT_TX_READY, &st) ||
++			    (st & HSI2C_INT_TX_NAK)) {
++				goto out;
++			}
++			fg_wr(HSI2C_TX_FIFO, bytes[n]);
++		}
++	}
++	ok = true;
++out:
++	fg_wr(HSI2C_INT_EN, 0);
++	fg_wr(HSI2C_CTL, ctl);
++	if (!ok && ++fg_errors <= 4) {
++		printf("A5XELTE FG: hsi2c %s of %u byte(s) failed stat=%#x ctl=%#x\n",
++		    receive ? "read" : "write", count, st, fg_rd(HSI2C_CTL));
++	}
++	return ok;
++}
++
++static bool
++fg_hsi2c_word(uint8_t reg, uint16_t *value)
++{
++	uint8_t in[2];
++
++	for (unsigned attempt = 0; attempt < 3; attempt++) {
++		if (fg_hsi2c_msg(false, &reg, 1) && fg_hsi2c_msg(true, in, 2)) {
++			*value = (uint16_t)(in[0] | ((unsigned)in[1] << 8));
++			return true;
++		}
++		delay(1000);
++	}
++	return false;
++}
++
++static bool fg_word(uint8_t reg, uint16_t *value);
++
++/* Whichever controller answered last: S3C2440 layout or high-speed. */
++static bool
++fg_word_any(uint8_t reg, uint16_t *value)
++{
++	return fg_hsi2c ? fg_hsi2c_word(reg, value) : fg_word(reg, value);
++}
++
+ /* Register pointer, STOP, then read the two bytes: i2c_smbus_read_word_data. */
+ static bool
+ fg_word(uint8_t reg, uint16_t *value)
+@@ -212,30 +340,38 @@
+ 	 * six controllers at that address.  The charger/FG part is an S2MU005 block whose sibling
+ 	 * PMIC answers as 0x66, so ask the three addresses it can have, on the bus Samsung
+ 	 * documents first and then on the rest.  The first pair that ACKs is kept. */
+-	static const uint32_t buses[] = {
+-		0x13830000u, 0x13840000u, 0x13850000u, 0x13860000u, 0x13870000u,
+-		0x13880000u, 0x13890000u,
++	static const struct { uint32_t pa; int hsi2c; } buses[] = {
++		{ 0x13830000u, 0 }, { 0x13840000u, 0 }, { 0x13850000u, 0 },
++		{ 0x13860000u, 1 }, { 0x13870000u, 1 }, { 0x13880000u, 1 },
++		{ 0x13890000u, 1 }, { 0x138a0000u, 1 }, { 0x138b0000u, 1 },
++		{ 0x138c0000u, 1 },
+ 	};
+ 	static const uint8_t addrs[] = { 0x76u, 0x66u, 0x1bu };
+ 
+ 	for (unsigned i = 0; i < sizeof(buses) / sizeof(buses[0]); i++) {
+-		fg_i2c = ml_io_map(buses[i], 0x1000);
++		fg_i2c = ml_io_map(buses[i].pa, 0x1000);
+ 		if (!fg_i2c) {
+ 			continue;
+ 		}
++		fg_hsi2c = buses[i].hsi2c;
+ 		for (unsigned a = 0; a < sizeof(addrs) / sizeof(addrs[0]); a++) {
+ 			uint16_t soc = 0xffff;
+ 			fg_addr = addrs[a];
+ 			fg_errors = 1000000u;   /* the scan logs itself, one line per bus */
+-			if (fg_word(FG_REPSOC, &soc)) {
++			if (fg_word_any(FG_REPSOC, &soc)) {
+ 				fg_errors = 0;
+-				printf("A5XELTE FG: gauge on 0x%08x at 0x%02x, RSOC=%#x\n",
+-				    buses[i], fg_addr, soc);
++				printf("A5XELTE FG: gauge on 0x%08x (%s) at 0x%02x, RSOC=%#x\n",
++				    buses[i].pa, fg_hsi2c ? "hsi2c" : "i2c", fg_addr, soc);
+ 				return 0;
+ 			}
+ 		}
+-		printf("A5XELTE FG: nothing on 0x%08x, stat=%#x con=%#x\n",
+-		    buses[i], fg_rd(FG_STAT), fg_rd(FG_CON));
++		if (fg_hsi2c) {
++			printf("A5XELTE FG: nothing on 0x%08x (hsi2c), istat=%#x ctl=%#x\n",
++			    buses[i].pa, fg_rd(HSI2C_INT_STAT), fg_rd(HSI2C_CTL));
++		} else {
++			printf("A5XELTE FG: nothing on 0x%08x, stat=%#x con=%#x\n",
++			    buses[i].pa, fg_rd(FG_STAT), fg_rd(FG_CON));
++		}
+ 	}
+ 	printf("A5XELTE FG: no gauge answered on any I2C bus\n");
+ 	return -1;
+@@ -248,8 +384,8 @@
+ 	uint16_t soc, vbat, cur, cap;
+ 	unsigned raw, p;
+ 
+-	if (!fg_i2c || !fg_word(FG_REPSOC, &soc) || !fg_word(FG_RVBAT, &vbat) ||
+-	    !fg_word(FG_RCUR, &cur) || !fg_word(FG_RBATCAP, &cap)) {
++	if (!fg_i2c || !fg_word_any(FG_REPSOC, &soc) || !fg_word_any(FG_RVBAT, &vbat) ||
++	    !fg_word_any(FG_RCUR, &cur) || !fg_word_any(FG_RBATCAP, &cap)) {
+ 		return -1;
+ 	}
+ 	/* Two layouts are in the vendor tree for this register: hundredths of a percent

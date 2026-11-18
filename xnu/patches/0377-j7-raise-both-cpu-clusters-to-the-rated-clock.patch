@@ -1,0 +1,189 @@
+From: j7
+Subject: j7: raise both CPU clusters to the rated 1.6 GHz
+
+Every perf window reports cpu_mhz=900 against an Exynos7870 rated 1586 MHz, and this tree has
+no cpufreq driver, so nothing ever asks the bootloader's operating point to change.
+
+Samsung's own clock code for this SoC (pwrcal/S5E7870 in the vendor kernel) documents the
+cluster blocks: CMU_CPUCL0 at 0x10900000 and CMU_CPUCL1 at 0x10800000, PLL_CON0 at +0x100
+(M 16:25, P 8:13, S 0:2, enable 31, locked 29), the ARMCLK mux at +0x208 bit 12, its status at
++0x608 bits 12:13, the two dividers at +0x400/+0x404, and in CMU_MIF the switch gate at
++0x858/+0x85c and its divider at +0x458/+0x45c. The DVFS table lists 1586 MHz at the same 900 mV
+as 902 MHz, so this needs no PMIC write.
+
+The PLL cannot be reprogrammed while the cores run from it: ARMCLK moves to the switch input,
+the dividers go to /1, the PLL is written and polled for lock, and only then does ARMCLK come
+back. Every wait is bounded and every outcome is logged; a PLL that never locks leaves the cores
+on the switch clock instead of hanging the phone. j7cpu=<kHz> overrides, 0 disables.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -219,6 +219,137 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++/*
++ * Raise both CPU clusters to the SoC's rated clock.
++ *
++ * Every perf window reports cpu_mhz=900 while the Exynos7870 is rated 1586 MHz, and this tree
++ * has no cpufreq driver, so nothing ever asks for more: the bootloader leaves the cluster PLLs
++ * at the 902 MHz operating point.  Samsung's own clock code for this SoC (pwrcal/S5E7870, from
++ * the vendor kernel) puts the registers at
++ *   CMU_CPUCL0 0x10900000, CMU_CPUCL1 0x10800000
++ *     +0x100 PLL_CON0, M 16:25, P 8:13, S 0:2, enable bit 31, locked bit 29
++ *     +0x208 the ARMCLK mux, bit 12: 0 = cluster PLL, 1 = the switch input
++ *     +0x608 that mux's status, bits 12:13
++ *     +0x400/+0x404 the two ARMCLK dividers, bits 0:2, value + 1
++ *   CMU_MIF 0x10460000
++ *     +0x858/+0x85c the switch gate for cluster 0/1, bit 0
++ *     +0x458/+0x45c the switch divider, bits 0:1 (BUS PLL / 2, about 800 MHz)
++ * and the DVFS table lists 1586 MHz at the same 900 mV as 902 MHz, so no PMIC write is needed.
++ *
++ * A PLL cannot be reprogrammed while the cores run from it, so ARMCLK is moved to the switch
++ * input first, the dividers are set to /1, the PLL is programmed and polled for lock, and only
++ * then is ARMCLK switched back.  Every wait is bounded, and a PLL that never locks leaves the
++ * cores on the switch clock with a log line instead of hanging the phone.
++ */
++static void
++j7_cpu_clock(unsigned khz)
++{
++	static const struct { uint64_t cmu; const char *name; uint32_t gate, swdiv; } cpu[] = {
++		{ 0x10900000ULL, "CPUCL0", 0x858u, 0x458u },
++		{ 0x10800000ULL, "CPUCL1", 0x85cu, 0x45cu },
++	};
++	/* 26 MHz * M / (P << S): 244/4/0 is 1586 MHz, the vendor table's top official step. */
++	const uint32_t m = (uint32_t)((uint64_t)khz * 4u / 26000u);
++	const uint32_t p = 4, s = 0;
++
++	if (m < 64 || m > 0x3ffu) {
++		IOLog("A5XELTE CPU: %u kHz is outside the PLL range\n", khz);
++		return;
++	}
++	IOMemoryDescriptor *mifDesc = IOMemoryDescriptor::withPhysicalAddress(
++	    0x10460000ULL, 0x1000, kIODirectionNone);
++	IOMemoryMap *mifMap = mifDesc != NULL ? mifDesc->map(kIOMapInhibitCache) : NULL;
++	if (mifMap == NULL) {
++		IOLog("A5XELTE CPU: no CMU_MIF map\n");
++		OSSafeReleaseNULL(mifDesc);
++		return;
++	}
++	volatile uint32_t *mif = (volatile uint32_t *)mifMap->getVirtualAddress();
++	for (unsigned i = 0; i < sizeof(cpu) / sizeof(cpu[0]); i++) {
++		IOMemoryDescriptor *desc = IOMemoryDescriptor::withPhysicalAddress(
++		    cpu[i].cmu, 0x1000, kIODirectionNone);
++		IOMemoryMap *map = desc != NULL ? desc->map(kIOMapInhibitCache) : NULL;
++		if (map == NULL) {
++			IOLog("A5XELTE CPU: no %s map\n", cpu[i].name);
++			OSSafeReleaseNULL(desc);
++			continue;
++		}
++		volatile uint32_t *c = (volatile uint32_t *)map->getVirtualAddress();
++		const uint32_t con0 = c[0x100 / 4];
++		const uint32_t cm = (con0 >> 16) & 0x3ffu, cp = (con0 >> 8) & 0x3fu, cs = con0 & 7u;
++		const uint64_t pll = (cp != 0 && cs < 7) ? 26000ULL * cm / ((uint64_t)cp << cs) : 0;
++		const uint32_t d1 = c[0x400 / 4] & 7u, d2 = c[0x404 / 4] & 7u;
++		const uint64_t arm = pll / ((uint64_t)(d1 + 1) * (uint64_t)(d2 + 1));
++		unsigned n;
++		bool locked = false;
++
++		IOLog("A5XELTE CPU: %s PLL_CON0=%08x M=%u P=%u S=%u -> %llu kHz, div %u/%u -> %llu kHz\n",
++		    cpu[i].name, con0, cm, cp, cs, pll, d1, d2, arm);
++		if (arm >= khz) {
++			IOLog("A5XELTE CPU: %s is already at %llu kHz\n", cpu[i].name, arm);
++			OSSafeReleaseNULL(map);
++			OSSafeReleaseNULL(desc);
++			continue;
++		}
++		/* Move ARMCLK to the switch input: its gate on, its divider /1 (BUS PLL / 2). */
++		mif[cpu[i].gate / 4] = mif[cpu[i].gate / 4] | 1u;
++		mif[cpu[i].swdiv / 4] = mif[cpu[i].swdiv / 4] & ~3u;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		IOSleep(1);
++		c[0x208 / 4] = c[0x208 / 4] | (1u << 12);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (n = 0; n < 100; n++) {
++			if (((c[0x608 / 4] >> 12) & 3u) == 1u) {
++				break;
++			}
++			IOSleep(1);
++		}
++		if (n == 100) {
++			IOLog("A5XELTE CPU: %s did not leave the PLL, left alone\n", cpu[i].name);
++			OSSafeReleaseNULL(map);
++			OSSafeReleaseNULL(desc);
++			continue;
++		}
++		/* Dividers to /1 while the cores are not on this path. */
++		c[0x400 / 4] = c[0x400 / 4] & ~7u;
++		c[0x404 / 4] = c[0x404 / 4] & ~7u;
++		IOSleep(1);
++		c[0x100 / 4] = (1u << 31) | (m << 16) | (p << 8) | s;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (n = 0; n < 100; n++) {
++			if (c[0x100 / 4] & (1u << 29)) {
++				locked = true;
++				break;
++			}
++			IOSleep(1);
++		}
++		if (!locked) {
++			IOLog("A5XELTE CPU: %s PLL never locked (%08x), staying on the switch clock\n",
++			    cpu[i].name, c[0x100 / 4]);
++			OSSafeReleaseNULL(map);
++			OSSafeReleaseNULL(desc);
++			continue;
++		}
++		IOSleep(1);
++		c[0x208 / 4] = c[0x208 / 4] & ~(1u << 12);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (n = 0; n < 100; n++) {
++			if (((c[0x608 / 4] >> 12) & 3u) == 0u) {
++				break;
++			}
++			IOSleep(1);
++		}
++		IOLog("A5XELTE CPU: %s on PLL_CON0=%08x, mux %u\n",
++		    cpu[i].name, c[0x100 / 4], (c[0x608 / 4] >> 12) & 3u);
++		OSSafeReleaseNULL(map);
++		OSSafeReleaseNULL(desc);
++	}
++	OSSafeReleaseNULL(mifMap);
++	OSSafeReleaseNULL(mifDesc);
++}
++#endif
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -449,6 +580,16 @@
+ 		}
+ 	}
+ 	{
++		/* j7cpu=<kHz> raises both clusters: every perf line said cpu_mhz=900 because the
++		 * bootloader leaves them at the 902 MHz operating point and nothing here ever
++		 * changes that.  0 keeps the bootloader's rate. */
++		int cpu = 1586;
++		PE_parse_boot_argn("j7cpu", &cpu, sizeof(cpu));
++		if (cpu > 0) {
++			j7_cpu_clock((unsigned)cpu);
++		}
++	}
++	{
+ 		/* j7clk=1 reads - and only reads - the clock controller bank the mainline driver
+ 		 * documents for this SoC (CMU_MIF 0x10460000, PLL_CON0 of the memory, media and
+ 		 * bus PLLs at +0x100/+0x120/+0x140). The CPU has been measured at 900 MHz against
+@@ -894,6 +1035,11 @@
+ static uint32_t *sweet_fb_wall;
+ static int32_t sweet_fb_wall_w, sweet_fb_wall_h;
+ static int sweet_fb_wall_tried;
++static uint64_t sweet_fb_wall_px;   /* pixels the last present took from the picture */
++static int sweet_fb_wall_reports;
++static uint32_t *sweet_fb_wall;
++static int32_t sweet_fb_wall_w, sweet_fb_wall_h;
++static int sweet_fb_wall_tried;
+ static uint64_t sweet_fb_wall_px;   /* pixels the last present took from the picture */
+ static int sweet_fb_wall_reports;
+ 

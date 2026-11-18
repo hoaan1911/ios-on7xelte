@@ -1,0 +1,149 @@
+From: j7
+Subject: j7: find the desktop background by its own colour
+
+The wallpaper never appeared, and the report line says why: "took 0 background pixels" on
+every frame. The exact-black test and the near-black test both replace nothing, because the home
+screen, the lock screen and the app switcher each paint their own dark colour and none of them is
+(0,0,0).
+
+Sample the layer that covers the display once per present, take its most common colour bucket,
+and accept it only when it covers a fifth of the samples and is dark. A run of at least 32 pixels
+of that colour, or of anything near-black, is background and takes the picture; a white app page
+produces no background colour at all and is left alone.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1037,11 +1037,9 @@
+ static int sweet_fb_wall_tried;
+ static uint64_t sweet_fb_wall_px;   /* pixels the last present took from the picture */
+ static int sweet_fb_wall_reports;
+-static uint32_t *sweet_fb_wall;
+-static int32_t sweet_fb_wall_w, sweet_fb_wall_h;
+-static int sweet_fb_wall_tried;
+-static uint64_t sweet_fb_wall_px;   /* pixels the last present took from the picture */
+-static int sweet_fb_wall_reports;
++/* this frame's own background colour, 0 when it has none: see sweet_fb_dominant() */
++static uint32_t sweet_fb_bg;
++static int sweet_fb_bg_wanted;
+ 
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ /*
+@@ -1113,6 +1111,71 @@
+ }
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++/*
++ * The colour the desktop paints behind everything.
++ *
++ * The fixed near-black test replaced nothing on this phone: the report line said "took 0
++ * background pixels" on every frame, because the home screen, the lock screen and the app
++ * switcher each paint their own dark background and none of them is (0,0,0).  Sample the layer
++ * once per present, take the most common colour bucket, and accept it only when it covers a
++ * fifth of the samples and is dark - which a wallpaper area is and an app's white page is not.
++ */
++static uint32_t
++sweet_fb_dominant(uintptr_t src, uint32_t stride, int32_t w, int32_t h)
++{
++	static uint16_t bins[4096];
++	unsigned total = 0, best = 0, seen = 0;
++	uint64_t r = 0, g = 0, b = 0;
++
++	bzero(bins, sizeof(bins));
++	for (int32_t y = 0; y < h; y += 8) {
++		const uint32_t *row = (const uint32_t *)(src + (uint64_t)y * stride);
++		for (int32_t x = 0; x < w; x += 8) {
++			const uint32_t v = row[x];
++			if ((v >> 24) != 0xffu) {
++				continue;
++			}
++			bins[((v >> 12) & 0xf00u) | ((v >> 8) & 0xf0u) | ((v >> 4) & 0x0fu)]++;
++			total++;
++		}
++	}
++	for (unsigned i = 1; i < 4096; i++) {
++		if (bins[i] > bins[best]) {
++			best = i;
++		}
++	}
++	if (total == 0 || (unsigned)bins[best] * 5u < total) {
++		return 0;
++	}
++	for (int32_t y = 0; y < h; y += 8) {
++		const uint32_t *row = (const uint32_t *)(src + (uint64_t)y * stride);
++		for (int32_t x = 0; x < w; x += 8) {
++			const uint32_t v = row[x];
++			if ((v >> 24) != 0xffu ||
++			    (((v >> 12) & 0xf00u) | ((v >> 8) & 0xf0u) | ((v >> 4) & 0x0fu)) != best) {
++				continue;
++			}
++			r += (v >> 16) & 0xffu;
++			g += (v >> 8) & 0xffu;
++			b += v & 0xffu;
++			seen++;
++		}
++	}
++	if (seen == 0) {
++		return 0;
++	}
++	r /= seen;
++	g /= seen;
++	b /= seen;
++	/* Only a dark background is replaced: a white app page must stay white. */
++	if ((r * 299u + g * 587u + b * 114u) / 1000u > 0x40u) {
++		return 0;
++	}
++	return 0xff000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
++}
++#endif
++
+ /*
+  * sweetfb_scale: the logical rect (dx,dy,w,h) at src goes to panel pixels
+  * x1.5, nearest neighbour (two source pixels become three). A panel row
+@@ -1124,6 +1187,14 @@
+     int32_t w, int32_t h)
+ {
+ 	static uint16_t column[2048];
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* Once per present, from the layer that covers the display: its own background colour. */
++	if (sweet_fb_bg_wanted && sweet_fb_wall != NULL && fLogicalW > 0 && fLogicalH > 0 &&
++	    (int64_t)w * h * 2 >= (int64_t)fLogicalW * fLogicalH) {
++		sweet_fb_bg = sweet_fb_dominant(src, srcRowBytes, w, h);
++		sweet_fb_bg_wanted = 0;
++	}
++#endif
+ 	/* One cacheable destination row. fPixels is write-combined panel memory, where a
+ 	 * per-pixel store costs far more than filling a normal row and copying it once: the
+ 	 * 750x1334 -> 1080x1920 frame measured 28 ms done pixel by pixel. */
+@@ -1219,7 +1290,18 @@
+ 				 * brightest channel is almost nil is background. */
+ 				const uint32_t cr = (v >> 16) & 0xffu, cg = (v >> 8) & 0xffu, cb = v & 0xffu;
+ 				const uint32_t cmax = cr > cg ? (cr > cb ? cr : cb) : (cg > cb ? cg : cb);
+-				if ((v >> 24) == 0xffu && cmax <= 0x14u && (end - x) >= 32) {
++				bool isbg = cmax <= 0x14u;
++				/* The exact and near-black tests both found nothing on this phone: each
++				 * screen paints its own dark colour.  Anything close to the frame's own
++				 * dominant colour (sweet_fb_dominant) is background too. */
++				if (!isbg && sweet_fb_bg != 0u) {
++					const int32_t dr = (int32_t)cr - (int32_t)((sweet_fb_bg >> 16) & 0xffu);
++					const int32_t dg = (int32_t)cg - (int32_t)((sweet_fb_bg >> 8) & 0xffu);
++					const int32_t db = (int32_t)cb - (int32_t)(sweet_fb_bg & 0xffu);
++					isbg = dr <= 12 && dr >= -12 && dg <= 12 && dg >= -12 &&
++					    db <= 12 && db >= -12;
++				}
++				if ((v >> 24) == 0xffu && isbg && (end - x) >= 32) {
+ 					/* A wallpaper area is hundreds of pixels across, a glyph stem is one
+ 					 * or two, so wide dark runs are background. Paint the image there
+ 					 * when one is loaded, the gradient when it is not. */
+@@ -1307,6 +1389,9 @@
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	sweet_fb_bg_wanted = 1;
++#endif
+ 	uint64_t copied = 0;
+ 
+ 

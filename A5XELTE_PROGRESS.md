@@ -253,3 +253,30 @@ Stage the iPhone 8 Plus userland in an exact-size HFSX USERDATA image, select it
   is stored and drops the whole-panel clean; a skipped row is already clean in memory.
 - Image `artifacts/j7-boot-44075613366/j7-xnu-boot.img`, 17,164,304 bytes,
   sha256 `97d2b17ed3a255b46d17f50e07c8eb48e6a1481ee2fefb8681b9dd76a04ccaeb`. Not yet flashed.
+# 2026-11-18 — J7: the CPU at 1.6 GHz, a background found by its own colour
+
+- **Device result (0376 image, sha256 `97d2b17e…4ccaeb`):** still 10 fps and still no wallpaper.
+  Every perf line reads `cpu_mhz=900`, and `A5XELTE FB: wall … took 0 background pixels last
+  frame` — the near-black test replaced nothing, so the fixed colour is the wrong idea.
+- **CPU clock (0377).** The vendor pwrcal source for this SoC (S5E7870) documents the cluster
+  blocks: CMU_CPUCL0 0x10900000, CMU_CPUCL1 0x10800000, PLL_CON0 +0x100 (M 16:25, P 8:13,
+  S 0:2, enable 31, locked 29), ARMCLK mux +0x208 bit 12 with its status at +0x608, dividers
+  +0x400/+0x404, and in CMU_MIF the switch gate +0x858/+0x85c and its divider +0x458/+0x45c.
+  The DVFS table puts 1586 MHz at the same 900 mV as the 902 MHz the bootloader leaves, so no
+  PMIC write is needed. ARMCLK moves to the 800 MHz switch input, the dividers go to /1, the
+  PLL is written (M=244 P=4 S=0) and polled for lock, then ARMCLK comes back. `j7cpu=<kHz>`
+  overrides, 0 disables; every wait is bounded and a PLL that never locks leaves the cores on
+  the switch clock instead of hanging. First device evidence will be `A5XELTE CPU: CPUCL0 …`
+  and `cpu_mhz=` in the next perf window.
+- **Wallpaper (0378).** The report line named the bug: no pixel was ever classified as
+  background, because each screen paints its own dark colour. The layer that covers the display
+  is sampled once per present (every 8th pixel), its most common colour bucket is taken when it
+  covers a fifth of the samples and is dark, and runs of 32+ pixels near it (or near-black) are
+  replaced with the picture. A white app page produces no background colour and is left alone.
+- **Gauge (0379).** Nothing answered at 0x3b on any of the six S3C controllers, and the
+  charger/FG part is an S2MU005 — the same part family as the PMIC at 0x66 — so the probe now
+  asks 0x3b, 0x66 and 0x1b and keeps the pair that ACKs. RSOC is read in whichever of the two
+  vendor layouts the value fits (hundredths of a percent, or 1/16384 of full) instead of
+  assuming the first, which is why the percentage never matched.
+- Image `artifacts/j7-boot-44238348399/j7-xnu-boot.img`, 17,164,304 bytes,
+  sha256 `7aac66ad8a9a44f41f1b1264396d704f632048d03ce072ae016364bd14778bf2`. Not yet flashed.

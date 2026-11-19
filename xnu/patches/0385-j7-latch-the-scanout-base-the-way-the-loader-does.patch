@@ -1,0 +1,99 @@
+From: j7
+Subject: j7: latch the scanout base the way the verified loader does
+
+The panel was black from the first flip on. Window 0 is protected by SHADOWCON bit 8, and the
+base written with that bit set stayed in the shadow register: the boot dump read ADD0 with the
+new address and UPDATE=1 a second later, so the request was never consumed and the controller
+kept scanning the buffer the console mute had already cleared. The loader that is verified on
+this phone clears the bit first, writes the base, then requests the update; do the same, in one
+helper used by both the first scanout and every flip. The first finished frame is also copied to
+the loader's buffer once, so a controller that still refuses the new base shows a frame instead
+of a black panel.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -191,6 +191,7 @@
+ 	uint32_t      fBackSize;
+ 	int           fBackIndex;     /* the one on screen */
+ 	int           fFlip;
++	int           fFlipped;       /* the first finished frame also went to the loader's buffer */
+ 	uintptr_t     fTarget;        /* what present() writes: back buffer, or the panel */
+ 	volatile uint32_t *fDecon;    /* DECON-F window 0 */
+ #endif
+@@ -282,6 +283,29 @@
+ }
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++/*
++ * Point window 0 at pa, the way the verified loader does it.
++ *
++ * SHADOWCON bit 8 protects window 0.  With it set, the base lands in a shadow register and only
++ * moves when a trigger consumes it; the previous attempt wrote the base with the bit set and
++ * asked for UPDATE, and the request was still pending a second later (the dump read UPDATE=1 and
++ * ADD0 held the new address) - the window kept scanning the buffer it had, which the console
++ * mute had already cleared, and the panel stayed black.  Clear the bit first: the base then
++ * takes effect at the next frame start, between two whole frames, so the change is still atomic.
++ * UPDATE goes after it because the loader writes it and it costs nothing when nothing is
++ * shadowed.
++ */
++static void
++j7_decon_scanout(volatile uint32_t *d, uint32_t pa)
++{
++	d[0x030 / 4] = d[0x030 / 4] & ~(1u << 8);
++	d[0x880 / 4] = pa;
++	d[0x710 / 4] = 1u;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++#endif
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -482,13 +506,10 @@
+ 					}
+ 				} else {
+ 					fDecon = (volatile uint32_t *)map->getVirtualAddress();
+-					/* Window 0's own base, and the update request that latches the
+-					 * shadowed window registers at the next frame boundary. */
+-					fDecon[0x880 / 4] = (uint32_t)fBackPhys[0];
+-					fDecon[0x710 / 4] = 1u;
+-					__asm__ volatile ("dsb sy" ::: "memory");
+-					IOLog("A5XELTE FB: double buffer on, scanout 0x%llx and 0x%llx, ADD0 now %08x\n",
+-					    fBackPhys[0], fBackPhys[1], fDecon[0x880 / 4]);
++					fFlipped = 0;
++					j7_decon_scanout(fDecon, (uint32_t)fBackPhys[0]);
++					IOLog("A5XELTE FB: double buffer on, scanout 0x%llx and 0x%llx, ADD0 now %08x SHADOWCON %08x\n",
++					    fBackPhys[0], fBackPhys[1], fDecon[0x880 / 4], fDecon[0x030 / 4]);
+ 				}
+ 			}
+ 		} else {
+@@ -1573,6 +1594,14 @@
+ 		 * bus transaction for every fourth of a million pixels. */
+ 		flush_dcache64((addr64_t)(uintptr_t)fTarget, fBackSize, FALSE);
+ 		__asm__ volatile ("dsb sy" ::: "memory");
++		/* The first finished frame is also put where the loader left the scanout.  If
++		 * the controller never takes the new base the phone then shows this frame
++		 * instead of a black panel, and that difference is the whole diagnosis. */
++		if (!fFlipped) {
++			fFlipped = 1;
++			memcpy((void *)fPixels, (const void *)fTarget, (size_t)fRowBytes * fHeight);
++			__asm__ volatile ("dsb sy" ::: "memory");
++		}
+ 		fBackIndex ^= 1;
+ 		flip();
+ 	}
+@@ -1647,10 +1676,7 @@
+ 	if (!fFlip || fDecon == NULL) {
+ 		return;
+ 	}
+-	fDecon[0x880 / 4] = (uint32_t)fBackPhys[fBackIndex];
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	fDecon[0x710 / 4] = 1u;
+-	__asm__ volatile ("dsb sy" ::: "memory");
++	j7_decon_scanout(fDecon, (uint32_t)fBackPhys[fBackIndex]);
+ }
+ #endif
+ 

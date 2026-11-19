@@ -1,0 +1,73 @@
+From: j7
+Subject: j7: sample the wallpaper at the layer's own size
+
+The wallpaper only replaced pixels when the swap layer was exactly the logical display size, and
+on this phone no layer that carries the desktop is: the log reported a frame whose dominant colour
+was black with "took 0 background pixels", which is what a size check that never matches looks
+like. Sample the picture at the layer's own pixel position instead, nearest neighbour, for both
+the near-black runs and the transparent pixels, so a wallpaper appears whatever rectangle the
+client hands over.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1078,6 +1078,34 @@
+ static uint32_t sweet_fb_bg;
+ static int sweet_fb_bg_wanted;
+ 
++/*
++ * The picture is the logical display size and a swap record's layer is whatever the client says,
++ * not always the same size: requiring an exact match meant no wallpaper was ever sampled (the
++ * log said "took 0 background pixels" on a frame whose dominant colour was black).  Sample the
++ * picture at the layer's pixel position instead, nearest neighbour.
++ */
++static inline uint32_t
++sweet_fb_wall_at(int32_t c, int32_t r, int32_t w, int32_t h)
++{
++	if (sweet_fb_wall == NULL || sweet_fb_wall_w <= 0 || sweet_fb_wall_h <= 0 || w <= 0 || h <= 0) {
++		return 0;
++	}
++	int64_t sx = (int64_t)c * sweet_fb_wall_w / w;
++	int64_t sy = (int64_t)r * sweet_fb_wall_h / h;
++	if (sx < 0) {
++		sx = 0;
++	} else if (sx >= sweet_fb_wall_w) {
++		sx = sweet_fb_wall_w - 1;
++	}
++	if (sy < 0) {
++		sy = 0;
++	} else if (sy >= sweet_fb_wall_h) {
++		sy = sweet_fb_wall_h - 1;
++	}
++	return sweet_fb_wall[(uint64_t)sy * (uint64_t)sweet_fb_wall_w + (uint64_t)sx];
++}
++
++
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ /*
+  * Expand the compiled-in picture to the logical display size. Nothing is visible to a
+@@ -1359,19 +1387,17 @@
+ 					/* A wallpaper area is hundreds of pixels across, a glyph stem is one
+ 					 * or two, so wide dark runs are background. Paint the image there
+ 					 * when one is loaded, the gradient when it is not. */
+-					if (sweet_fb_wall != NULL && sweet_fb_wall_w == w &&
+-					    sweet_fb_wall_h == h) {
+-						v = sweet_fb_wall[(uint64_t)r * (uint64_t)w + (uint64_t)c];
++					if (sweet_fb_wall != NULL) {
++						v = sweet_fb_wall_at(c, r, w, h);
+ 						sweet_fb_wall_px += (uint32_t)(end - x);
+ 					} else {
+ 						v = bg;
+ 					}
+ 					sweet_fb_alpha0 += (uint32_t)(end - x);
+-				} else if (v == 0u && sweet_fb_wall != NULL &&
+-				    sweet_fb_wall_w == w && sweet_fb_wall_h == h) {
++				} else if (v == 0u && sweet_fb_wall != NULL) {
+ 					/* The client left this pixel transparent, so nothing else draws
+ 					 * there: the picture goes in, and it counts. */
+-					v = sweet_fb_wall[(uint64_t)r * (uint64_t)w + (uint64_t)c];
++					v = sweet_fb_wall_at(c, r, w, h);
+ 					sweet_fb_wall_px += (uint32_t)(end - x);
+ 				}
+ 				for (; x < end; x++) {

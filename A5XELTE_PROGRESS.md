@@ -313,3 +313,42 @@ patch adds the high-speed sequence and scans 0x13860000-0x138c0000 as well.
 Expected in the next log: `A5XELTE CPU: CPUCL0 ... -> 1794000 kHz` (or 1586000), `cpu_mhz=1794`
 in the perf windows, `A5XELTE FB: double buffer on, scanout 0x... and 0x...`, a copy time far
 below 35 ms, and `A5XELTE FG: gauge on 0x... (hsi2c) at 0x3b`.
+
+## 2026-11-18 — the 38 MHz boot: the clock write and the unlatched flip
+
+The device booted the 0380–0383 image and reported a black panel and 900 MHz. The log says
+something worse than that, and it explains both complaints:
+
+    A5XELTE FB: submits=2 ... cpu_mhz=38
+    A5XELTE FB: frames=1 elapsed_ms=8175 fps=0.1 avg_copy_us=2369996
+    A5XELTE FB: copy split build_us=2212965 store_us=63823
+
+`cpu_mhz` is measured by `j7m_cpu_mhz()` (a timed add loop), not read from a table, so the machine
+really was running at 38 MHz: a present took 2.4 s (10 s in the first window) and a touch waited
+half a minute. 0380 never reprogrammed the PLL — the log has `CPUCL0 did not leave the PLL, left
+along` and the PLL_CON0 readback is still `a15b0501` (M=347 P=5 S=1, 902 MHz) — but it had already
+written the switch gate and divider at CMU_MIF +0x858/+0x458, which are not where this tree
+believed. 0384 removes every write: `j7_cpu_clock()` reads PLL_CON0 and the ARMCLK dividers,
+logs the rate, and leaves the tree as the bootloader set it. 902 MHz is slow; 38 MHz is unusable.
+
+The black panel is the other half:
+
+    A5XELTE FB: double buffer on, scanout 0x87c58000 and 0x885a8000, ADD0 now 87c58000
+    A5XELTE DECON: OSDA=00000000 OSDB=0086e77f ADD0=87c58000 UPDATE=00000001 TRIGCON=00000040
+
+ADD0 holds the new address and UPDATE still reads 1 a second later, so the update request was
+never consumed: window 0 is protected by SHADOWCON bit 8 (0x701 in the same dump) and the base
+stayed in its shadow register. The controller kept scanning 0x67000000, which the `a5fb_noconsole`
+mute had already cleared — a black panel that no wake can change. The verified loader
+(`shim/a5xelte/display_console.c`) clears SHADOWCON bit 8, writes FB_START, then requests the
+update; 0385 does exactly that in `j7_decon_scanout()`, used by the first scanout and every flip,
+and copies the first finished frame to the loader's buffer once so a controller that still refuses
+the base shows a frame instead of black.
+
+0386: `wall … took 0 background pixels` was never about the colour test. Both wallpaper paths
+required the swap layer to be exactly the picture's size (750x1334); a layer of another size
+matched neither path, and the frame's dominant colour being black proves the background was there.
+The picture is now sampled at the layer's own pixel position.
+
+Expected in the next log: `cpu_mhz=900` again, `avg_copy_us` back near 35 ms, `double buffer on,
+scanout … SHADOWCON 00000601` (bit 8 clear), and a non-zero `took N background pixels`.

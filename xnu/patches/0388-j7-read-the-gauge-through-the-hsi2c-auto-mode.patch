@@ -1,0 +1,202 @@
+From: j7
+Subject: j7: read the gauge through the HSI2C block's auto mode
+
+Every high-speed bus logged istat=0 and answered nothing, and the reason is in the register
+map: the Exynos HSI2C has I2C_INT_ENABLE at 0x20 and I2C_INT_STATUS at 0x24, not 0x10 and 0x14,
+and its FIFOs at 0x34/0x38, not 0x1c/0x20.  The scan was reading and writing the wrong words, so
+no transfer ever started.  Use the block's auto mode as drivers/i2c/busses/i2c-exynos5.c does -
+master and direction in I2C_CTL, target in I2C_ADDR, length/read/stop/run in I2C_AUTO_CONF,
+completion in I2C_INT_STATUS - and leave the timing registers the bootloader programmed alone.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/bsd/dev/a5xelte_battery.c
++++ b/bsd/dev/a5xelte_battery.c
+@@ -42,36 +42,48 @@
+  * S3C2440-layout one at 0x13830000-0x13850000, and the PMIC pair - S2MPU05 at 0x66
+  * and the S2MU005 fuel gauge at 0x3b - sits on the first of them.  Writing the S3C
+  * register layout there read back exactly the value written (stat=0xf0, the byte
+- * itself) on every bus, which is why the gauge scan never found anything.  The
+- * register map and the start sequence are the ones in Samsung's exynos5-hsi2c:
+- * direction and master in HSI2C_CTL, one byte per HSI2C_TX_FIFO word, and writing
+- * the address byte to the FIFO is what starts the transfer.
++ * itself) on every bus, which is why the gauge scan never found anything.  Those offsets
++ * were wrong too: the Exynos HSI2C keeps its interrupt registers at 0x20/0x24 and its FIFOs
++ * at 0x34/0x38, so the status word the scan read at 0x14 was always zero and every byte it
++ * wrote to 0x1c went nowhere.  Use the block's own auto mode, where the controller runs the
++ * address, the data and the stop itself (drivers/i2c/busses/i2c-exynos5.c), so there is no
++ * FIFO handshaking to get wrong: master and direction in HSI2C_CTL, target in HSI2C_ADDR,
++ * length, read/write, stop and the run bit in HSI2C_AUTO_CONF, completion in HSI2C_INT_STAT.
+  */
+-#define HSI2C_CTL       0x00u
+-#define HSI2C_FIFO_CTL  0x04u
+-#define HSI2C_TRAILING  0x08u
+-#define HSI2C_INT_EN    0x10u
+-#define HSI2C_INT_STAT  0x14u
+-#define HSI2C_TX_FIFO   0x1cu
+-#define HSI2C_RX_FIFO   0x20u
++#define HSI2C_CTL        0x00u
++#define HSI2C_FIFO_CTL   0x04u
++#define HSI2C_INT_EN     0x20u
++#define HSI2C_INT_STAT   0x24u
++#define HSI2C_FIFO_STAT  0x30u
++#define HSI2C_TX_DATA    0x34u
++#define HSI2C_RX_DATA    0x38u
++#define HSI2C_CONF       0x40u
++#define HSI2C_AUTO_CONF  0x44u
++#define HSI2C_TIMEOUT    0x48u
++#define HSI2C_TRANS_STAT 0x50u
++#define HSI2C_ADDR       0x70u
+ 
+ #define HSI2C_CTL_FUNC_I2C  (1u << 0)
+ #define HSI2C_CTL_MASTER    (1u << 3)
+ #define HSI2C_CTL_RXCHON    (1u << 6)
+ #define HSI2C_CTL_TXCHON    (1u << 7)
+-#define HSI2C_CTL_SW_RST    (1u << 31)
+ 
+-#define HSI2C_INT_RX_READY  (1u << 0)
+-#define HSI2C_INT_TX_READY  (1u << 1)
+-#define HSI2C_INT_RX_NAK    (1u << 2)
+-#define HSI2C_INT_TX_NAK    (1u << 3)
+-#define HSI2C_INT_ARB_LOST  (1u << 4)
+-#define HSI2C_INT_STOP      (1u << 5)
+-#define HSI2C_INT_ADDR_NAK  (1u << 6)
+-#define HSI2C_INT_ADDR_ACK  (1u << 7)
++#define HSI2C_INT_TRANS_DONE  (1u << 7)
++#define HSI2C_INT_TRANS_ABORT (1u << 8)
++#define HSI2C_INT_NO_DEV_ACK  (1u << 9)
++#define HSI2C_INT_NO_DEV      (1u << 10)
++#define HSI2C_INT_TIMEOUT     (1u << 11)
++#define HSI2C_INT_DONE        (HSI2C_INT_TRANS_DONE | HSI2C_INT_TRANS_ABORT | \
++    HSI2C_INT_NO_DEV_ACK | HSI2C_INT_NO_DEV | HSI2C_INT_TIMEOUT)
++
++#define HSI2C_CONF_AUTO_MODE  (1u << 31)
++#define HSI2C_TIMEOUT_EN      (1u << 31)
++#define HSI2C_AUTO_READ_WRITE (1u << 16)
++#define HSI2C_AUTO_STOP       (1u << 17)
++#define HSI2C_AUTO_RUN        (1u << 31)
+ 
+-#define HSI2C_FIFO_RX_RDY   (1u << 0)
+-#define HSI2C_FIFO_TX_RDY   (1u << 4)
++#define HSI2C_FIFO_RX_EN      (1u << 0)
++#define HSI2C_FIFO_TX_EN      (1u << 1)
+ 
+ static int fg_hsi2c;
+ 
+@@ -192,7 +204,7 @@
+ static bool
+ fg_hsi2c_wait(uint32_t mask, uint32_t *st)
+ {
+-	for (unsigned n = 0; n < 2000; n++) {
++	for (unsigned n = 0; n < 100; n++) {
+ 		*st = fg_rd(HSI2C_INT_STAT);
+ 		if (*st & mask) {
+ 			return true;
+@@ -202,45 +214,60 @@
+ 	return false;
+ }
+ 
+-/* One message on the high-speed controller; bytes[0] is the register pointer. */
++/* Put the block in auto mode before it is scanned: the controller, not the driver, owns the
++ * address, data and stop phases.  The timing registers are left exactly as the bootloader
++ * programmed them, because it already read this gauge and its SCL period is set up right. */
++static void
++fg_hsi2c_init(void)
++{
++	fg_wr(HSI2C_TIMEOUT, fg_rd(HSI2C_TIMEOUT) & ~HSI2C_TIMEOUT_EN);
++	fg_wr(HSI2C_CONF, fg_rd(HSI2C_CONF) | HSI2C_CONF_AUTO_MODE);
++	fg_wr(HSI2C_CTL, HSI2C_CTL_FUNC_I2C | HSI2C_CTL_MASTER);
++	fg_wr(HSI2C_FIFO_CTL, HSI2C_FIFO_RX_EN | HSI2C_FIFO_TX_EN);
++	fg_wr(HSI2C_INT_EN, 0);
++	fg_wr(HSI2C_INT_STAT, fg_rd(HSI2C_INT_STAT));   /* the status bits are write-one-to-clear */
++	delay(10);
++}
++
++/* One message on the high-speed controller, in auto mode; bytes[0] is the register pointer. */
+ static bool
+ fg_hsi2c_msg(bool receive, uint8_t *bytes, unsigned count)
+ {
+-	uint32_t ctl = HSI2C_CTL_FUNC_I2C | HSI2C_CTL_MASTER;
+-	uint32_t st = 0;
++	const uint32_t ctl = HSI2C_CTL_FUNC_I2C | HSI2C_CTL_MASTER;
++	uint32_t st = 0, fs;
+ 	bool ok = false;
+ 
+ 	if (!count || count > 4) {
+ 		return false;
+ 	}
+-	fg_wr(HSI2C_CTL, ctl | HSI2C_CTL_SW_RST);
+-	delay(1);
+ 	fg_wr(HSI2C_CTL, ctl | (receive ? HSI2C_CTL_RXCHON : HSI2C_CTL_TXCHON));
+-	fg_wr(HSI2C_FIFO_CTL, HSI2C_FIFO_RX_RDY | HSI2C_FIFO_TX_RDY);
+-	fg_wr(HSI2C_TRAILING, receive ? (count - 1) : 0);
+-	fg_wr(HSI2C_INT_STAT, 0xffffffffu);
+-	fg_wr(HSI2C_INT_EN, HSI2C_INT_ADDR_ACK | HSI2C_INT_ADDR_NAK | HSI2C_INT_TX_NAK |
+-	    HSI2C_INT_RX_NAK | (receive ? HSI2C_INT_RX_READY : HSI2C_INT_TX_READY));
+-	/* The address byte is what starts the transfer. */
+-	fg_wr(HSI2C_TX_FIFO, (uint32_t)((fg_addr & 0xfeu) | (receive ? 1u : 0u)));
+-	if (!fg_hsi2c_wait(HSI2C_INT_ADDR_ACK | HSI2C_INT_ADDR_NAK, &st) ||
+-	    (st & HSI2C_INT_ADDR_NAK)) {
++	fg_wr(HSI2C_FIFO_CTL, HSI2C_FIFO_RX_EN | HSI2C_FIFO_TX_EN |
++	    ((uint32_t)count << 4) | ((uint32_t)count << 16));
++	/* The target address lives in the top half, the controller's own id in the bottom. */
++	fg_wr(HSI2C_ADDR, ((uint32_t)fg_addr & 0x3feu) << 9);
++	fg_wr(HSI2C_INT_STAT, fg_rd(HSI2C_INT_STAT));
++	fg_wr(HSI2C_INT_EN, HSI2C_INT_DONE);
++	fg_wr(HSI2C_AUTO_CONF, (uint32_t)count | HSI2C_AUTO_STOP | HSI2C_AUTO_RUN |
++	    (receive ? HSI2C_AUTO_READ_WRITE : 0u));
++	if (!receive) {
++		for (unsigned n = 0; n < count; n++) {
++			fg_wr(HSI2C_TX_DATA, bytes[n]);
++		}
++	}
++	if (!fg_hsi2c_wait(HSI2C_INT_DONE, &st)) {
++		goto out;
++	}
++	/* The other flavour of the block moves the same status bits into I2C_TRANS_STATUS. */
++	if (!(st & HSI2C_INT_TRANS_DONE) && !(fg_rd(HSI2C_TRANS_STAT) & 1u)) {
+ 		goto out;
+ 	}
+ 	if (receive) {
+-		for (unsigned n = 0; n < count; n++) {
+-			if (!fg_hsi2c_wait(HSI2C_INT_RX_READY, &st)) {
+-				goto out;
+-			}
+-			bytes[n] = (uint8_t)fg_rd(HSI2C_RX_FIFO);
++		fs = fg_rd(HSI2C_FIFO_STAT);
++		if (((fs >> 16) & 0x7fu) < count) {
++			goto out;
+ 		}
+-	} else {
+ 		for (unsigned n = 0; n < count; n++) {
+-			if (!fg_hsi2c_wait(HSI2C_INT_TX_READY, &st) ||
+-			    (st & HSI2C_INT_TX_NAK)) {
+-				goto out;
+-			}
+-			fg_wr(HSI2C_TX_FIFO, bytes[n]);
++			bytes[n] = (uint8_t)fg_rd(HSI2C_RX_DATA);
+ 		}
+ 	}
+ 	ok = true;
+@@ -248,8 +275,9 @@
+ 	fg_wr(HSI2C_INT_EN, 0);
+ 	fg_wr(HSI2C_CTL, ctl);
+ 	if (!ok && ++fg_errors <= 4) {
+-		printf("A5XELTE FG: hsi2c %s of %u byte(s) failed stat=%#x ctl=%#x\n",
+-		    receive ? "read" : "write", count, st, fg_rd(HSI2C_CTL));
++		printf("A5XELTE FG: hsi2c %s of %u byte(s) failed stat=%#x ts=%#x conf=%#x\n",
++		    receive ? "read" : "write", count, st, fg_rd(HSI2C_TRANS_STAT),
++		    fg_rd(HSI2C_CONF));
+ 	}
+ 	return ok;
+ }
+@@ -354,6 +382,9 @@
+ 			continue;
+ 		}
+ 		fg_hsi2c = buses[i].hsi2c;
++		if (fg_hsi2c) {
++			fg_hsi2c_init();
++		}
+ 		for (unsigned a = 0; a < sizeof(addrs) / sizeof(addrs[0]); a++) {
+ 			uint16_t soc = 0xffff;
+ 			fg_addr = addrs[a];

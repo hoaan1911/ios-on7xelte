@@ -352,3 +352,43 @@ The picture is now sampled at the layer's own pixel position.
 
 Expected in the next log: `cpu_mhz=900` again, `avg_copy_us` back near 35 ms, `double buffer on,
 scanout … SHADOWCON 00000601` (bit 8 clear), and a non-zero `took N background pixels`.
+
+## 2026-11-19 — 9 fps, no tearing, and a wallpaper that still would not paint
+
+The 0384–0386 boot worked: the panel is up, tearing is gone, and the clock is where the
+bootloader left it.
+
+    A5XELTE FB: frames=147 elapsed_ms=15962 fps=9.3 avg_copy_us=71090 max_copy_us=71792
+    A5XELTE FB: copy split build_us=9866386 store_us=268052      (147 frames)
+    A5XELTE FB: wall 750x1334 px0=ff000000 mid=ff4a4939 bg=ff000000 took 0 background pixels
+
+`cpu_mhz=891` (measured, not a table), so the machine is back at the bootloader's 902 MHz and the
+copy is back to 71 ms. Of that, `build_us` is 65 ms per frame — 45 ns per source pixel, which is
+one uncached read of the client's surface each — and `store_us` is 1.8 ms. 0387 stages each source
+row in cacheable memory once and builds every output pixel from that copy.
+
+The wallpaper: `bg=ff000000` (the frame's dominant colour is black) and still `took 0`. The paint
+required a run of 32 consecutive output pixels of the same colour, but at the panel's 1.44x scale
+one source pixel covers one or two output pixels, so no run is ever longer than two and that test
+could never match. The only pixels the picture ever replaced were the 4320 fully transparent ones
+(`took 4320`), which is the transparency path, not the background path. 0387 paints every dark
+opaque pixel with the picture, sampled through a column table built once per present.
+
+The gauge still answered on nothing:
+
+    A5XELTE FG: nothing on 0x13830000, stat=0xf0 con=0xe3            (S3C layout, unclocked)
+    A5XELTE FG: nothing on 0x13860000 (hsi2c), istat=0 ctl=0x9      (same for 0x1387-0x1389)
+    A5XELTE FG: nothing on 0x138a0000 (hsi2c), istat=0x7fffffff     (nothing mapped there)
+
+`istat=0` on eight high-speed buses and `0x7fffffff` on the blocks that are not there is a block
+that is clocked and reached, and 0383 was reading and writing the wrong words of it: the Exynos
+HSI2C has `I2C_INT_ENABLE` at 0x20 and `I2C_INT_STATUS` at 0x24 (the map in
+drivers/i2c/busses/i2c-exynos5.c), not 0x10/0x14, and the FIFOs at 0x34/0x38, not 0x1c/0x20.
+0388 drives the block in its auto mode — `I2C_CTL` for master and direction, `I2C_ADDR` for the
+target, `I2C_AUTO_CONF` for length/read/stop/run, `I2C_INT_STATUS` for the result — and leaves the
+timing registers alone because the bootloader already read this gauge.
+
+Expected in the next log: `build_us` near 10 ms per 147 frames and `fps` 20–30, a `wall … took N
+background pixels` with N in the hundreds of thousands, and either
+`A5XELTE FG: gauge on 0x... (hsi2c) at 0x3b, RSOC=...` or a `hsi2c read of 2 byte(s) failed` line
+carrying the real `stat`, `ts` and `conf`.

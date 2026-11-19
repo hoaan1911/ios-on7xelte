@@ -392,3 +392,45 @@ Expected in the next log: `build_us` near 10 ms per 147 frames and `fps` 20–30
 background pixels` with N in the hundreds of thousands, and either
 `A5XELTE FG: gauge on 0x... (hsi2c) at 0x3b, RSOC=...` or a `hsi2c read of 2 byte(s) failed` line
 carrying the real `stat`, `ts` and `conf`.
+
+## 2026-11-19 — the wallpaper paints, and where the 70 ms actually goes
+
+Image `44518516504` (patches 0384–0388) on the phone. The wallpaper is on screen — the user's
+photo of the phone shows the built-in picture behind the Apple logo — and the log says so:
+
+    A5XELTE FB: wall 750x1334 px0=ff000000 mid=ff4a4939 bg=ff000000 took 1422150 background pixels last frame
+    A5XELTE FB: copy split build_us=70045 store_us=1925
+    A5XELTE FB: frames=1 elapsed_ms=5385 fps=0.1 bytes=8294400 avg_copy_us=78487 max_copy_us=78487
+
+So `sweet_fb_dominant()` and the per-dark-pixel paint both work. Three things follow from the
+numbers, and the user reports all three: the wallpaper is a little too early, the frame is still
+70 ms of build, and the gauge still answers on nothing.
+
+**The build is not the paint.** `build_us=70045` for a 78 ms present, with 1.4 M pixels painted in
+it, is 47 µs per source row (1334 rows). Painting a row is 750 table lookups; reading it is
+3000 bytes out of the client's surface, which is cache-inhibited in this kernel, so the 0387
+`memcpy` into cacheable memory is itself a 32-bit load per bus transaction — the same cost as the
+gather it replaced, which is why build_us barely moved from 65 ms. 0389 loads the row two pixels at
+a time, four loads in flight, and does the picture decision once per *source* pixel on the staged
+copy instead of once per output pixel. The copy split line gains `src_us` so the read and the
+paint are separated in the next log.
+
+**Too early.** The picture is painted on the boot logo screen, so the Apple sits on the wallpaper
+instead of on black. There is no userspace hook here, but the kernel sees the right moment itself:
+`kern_exec.c` already prints `exec SpringBoard`, and SpringBoard's spawn is the last step before
+the lock screen. 0390 sets `sweet_fb_wall_ready` there, and `scaledCopy()` paints nothing until it
+is set.
+
+**The gauge never got its 100 µs.** 0388's completion poll gave up after 100 µs. A two-byte read at
+100 kHz is about 300 µs, and `drivers/i2c/busses/i2c-exynos5.c` waits 100 ms, so every transfer was
+abandoned while it was still running, which is exactly `istat=0` on all eight high-speed buses.
+0391 waits 5 ms, pushes the command bytes into the transmit FIFO *before* the run bit (an empty
+FIFO at start reads as an underrun), clears `I2C_AUTO_CONF` after a failed message, and keeps the
+scan's addresses in 7-bit form — `I2C_ADDR` takes bits [19:10] (`HSI2C_SLV_ADDR_MAS`) and `IICDS`
+takes `addr << 1`, and 0388 wrote the same byte-form value into both, which is a different device
+on the S3C controller and only landed in the right HSI2C field by accident for 0x76.
+
+Expected in the next log: `src_us` and `build_us` together well under the 70 ms, `fps` 20–30 on a
+frame that changes, `wall … took N` only *after* `exec SpringBoard`, and either
+`A5XELTE FG: gauge on 0x... (hsi2c) at 0x3b, RSOC=...` or
+`nothing on 0x... (hsi2c), istat=… ts=… ctl=…` with a `ts` value that says whether the bus ACKed.

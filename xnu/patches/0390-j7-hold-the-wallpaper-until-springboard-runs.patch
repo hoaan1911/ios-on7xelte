@@ -1,0 +1,63 @@
+From: j7
+Subject: j7: hold the wallpaper until SpringBoard runs
+
+The picture was painted on the boot logo screen, so the Apple appeared over the wallpaper
+instead of over black.  The loginwindow-side solution is not available here, so use the one
+the kernel already sees: set a flag when kern_exec.c executes SpringBoard, which is the last
+step before the lock screen, and paint only after that.  Before it the panel gets exactly
+what the boot screen drew, and nothing of the picture.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1077,6 +1077,10 @@
+ /* this frame's own background colour, 0 when it has none: see sweet_fb_dominant() */
+ static uint32_t sweet_fb_bg;
+ static int sweet_fb_bg_wanted;
++/* Set by the exec path when SpringBoard is executed (kern_exec.c).  Until then the panel
++ * shows the boot logo drawn on black, and painting the picture under it looked like the
++ * wallpaper arriving before the system did. */
++int sweet_fb_wall_ready;
+ 
+ /*
+  * The picture is the logical display size and a swap record's layer is whatever the client says,
+@@ -1421,7 +1425,7 @@
+ 			 * pixel: at 1.44x one source pixel covers one or two output pixels, so this is
+ 			 * 750 decisions a row instead of 1080 and every one of them reads the cached
+ 			 * copy.  The expansion below then only copies a value. */
+-			if (wrow != NULL) {
++			if (sweet_fb_wall_ready && wrow != NULL) {
+ 				for (int32_t c = 0; c < w; c++) {
+ 					const uint32_t v = srcrow[c];
+ 					if (v == 0u) {
+@@ -1456,8 +1460,9 @@
+ 						sweet_fb_alpha0++;
+ 					}
+ 				}
+-			} else {
+-				/* No picture at all: keep the plain gradient for a dark background. */
++			} else if (wrow == NULL) {
++				/* No picture at all: keep the plain gradient for a dark background.  The
++				 * boot logo screen has a picture but is not ready yet, and stays black. */
+ 				for (int32_t c = 0; c < w; c++) {
+ 					const uint32_t v = srcrow[c];
+ 					const uint32_t cr = (v >> 16) & 0xffu, cg = (v >> 8) & 0xffu;
+--- a/kern_exec.c
++++ b/kern_exec.c
+@@ -7617,6 +7617,15 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 			/* A short line keeps the persistent console ring useful. */
+ 			printf("exec %s\n", p->p_name);
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++			/* SpringBoard is the last step before the lock screen, and the boot logo
++			 * screen before it is drawn on black: let the framebuffer paint its
++			 * wallpaper from here on, so it does not appear under the Apple logo. */
++			if (p->p_name != NULL && strcmp(p->p_name, "SpringBoard") == 0) {
++				extern int sweet_fb_wall_ready;
++				sweet_fb_wall_ready = 1;
++			}
++#endif
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "

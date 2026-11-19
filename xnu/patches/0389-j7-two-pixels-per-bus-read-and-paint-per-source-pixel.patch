@@ -1,0 +1,227 @@
+From: j7
+Subject: j7: two pixels per bus read, and paint once per source pixel
+
+The wallpaper paints now (1.4 M pixels in one frame) and the build is still 70 ms of a 78 ms
+present, so the cost is not the paint: the client's surface is cache-inhibited and a
+3000-byte row cost 47 us, which is one bus transaction per 32-bit load.  Load two pixels at a
+time, four loads in flight, and keep memcpy only for a row that is not 8-byte aligned.
+
+The picture decision also ran per output pixel with the picture's column looked up in a
+750-entry table per 1080-pixel row.  Do it once per source pixel in the staged row instead,
+where the column of the picture is a table built once per present, and let the expansion
+loop only copy values.  A new src_us in the copy split line says how much of build_us is the
+row read.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -41,7 +41,7 @@
+ extern "C" unsigned j7m_cpu_mhz(void);
+ 
+ /* scaledCopy(): row build (index, background) versus panel stores, nanoseconds */
+-static uint64_t sweet_fb_build_ns, sweet_fb_store_ns;
++static uint64_t sweet_fb_build_ns, sweet_fb_store_ns, sweet_fb_src_ns;
+ /* j7fb_band=0 stores one panel row at a time instead of four. */
+ static int sweet_fb_band = 1;
+ /* set by scaledCopy(): pixels the client left fully transparent in the last present */
+@@ -832,9 +832,9 @@
+ 			    fb->fPerfNS / fb->fPerfFrames / 1000, fb->fPerfMaxNS / 1000);
+ 			IOLog("A5XELTE FB: submits=%llu wait_us=%llu store_us=%llu flush_us=%llu wrap=%u cpu_mhz=%u\n",
+ 			    submits, waitUs, storeUs, flushUs, wraps, j7m_cpu_mhz());
+-			IOLog("A5XELTE FB: copy split build_us=%llu store_us=%llu\n",
+-			    sweet_fb_build_ns / 1000, sweet_fb_store_ns / 1000);
+-			sweet_fb_build_ns = sweet_fb_store_ns = 0;
++			IOLog("A5XELTE FB: copy split build_us=%llu src_us=%llu store_us=%llu\n",
++			    sweet_fb_build_ns / 1000, sweet_fb_src_ns / 1000, sweet_fb_store_ns / 1000);
++			sweet_fb_build_ns = sweet_fb_src_ns = sweet_fb_store_ns = 0;
+ 			IOLog("A5XELTE FB: swap_ends=%llu swap_waits=%llu avg_swapwait_us=%llu\n",
+ 			    sweet_fb_swap_count, sweet_fb_swap_waits,
+ 			    sweet_fb_swap_waits ? sweet_fb_swap_wait_us / sweet_fb_swap_waits : 0);
+@@ -1252,6 +1252,38 @@
+ #endif
+ 
+ /*
++ * The client's surface arrives cache-inhibited, where every 32-bit load is its own bus
++ * transaction: one 3000-byte row cost 47 us, which was most of the frame.  Load two pixels
++ * per transaction instead, four loads at a time so the controller can pipeline them, and
++ * fall back to memcpy only for a row that is not 8-byte aligned.
++ */
++static void
++sweet_fb_row_copy(uint32_t *dst, const uint32_t *src, int32_t n)
++{
++	if ((((uintptr_t)src | (uintptr_t)dst) & 7u) != 0) {
++		memcpy(dst, src, (size_t)n * 4);
++		return;
++	}
++	const uint64_t *s = (const uint64_t *)src;
++	uint64_t *d = (uint64_t *)dst;
++	const int32_t pairs = n >> 1;
++	int32_t i = 0;
++	for (; i + 3 < pairs; i += 4) {
++		const uint64_t a = s[i], b = s[i + 1], c = s[i + 2], e = s[i + 3];
++		d[i] = a;
++		d[i + 1] = b;
++		d[i + 2] = c;
++		d[i + 3] = e;
++	}
++	for (; i < pairs; i++) {
++		d[i] = s[i];
++	}
++	if (n & 1) {
++		dst[n - 1] = src[n - 1];
++	}
++}
++
++/*
+  * sweetfb_scale: the logical rect (dx,dy,w,h) at src goes to panel pixels
+  * x1.5, nearest neighbour (two source pixels become three). A panel row
+  * whose source row equals the previous one is copied from it. Called only
+@@ -1262,8 +1294,8 @@
+     int32_t w, int32_t h)
+ {
+ 	static uint16_t column[2048];
+-	/* The wallpaper column for each output pixel: same lifetime as column[]. */
+-	static uint16_t wallx[2048];
++	/* The picture's column for each source pixel: same lifetime as column[]. */
++	static uint16_t wallc[2048];
+ 	/* The client's surface is not in the cache.  Reading a pixel straight out of it costs a bus
+ 	 * transaction, and the row build measured 65 ms of a 106 ms frame - 45 ns per source pixel,
+ 	 * which is one uncached read each.  Stage the row in cacheable memory once, one transaction
+@@ -1301,10 +1333,12 @@
+ 	    w <= 0 || w > (int32_t)(sizeof(srcrow) / sizeof(srcrow[0]))) {
+ 		return 0;
+ 	}
++	for (int32_t c = 0; c < w; c++) {
++		wallc[c] = sweet_fb_wall_col(c, w);
++	}
+ 	for (int32_t x = 0; x < pw; x++) {
+ 		int32_t c = (px0 + x) * (int32_t)fLogicalW / (int32_t)fWidth - dx;
+ 		column[x] = (uint16_t)(c < 0 ? 0 : (c >= w ? w - 1 : c));
+-		wallx[x] = sweet_fb_wall_col(column[x], w);
+ 	}
+ 	int32_t previous = -1;
+ 	uint64_t buildStart = 0, storeStart = 0;
+@@ -1348,8 +1382,14 @@
+ 		}
+ 		uint32_t *out = (uint32_t *)(target + (uint64_t)py * fRowBytes + (uint64_t)px0 * 4);
+ 		const uint32_t *in = (const uint32_t *)(src + (uint64_t)r * srcRowBytes);
+-		/* One pass over the client's row, then everything reads the cached copy. */
+-		memcpy(srcrow, in, (size_t)w * 4);
++		/* One pass over the client's row, two pixels per bus transaction. */
++		{
++			const uint64_t copyStart = mach_absolute_time();
++			sweet_fb_row_copy(srcrow, in, w);
++			uint64_t ns = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time() - copyStart, &ns);
++			sweet_fb_src_ns += ns;
++		}
+ 		in = srcrow;
+ 		/* The desktop behind the icons arrives as opaque black, not as transparency: a whole frame
+ 		 * carried only 4320 fully transparent pixels, and every swap record carries a single
+@@ -1377,53 +1417,67 @@
+ 			}
+ 			/* The picture's row for this logical row, once per row. */
+ 			const uint32_t *wrow = sweet_fb_wall_row(r, h);
++			/* Decide picture or background once per source pixel, not once per output
++			 * pixel: at 1.44x one source pixel covers one or two output pixels, so this is
++			 * 750 decisions a row instead of 1080 and every one of them reads the cached
++			 * copy.  The expansion below then only copies a value. */
++			if (wrow != NULL) {
++				for (int32_t c = 0; c < w; c++) {
++					const uint32_t v = srcrow[c];
++					if (v == 0u) {
++						/* The client left this pixel transparent, so nothing
++						 * else draws there: the picture goes in, and it counts. */
++						srcrow[c] = wrow[wallc[c]];
++						sweet_fb_wall_px++;
++						continue;
++					}
++					if ((v >> 24) != 0xffu) {
++						continue;
++					}
++					const uint32_t cr = (v >> 16) & 0xffu, cg = (v >> 8) & 0xffu;
++					const uint32_t cb = v & 0xffu;
++					const uint32_t cmax = cr > cg ? (cr > cb ? cr : cb) : (cg > cb ? cg : cb);
++					/* 0x14 was too tight: the lock screen and the home screen paint
++					 * 0xff1c1c1e and friends, which stayed on screen as black. */
++					bool isbg = cmax <= 0x28u;
++					/* The exact and near-black tests both found nothing on this
++					 * phone: each screen paints its own dark colour.  Anything close
++					 * to the frame's own dominant colour is background too. */
++					if (!isbg && sweet_fb_bg != 0u) {
++						const int32_t dr = (int32_t)cr - (int32_t)((sweet_fb_bg >> 16) & 0xffu);
++						const int32_t dg = (int32_t)cg - (int32_t)((sweet_fb_bg >> 8) & 0xffu);
++						const int32_t db = (int32_t)cb - (int32_t)(sweet_fb_bg & 0xffu);
++						isbg = dr <= 12 && dr >= -12 && dg <= 12 && dg >= -12 &&
++						    db <= 12 && db >= -12;
++					}
++					if (isbg) {
++						srcrow[c] = wrow[wallc[c]];
++						sweet_fb_wall_px++;
++						sweet_fb_alpha0++;
++					}
++				}
++			} else {
++				/* No picture at all: keep the plain gradient for a dark background. */
++				for (int32_t c = 0; c < w; c++) {
++					const uint32_t v = srcrow[c];
++					const uint32_t cr = (v >> 16) & 0xffu, cg = (v >> 8) & 0xffu;
++					const uint32_t cb = v & 0xffu;
++					const uint32_t cmax = cr > cg ? (cr > cb ? cr : cb) : (cg > cb ? cg : cb);
++					if ((v >> 24) == 0xffu && cmax <= 0x28u) {
++						srcrow[c] = bg;
++					}
++				}
++			}
+ 			/* One source pixel becomes one or two output pixels: write the run, not the
+ 			 * output pixel, so the source is read once per pixel instead of gathered. */
+ 			int32_t x = 0;
+ 			while (x < pw) {
+ 				int32_t c = column[x];
+ 				int32_t end = x + 1;
+-				uint32_t v;
+ 				while (end < pw && column[end] == c) {
+ 					end++;
+ 				}
+-				v = in[c];
+-				/* The desktop is not exactly black: the lock screen and the home screen
+-				 * paint a near-black (0xff0a0a0a and friends), which the exact test used
+-				 * to miss, so no wallpaper ever appeared. Any opaque colour whose
+-				 * brightest channel is almost nil is background. */
+-				const uint32_t cr = (v >> 16) & 0xffu, cg = (v >> 8) & 0xffu, cb = v & 0xffu;
+-				const uint32_t cmax = cr > cg ? (cr > cb ? cr : cb) : (cg > cb ? cg : cb);
+-				/* 0x14 was too tight: the lock screen and the home screen paint
+-				 * 0xff1c1c1e and friends, which stayed on screen as black. */
+-				bool isbg = cmax <= 0x28u;
+-				/* The exact and near-black tests both found nothing on this phone: each
+-				 * screen paints its own dark colour.  Anything close to the frame's own
+-				 * dominant colour (sweet_fb_dominant) is background too. */
+-				if (!isbg && sweet_fb_bg != 0u) {
+-					const int32_t dr = (int32_t)cr - (int32_t)((sweet_fb_bg >> 16) & 0xffu);
+-					const int32_t dg = (int32_t)cg - (int32_t)((sweet_fb_bg >> 8) & 0xffu);
+-					const int32_t db = (int32_t)cb - (int32_t)(sweet_fb_bg & 0xffu);
+-					isbg = dr <= 12 && dr >= -12 && dg <= 12 && dg >= -12 &&
+-					    db <= 12 && db >= -12;
+-				}
+-				/* Runs are at most two pixels wide, because one source pixel covers
+-				 * one or two output pixels at 1.44x, so the old "a background run is 32
+-				 * pixels" test never matched and no wallpaper was ever painted.  A dark
+-				 * opaque pixel is background; the wallpaper's pixel for it is a table
+-				 * lookup because the row and the column of the picture are fixed here. */
+-				if ((v >> 24) == 0xffu && isbg) {
+-					v = wrow != NULL ? wrow[wallx[x]] : bg;
+-					if (wrow != NULL) {
+-						sweet_fb_wall_px += (uint32_t)(end - x);
+-					}
+-					sweet_fb_alpha0 += (uint32_t)(end - x);
+-				} else if (v == 0u && wrow != NULL) {
+-					/* The client left this pixel transparent, so nothing else draws
+-					 * there: the picture goes in, and it counts. */
+-					v = wrow[wallx[x]];
+-					sweet_fb_wall_px += (uint32_t)(end - x);
+-				}
++				const uint32_t v = in[c];
+ 				for (; x < end; x++) {
+ 					row[x] = v;
+ 				}

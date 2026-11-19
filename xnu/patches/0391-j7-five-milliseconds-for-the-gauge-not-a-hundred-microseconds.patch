@@ -1,0 +1,108 @@
+From: j7
+Subject: j7: five milliseconds for the gauge, not a hundred microseconds
+
+Every high-speed bus still logged nothing, and the transfer was never given a chance: the
+completion poll gave up after 100 us, while drivers/i2c/busses/i2c-exynos5.c waits 100 ms and
+a two-byte read at 100 kHz takes about 300 us.  Wait 5 ms, put the command bytes in the
+transmit FIFO before the run bit instead of after it, and drop I2C_AUTO_CONF when a message
+fails so the next one is not started from a half-run block.
+
+The addresses were also written in two inconsistent forms: the scan moved a byte-form address
+into I2C_ADDR (shifted by 9, which happens to land in the right field only for 0x76) and into
+IICDS unshifted (which is a different device on the S3C controller).  Keep every address in
+the 7-bit form the device tree uses and shift each controller's way.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/bsd/dev/a5xelte_battery.c
++++ b/bsd/dev/a5xelte_battery.c
+@@ -38,6 +38,9 @@
+ #define FG_MODE_RX      0x90u           /* master receive, START */
+ 
+ /*
++ * All addresses below are the 7-bit form the device tree uses; the S3C controller takes
++ * (addr << 1) and the HSI2C block takes the address in bits [19:10].
++ *
+  * The high-speed I2C blocks (0x13860000 and up) are a different controller from the
+  * S3C2440-layout one at 0x13830000-0x13850000, and the PMIC pair - S2MPU05 at 0x66
+  * and the S2MU005 fuel gauge at 0x3b - sits on the first of them.  Writing the S3C
+@@ -165,7 +168,7 @@
+ 	fg_wr(FG_CON, 0xe3u);
+ 	fg_wr(FG_FILTER, 7u);
+ 	fg_wr(FG_STAT, receive ? FG_MODE_RX : FG_MODE_TX);
+-	fg_wr(FG_DS, (uint32_t)fg_addr | (receive ? 1u : 0u));
++	fg_wr(FG_DS, ((uint32_t)fg_addr << 1) | (receive ? 1u : 0u));
+ 	delay(1);
+ 	fg_wr(FG_STAT, (receive ? FG_MODE_RX : FG_MODE_TX) | 0x20u);
+ 	if (!fg_wait() || (fg_rd(FG_STAT) & 1u)) {
+@@ -201,10 +204,14 @@
+ }
+ 
+ /* Waits for one of `mask` in HSI2C_INT_STAT, bounded; leaves the status in *st. */
++/* The vendor driver waits 100 ms for a message to finish, and a 2-byte read at 100 kHz
++ * takes about 300 us, so a 100 us bound gave up on transfers that were still running:
++ * the scan reported istat=0 on every bus.  5 ms is enough for one message at either
++ * the bootloader's clock or the slowest standard rate. */
+ static bool
+ fg_hsi2c_wait(uint32_t mask, uint32_t *st)
+ {
+-	for (unsigned n = 0; n < 100; n++) {
++	for (unsigned n = 0; n < 5000; n++) {
+ 		*st = fg_rd(HSI2C_INT_STAT);
+ 		if (*st & mask) {
+ 			return true;
+@@ -243,17 +250,19 @@
+ 	fg_wr(HSI2C_CTL, ctl | (receive ? HSI2C_CTL_RXCHON : HSI2C_CTL_TXCHON));
+ 	fg_wr(HSI2C_FIFO_CTL, HSI2C_FIFO_RX_EN | HSI2C_FIFO_TX_EN |
+ 	    ((uint32_t)count << 4) | ((uint32_t)count << 16));
+-	/* The target address lives in the top half, the controller's own id in the bottom. */
+-	fg_wr(HSI2C_ADDR, ((uint32_t)fg_addr & 0x3feu) << 9);
++	/* I2C_ADDR holds the 7-bit target in bits [19:10] (HSI2C_SLV_ADDR_MAS). */
++	fg_wr(HSI2C_ADDR, ((uint32_t)fg_addr & 0x3ffu) << 10);
+ 	fg_wr(HSI2C_INT_STAT, fg_rd(HSI2C_INT_STAT));
+ 	fg_wr(HSI2C_INT_EN, HSI2C_INT_DONE);
+-	fg_wr(HSI2C_AUTO_CONF, (uint32_t)count | HSI2C_AUTO_STOP | HSI2C_AUTO_RUN |
+-	    (receive ? HSI2C_AUTO_READ_WRITE : 0u));
++	/* The bytes go in before the run bit: a transmit FIFO that is empty when the
++	 * controller starts reads as an underrun and aborts the transfer. */
+ 	if (!receive) {
+ 		for (unsigned n = 0; n < count; n++) {
+ 			fg_wr(HSI2C_TX_DATA, bytes[n]);
+ 		}
+ 	}
++	fg_wr(HSI2C_AUTO_CONF, (uint32_t)count | HSI2C_AUTO_STOP | HSI2C_AUTO_RUN |
++	    (receive ? HSI2C_AUTO_READ_WRITE : 0u));
+ 	if (!fg_hsi2c_wait(HSI2C_INT_DONE, &st)) {
+ 		goto out;
+ 	}
+@@ -273,6 +282,9 @@
+ 	ok = true;
+ out:
+ 	fg_wr(HSI2C_INT_EN, 0);
++	if (!ok) {
++		fg_wr(HSI2C_AUTO_CONF, 0);   /* drop a transfer that never completed */
++	}
+ 	fg_wr(HSI2C_CTL, ctl);
+ 	if (!ok && ++fg_errors <= 4) {
+ 		printf("A5XELTE FG: hsi2c %s of %u byte(s) failed stat=%#x ts=%#x conf=%#x\n",
+@@ -374,7 +386,7 @@
+ 		{ 0x13890000u, 1 }, { 0x138a0000u, 1 }, { 0x138b0000u, 1 },
+ 		{ 0x138c0000u, 1 },
+ 	};
+-	static const uint8_t addrs[] = { 0x76u, 0x66u, 0x1bu };
++	static const uint8_t addrs[] = { 0x3bu, 0x33u, 0x0du };
+ 
+ 	for (unsigned i = 0; i < sizeof(buses) / sizeof(buses[0]); i++) {
+ 		fg_i2c = ml_io_map(buses[i].pa, 0x1000);
+@@ -397,8 +409,9 @@
+ 			}
+ 		}
+ 		if (fg_hsi2c) {
+-			printf("A5XELTE FG: nothing on 0x%08x (hsi2c), istat=%#x ctl=%#x\n",
+-			    buses[i].pa, fg_rd(HSI2C_INT_STAT), fg_rd(HSI2C_CTL));
++			printf("A5XELTE FG: nothing on 0x%08x (hsi2c), istat=%#x ts=%#x ctl=%#x\n",
++			    buses[i].pa, fg_rd(HSI2C_INT_STAT), fg_rd(HSI2C_TRANS_STAT),
++			    fg_rd(HSI2C_CTL));
+ 		} else {
+ 			printf("A5XELTE FG: nothing on 0x%08x, stat=%#x con=%#x\n",
+ 			    buses[i].pa, fg_rd(FG_STAT), fg_rd(FG_CON));

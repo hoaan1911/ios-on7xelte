@@ -43,8 +43,8 @@ Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
  				for (int32_t c = 0; c < w; c++) {
  					const uint32_t v = srcrow[c];
  					const uint32_t cr = (v >> 16) & 0xffu, cg = (v >> 8) & 0xffu;
---- a/kern_exec.c
-+++ b/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
 @@ -7617,6 +7617,15 @@
  #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
  			/* A short line keeps the persistent console ring useful. */

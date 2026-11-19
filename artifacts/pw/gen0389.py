@@ -11,7 +11,7 @@ import os, shutil, subprocess, sys
 ROOT = "artifacts/pw"
 FB = "iokit/Kernel/arm/SweetFramebuffer.cpp"
 FG = "bsd/dev/a5xelte_battery.c"
-KX = "kern_exec.c"
+KX = "bsd/kern/kern_exec.c"
 CO = "Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>"
 
 
@@ -38,7 +38,7 @@ def cut(s, start_anchor, end_anchor, new, why):
 # ---------------------------------------------------------------- stage 0
 os.makedirs(ROOT + "/p2", exist_ok=True)
 s0 = load(ROOT + "/new/" + FB)
-k0 = load("artifacts/cur/" + KX)
+k0 = load("artifacts/cur/kern_exec.c")
 g0 = load(ROOT + "/new/" + FG)
 
 # ---------------------------------------------------------------- 0389
@@ -348,12 +348,13 @@ g1 = sub(g1,
 os.makedirs(ROOT + "/p2/s1/iokit/Kernel/arm", exist_ok=True)
 os.makedirs(ROOT + "/p2/s2/iokit/Kernel/arm", exist_ok=True)
 os.makedirs(ROOT + "/p2/s2/bsd/dev", exist_ok=True)
+os.makedirs(ROOT + "/p2/s2/bsd/kern", exist_ok=True)
 open(ROOT + "/p2/s1/" + FB, "w").write(s1)
 open(ROOT + "/p2/s2/" + FB, "w").write(s2)
 open(ROOT + "/p2/s2/" + KX, "w").write(k1)
 open(ROOT + "/p2/s2/" + FG, "w").write(g1)
 open(ROOT + "/p2/s0_" + FB.replace("/", "_"), "w").write(s0)
-open(ROOT + "/p2/s0_" + KX, "w").write(k0)
+open(ROOT + "/p2/s0_" + KX.replace("/", "_"), "w").write(k0)
 open(ROOT + "/p2/s0_" + FG.replace("/", "_"), "w").write(g0)
 
 
@@ -372,7 +373,7 @@ def patch(name, subject, body, hunks):
 
 
 s0f = ROOT + "/p2/s0_" + FB.replace("/", "_")
-k0f = ROOT + "/p2/s0_" + KX
+k0f = ROOT + "/p2/s0_" + KX.replace("/", "_")
 g0f = ROOT + "/p2/s0_" + FG.replace("/", "_")
 
 patch("0389-j7-two-pixels-per-bus-read-and-paint-per-source-pixel",

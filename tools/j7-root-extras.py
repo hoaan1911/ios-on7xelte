@@ -24,6 +24,9 @@ changed travel over adb -- the phone keeps its first-boot state, so nothing take
 
   restore undo a push: writes those same ranges back from device/USERDATA-before.img.
 
+  inspect list a path inside the pulled image, mounted read-only, without pulling anything again:
+            python3 tools/j7-root-extras.py inspect --path Applications --glob '*.appex'
+
 Examples (Linux or macOS; root via sudo, so run `sudo -v` first):
   python3 tools/j7-root-extras.py push           # works on Linux and macOS
   python3 tools/j7-root-extras.py restore
@@ -41,6 +44,7 @@ Apple payload stays in device/j7-root-extras.tar and the pulled image; both are 
 The tool never touches BOOT: the kernel and the boot arguments are not part of this.
 """
 import argparse
+import fnmatch
 import hashlib
 import os
 import plistlib
@@ -515,21 +519,25 @@ def copy_image(src, dst):
     return dst
 
 
-def attach_image(image, mnt):
-    """Mount the HFS+ image read-write. macOS attaches it as a device first; Linux loops it."""
+def attach_image(image, mnt, readonly=False):
+    """Mount the HFS+ image. macOS attaches it as a device first; Linux loops it."""
     if not DARWIN:
-        run([*SUDO, 'mount', '-t', 'hfsplus', '-o', 'loop,force', image, mnt])
+        opts = 'loop,force' + (',ro' if readonly else '')
+        run([*SUDO, 'mount', '-t', 'hfsplus', '-o', opts, image, mnt])
         return image
+    mode = '-readonly' if readonly else '-readwrite'
     out = run([*SUDO, 'hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage',
-               '-nomount', '-readwrite', '-noverify', image]).stdout
+               '-nomount', mode, '-noverify', image]).stdout
     dev = next((line.split('\t')[0].strip() for line in out.splitlines()
+
                 if line.split('\t')[0].strip().startswith('/dev/disk')), None)
     if not dev:
         sys.exit(f'hdiutil did not attach {image}:\n{out.strip()[-1500:]}')
-    fsck = fsck_cmd()
-    if fsck:
-        run([*fsck, dev], check=False)  # the phone never unmounts cleanly
-    run([*SUDO, 'mount', '-t', 'hfs', dev, mnt])
+    if not readonly:
+        fsck = fsck_cmd()
+        if fsck:
+            run([*fsck, dev], check=False)  # the phone never unmounts cleanly
+    run([*SUDO, 'mount', '-t', 'hfs', *(['-o', 'rdonly'] if readonly else []), dev, mnt])
     return dev
 
 
@@ -625,6 +633,44 @@ def do_push(args):
     return 0
 
 
+def do_inspect(args):
+    """List part of a pulled image read-only: the phone's own HFSX cannot be looked at over adb,
+    and a read-only mount of the copy changes nothing."""
+    require_posix('inspect', 'look inside the image')
+    if not os.path.isfile(args.image):
+        sys.exit(f'{args.image} does not exist: it is an image "push" pulled')
+    precheck_sudo()
+    mnt = tempfile.mkdtemp(prefix='j7look-')
+    handle = None
+    try:
+        handle = attach_image(args.image, mnt, readonly=True)
+        base = os.path.join(mnt, args.path.strip('/')) if args.path else mnt
+        if not os.path.isdir(base):
+            sys.exit(f'{args.path} is not on this image')
+        total = shown = 0
+        for root, dirs, files in os.walk(base):
+            dirs.sort()
+            for name in sorted(dirs) + sorted(files):
+                full = os.path.join(root, name)
+                rel = os.path.relpath(full, mnt)
+                if args.glob and not (fnmatch.fnmatch(name, args.glob)
+                                      or fnmatch.fnmatch(rel, args.glob)):
+                    continue
+                total += 1
+                if shown < args.limit:
+                    kind = 'd' if os.path.isdir(full) else 'f'
+                    print(f'{kind} {os.lstat(full).st_size:>10} {rel}')
+                    shown += 1
+        print(f'{total} match(es)' + (f', first {shown} shown (--limit)' if total > shown else ''))
+        if args.verbose:
+            print('read-only: nothing here was written, and nothing reaches the phone')
+        return 0
+    finally:
+        if handle:
+            detach_image(handle, mnt)
+        run([*SUDO, 'rmdir', mnt], check=False)
+
+
 def do_restore(args):
     require_posix('restore', 'undo a push')
     if not os.path.isfile(args.runs):
@@ -674,6 +720,14 @@ def main():
     pu.add_argument('--keep-work', action='store_true', help='keep the edited copy of the image')
     pu.add_argument('--force', action='store_true', help='ignore the size and space guards')
 
+    ins = sub.add_parser('inspect', help='list a path in a pulled image, read-only, no pull')
+    ins.add_argument('--image', default=os.path.join('device', 'USERDATA-before.img'))
+    ins.add_argument('--path', default='',
+                     help='path inside the root, e.g. System/Library/ExtensionKit/Extensions')
+    ins.add_argument('--glob', default='', help='only names matching this, e.g. "*.appex"')
+    ins.add_argument('--limit', type=int, default=100, help='entries to print (default 100)')
+    ins.add_argument('-v', '--verbose', action='store_true')
+
     rs = sub.add_parser('restore', help='write the pre-change ranges back')
     rs.add_argument('--adb', default='adb')
     rs.add_argument('--dev')
@@ -699,6 +753,8 @@ def main():
         return 0
     if a.mode == 'push':
         return do_push(a)
+    if a.mode == 'inspect':
+        return do_inspect(a)
     # restore only writes ranges; nothing here needs the image mounted
     return do_restore(a)
 

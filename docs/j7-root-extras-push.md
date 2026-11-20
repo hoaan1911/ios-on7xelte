@@ -125,6 +125,26 @@ after the push, that log line is the difference between "the extension is not in
 "the extension is installed and does not render" — they need different fixes, and the second one
 is not a bundle problem.
 
+### Look inside the phone without writing anything
+
+```bash
+python3 tools/j7-root-extras.py inspect --path System/Library/ExtensionKit/Extensions --glob '*.appex'
+python3 tools/j7-root-extras.py inspect --path Applications/PaperBoard.app/PlugIns --glob '*.appex'
+```
+
+`inspect` mounts `device/USERDATA-before.img` **read-only** (no `fsck`, no writes) and lists what is
+really in the root, so ""is that extension on the phone?"" is answered without a pull or a push.
+
+Do not write into that mount by hand, and do not copy files into it from Finder:
+
+- the mounted volume is the *local image*, not the phone. `push` writes back only the 4 KiB blocks
+  that differ between its image and the device, and it re-clones the working copy on every run, so
+  anything dragged in there is thrown away or, at best, only reaches the phone if a later `push`
+  happens to diff that image against the device — silently and without its own verification;
+- Finder copies break the bundle: files must be owned `root:wheel` (the kernel refuses to `exec` a
+  bundle owned by your user) and keep their exact modes and symlinks. A drag-and-drop copy makes them
+  `you:staff`, adds `.DS_Store`, and carries resource forks the iOS root never had.
+
 ### On macOS (hackintosh or a real Mac)
 
 HFS+ is native to macOS (still fully supported in macOS 26), so this is the shortest path: the tool

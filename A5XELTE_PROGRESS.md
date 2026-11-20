@@ -627,3 +627,17 @@ incomplete, the appex and its executable land with mode 755 while the existing e
 a second run reports every unit complete, `--replace` still re-extracts whole units, and the owner check
 still refuses an executable that is not root-owned. Not verified: the real tar's contents, which is the
 next thing to look at.
+
+### Every unit in the tar is already complete on the phone
+
+`tar -tf device/j7-root-extras.tar | grep -c '\.appex'` gives 3782 lines, i.e. 130 `.appex` bundles
+inside 140 install units — the tar does carry the extensions. The member-by-member dry run against the
+real image then reported **all 140 units complete**: the phone already holds every file this tar has,
+extensions included. So the grey tiles are not a missing-bundle problem on this phone, and no push
+will change them; the next question is the render path or resources outside `/Applications`.
+
+Added `inspect` so the pulled image can be read without a pull or a write: it attaches
+`device/USERDATA-before.img` read-only (no fsck, `-o rdonly`, `hdiutil -readonly`), walks one path and
+prints sizes, optionally filtered by `--glob`. Verified against a fake mount: read-only flag reaches
+`attach_image`, listing and globbing are correct, and a missing image exits instead of mounting.
+Not verified: a real HFS+ mount of the image (no macOS here).

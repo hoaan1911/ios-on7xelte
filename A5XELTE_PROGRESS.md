@@ -577,3 +577,11 @@ Verified only on Linux: a fake adb stream (1 MiB data, 2 MiB zeros, 1 MiB data) 
 sparse image with 2 MiB holes and a change run at the expected block, and the Darwin code path with
 `run()` stubbed produced hdiutil attach, fsck_hfs on /dev/disk9, mount -t hfs, umount and hdiutil
 detach in that order. No mounting, pulling or writing was done on a Mac or on the phone.
+
+The hackintosh reached this step first, and hit a host problem rather than a device one: adb 37.0.1
+on Darwin 25.6 stops the daemon right after `usb_osx.cpp:323 reported max packet size for …`, so
+`adb devices` prints `ADB server didn't ACK` / `failed to start daemon` and nothing can be pushed.
+That is the legacy USB backend 37.x brought back for macOS; `ADB_LIBUSB=1` selects libusb instead,
+and platform-tools 35.0.1 is libusb by default. The tool now prints that hint when `adb devices`
+returns an error, and `docs/j7-root-extras-push.md` has an "ADB server didn't ACK on macOS" section.
+Nothing was run against the phone or an HFS+ image on the Mac yet.

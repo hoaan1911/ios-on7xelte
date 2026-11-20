@@ -98,12 +98,30 @@ def fsck_cmd():
     return None
 
 
+def adb_hint(tool):
+    """adb on macOS dies in its legacy USB backend on some USB controllers (hackintoshes)."""
+    if not DARWIN:
+        return ('Check for a stuck adb:  ps aux | grep adb   and   lsof -iTCP:5037\n'
+                'then  adb kill-server  and try again.')
+    return ('On macOS, adb 37.x uses its legacy USB backend by default and can crash on the first\n'
+            'device it sees (this is the usb_osx.cpp line in the log above). Switch back to libusb:\n'
+            f'  {tool} kill-server; ADB_LIBUSB=1 LIBUSB=1 {tool} devices\n'
+            'and keep that variable set for every adb call, including this tool. If that also\n'
+            'fails, the same works from platform-tools 35.0.1 (libusb by default):\n'
+            '  curl -LO https://dl.google.com/android/repository/platform-tools_r35.0.1-darwin.zip')
+
+
 class Phone:
     """adb in TWRP: shell text out, exec-out bytes out."""
 
     def __init__(self, tool):
         self.tool = tool
-        devices = run([tool, 'devices']).stdout
+        p = run([tool, 'devices'], check=False)
+        if p.returncode:
+            sys.exit(f'adb could not start its server ({tool} devices):\n'
+                     f'{(p.stderr or p.stdout or "").strip()[-1600:]}\n'
+                     f'{adb_hint(tool)}')
+        devices = p.stdout
         if not any(line.split('\t')[-1].strip() in ('device', 'recovery')
                    for line in devices.splitlines()[1:] if line.strip()):
             sys.exit(f'no adb device ({tool} devices). Boot TWRP and plug the phone in.')

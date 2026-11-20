@@ -138,6 +138,35 @@ python3 tools/j7-root-extras.py push --dry-run
 python3 tools/j7-root-extras.py push
 ```
 
+### `ADB server didn't ACK` on macOS
+
+adb 37.x switched macOS back to its **legacy USB backend** (`usb_osx.cpp`); `ADB_LIBUSB=1` opts
+back into libusb. On some USB controllers — hackintoshes especially — the legacy path crashes the
+daemon on the first device it enumerates, which looks like this:
+
+```
+* daemon not running; starting now at tcp:5037
+ADB server didn't ACK
+… usb_osx.cpp:323 reported max packet size for 52103bedfa51642f is 512
+* failed to start daemon
+```
+
+So, in order:
+
+1. Watch the daemon itself (the client log above stops before the reason):
+   `ADB_TRACE=usb:v adb -L tcp:5037 nodaemon server`, Ctrl-C after the error line.
+2. Use libusb instead of the legacy backend, for the server and for this tool:
+   `adb kill-server; export ADB_LIBUSB=1 LIBUSB=1; adb devices`
+   (`LIBUSB=1` is the old name, harmless to set as well.) If the server is already running from a
+   previous backend you must `adb kill-server` first — the variable only affects a fresh server.
+3. If libusb does not see the device either, use platform-tools 35.0.1, which is libusb by
+   default: `curl -LO https://dl.google.com/android/repository/platform-tools_r35.0.1-darwin.zip`,
+   unzip, and call that `adb` explicitly with `--adb /path/to/adb` (or put it first in `PATH`).
+4. Check nothing else holds the port: `lsof -nP -iTCP:5037` and kill whatever it lists.
+
+The tool prints this same hint when `adb devices` returns an error, instead of just the raw adb
+output.
+
 ## 3. Undo
 
 The pre-change image and the changed-run list are both still there:

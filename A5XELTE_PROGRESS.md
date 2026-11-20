@@ -434,3 +434,51 @@ Expected in the next log: `src_us` and `build_us` together well under the 70 ms,
 frame that changes, `wall … took N` only *after* `exec SpringBoard`, and either
 `A5XELTE FG: gauge on 0x... (hsi2c) at 0x3b, RSOC=...` or
 `nothing on 0x... (hsi2c), istat=… ts=… ctl=…` with a `ts` value that says whether the bus ACKed.
+
+## 2026-11-20 — the row read is fixed, the picture is gone, and why every bus said 0x2000c
+
+Device log for image `44577466397` (17,180,688 bytes, sha256
+`3f67dcab730229296d116085c1c6841dad4a887b78ae333e27c853a4ed6e5877`). The user reports it as
+faster and more responsive, still not finished, and compares it to a 3GS on iOS 9.
+
+**0389 worked.** `copy split build_us=64635 src_us=2968 store_us=1898` for 8 frames is 0.37 ms of
+row read per frame instead of the 47 µs per row (≈65 ms) of 0387. The uncached gather is gone; the
+`src_us` share of `build_us` is now under 1 %.
+
+**The present is still 55–72 ms.** `avg_copy_us` in the interaction windows is 55–73 ms
+(`fps=9.3` in the 16 s window with 600 presents) and in the idle windows `fps` is 0.1–2 because
+almost nothing presents. `build_us` over those windows is 60 % of wall time (≈16 ms per frame), so
+the remaining 40 ms is not in `scaledCopy`'s two measured sections. That is the next thing to
+measure, not to guess at.
+
+**The picture had holes because it is not the desktop's wallpaper.** It is one half-size RGB565
+photograph painted where the client painted background, so every dark part of the photograph stayed
+greyed and the tile showed black blocks. 0392 removes it from the kernel entirely: no
+`j7wall_data.h`, no embedded expansion. A raw file at `/var/mobile/j7wall.raw` (or `j7wall=<path>`)
+is still honoured, and that path now opens the file before allocating and frees the buffer when the
+read fails.
+
+**"Add New Wallpaper" is empty because the gallery is not in the kernel.** The gallery tiles are
+PosterBoard's poster extensions and the app-provided poster plug-ins, both under `/Applications`,
+and this root was staged with `/Applications/***` excluded and then narrowed to six bundles
+(`docs/a5xelte-root-application-omission.md`). Evidence in this boot: PosterBoard runs
+(`exec PosterBoard`, and its `sel 17` calls answer), while `PaperBoard` — the wallpaper gallery
+service, `paperboard.wallpaper-service` — never appears in the log at all, not as an exec and not in
+a launchd message. That is a staged-root gap, not something a patch can add: the bundles are Apple
+payload and stay out of Git.
+
+**Every high-speed bus logged the same `ts=0x2000c`, and that is a leftover.** Bit 17 of
+`I2C_TRANS_STATUS` is the stop phase. 0388/0391 never waited for a stop to finish and never reset
+the block, so the first failed message left the controller stopping and every bus probed after it
+reported the same inherited word — which is why three unrelated blocks produced one identical value.
+0393 drops the hand-rolled sequence for the one that is device verified on this IP in the A5XELTE
+PMIC path (`bsd/dev/a5xelte_touch.c`): reset through `I2C_CTL` bit 31, Linux's 400 kHz timing
+registers, the byte count in the FIFO trigger the controller expects, both FIFOs serviced while the
+transfer runs, `INT_STATUS` polled and cleared bit by bit, success only after `TRANS_STATUS` bit 17
+clears, and a reset after a failed message. The scan asks 0x36 (MAX77854, as the S7 uses next to
+its 0x66 PMIC) instead of 0x0d, which is not a fuel gauge on any Samsung board.
+
+Expected in the next log: a `wall` report line only when a picture file exists (there is none, so
+the desktop keeps its graded background and no photograph at all), and either
+`A5XELTE FG: gauge on 0x... (hsi2c) at 0x3b, RSOC=...` or `hsi2c read of 2 byte(s) failed
+irq=… ts=… fifo=…` with an `irq` from the transfer itself instead of an inherited `0x2000c`.

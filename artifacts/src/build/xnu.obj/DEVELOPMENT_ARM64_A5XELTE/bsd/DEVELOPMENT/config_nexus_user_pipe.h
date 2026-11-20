@@ -1,0 +1,1 @@
+#define CONFIG_NEXUS_USER_PIPE 1

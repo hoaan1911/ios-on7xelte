@@ -1,0 +1,102 @@
+From: j7
+Subject: j7: drop the compiled-in picture from the desktop
+
+The photograph painted, but every dark part of it was a hole: the desktop is painted on
+top of it, and the tile seen on the phone had black blocks wherever the picture was
+dark.  Stop shipping the picture inside the kernel - one half-size RGB565 photograph is
+not a wallpaper anyway - and paint nothing where the client painted nothing, so the
+desktop keeps one flat, graded background.
+
+A raw picture is still read from /var/mobile/j7wall.raw (or j7wall=<path>) when that
+file exists, and that path now opens the file before allocating the buffer and frees
+the buffer when the read fails, instead of leaving four megabytes behind and painting
+half of it.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -80,9 +80,6 @@
+ #include <sys/kauth.h>
+ #include <sys/vfs_context.h>
+ #endif
+-#if defined(ARM64_BOARD_CONFIG_A5XELTE)
+-#include "j7wall_data.h"    /* tools/j7wall.py output: the picture below, RGB565 */
+-#endif
+ 
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ static void sweet_fb_copy_init(void);
+@@ -1121,34 +1118,6 @@
+ 
+ 
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+-/*
+- * Expand the compiled-in picture to the logical display size. Nothing is visible to a
+- * computer yet, so the only thing that can reach the phone is the boot image: the
+- * wallpaper travels inside the kernel instead of in a file the user would have to push.
+- * The data is half size RGB565; nearest neighbour both ways, once, at first present.
+- */
+-static void
+-sweet_fb_wall_embedded(uint32_t *dst, int32_t w, int32_t h)
+-{
+-	for (int32_t y = 0; y < h; y++) {
+-		int64_t sy = (int64_t)y * J7WALL_HEIGHT / h;
+-		const unsigned short *srow = j7wall_data + sy * J7WALL_WIDTH;
+-		uint32_t *drow = dst + (int64_t)y * w;
+-		int32_t sx = 0;
+-		for (int32_t x = 0; x < w; x++) {
+-			while (sx + 1 < J7WALL_WIDTH && (int64_t)(sx + 1) * w <= (int64_t)x * J7WALL_WIDTH) {
+-				sx++;
+-			}
+-			uint32_t v = srow[sx];
+-			uint32_t r = (v >> 11) & 0x1fu;
+-			uint32_t g = (v >> 5) & 0x3fu;
+-			uint32_t b = v & 0x1fu;
+-			drow[x] = 0xff000000u | (((r << 3) | (r >> 2)) << 16) |
+-			    (((g << 2) | (g >> 4)) << 8) | ((b << 3) | (b >> 2));
+-		}
+-	}
+-}
+-
+ static void
+ sweet_fb_wall_load(int32_t w, int32_t h)
+ {
+@@ -1162,26 +1131,27 @@
+ 	if (size <= 0) {
+ 		return;
+ 	}
++	/* No compiled-in picture any more.  It was one photograph at half resolution in
++	 * RGB565, so its dark areas were not the wallpaper the desktop would have shown but
++	 * holes in it, and the desktop is better off with its own background.  A file that is
++	 * really there is still used, and j7wall=<path> still picks another one. */
++	if (vnode_open(path, FREAD, 0, 0, &vp, ctx) != 0 || vp == NULL) {
++		IOLog("A5XELTE FB: no wallpaper at %s, keeping the plain background\n", path);
++		return;
++	}
+ 	sweet_fb_wall = (uint32_t *)IOMallocData((vm_size_t)size);
+ 	if (sweet_fb_wall == NULL) {
++		vnode_close(vp, FREAD, ctx);
+ 		IOLog("A5XELTE FB: no memory for a wallpaper\n");
+ 		return;
+ 	}
+-	if (vnode_open(path, FREAD, 0, 0, &vp, ctx) != 0 || vp == NULL) {
+-		IOLog("A5XELTE FB: no wallpaper at %s, using the built-in picture\n", path);
+-		sweet_fb_wall_embedded(sweet_fb_wall, w, h);
+-		sweet_fb_wall_w = w;
+-		sweet_fb_wall_h = h;
+-		return;
+-	}
+ 	int error = vn_rdwr(UIO_READ, vp, (caddr_t)sweet_fb_wall, size, 0, UIO_SYSSPACE,
+ 	    IO_NODELOCKED | IO_NOCACHE, kauth_cred_get(), NULL, NULL);
+ 	vnode_close(vp, FREAD, ctx);
+ 	if (error != 0) {
+-		IOLog("A5XELTE FB: wallpaper read %d, using the built-in picture\n", error);
+-		sweet_fb_wall_embedded(sweet_fb_wall, w, h);
+-		sweet_fb_wall_w = w;
+-		sweet_fb_wall_h = h;
++		IOFreeData(sweet_fb_wall, (vm_size_t)size);
++		sweet_fb_wall = NULL;
++		IOLog("A5XELTE FB: wallpaper read %d, keeping the plain background\n", error);
+ 		return;
+ 	}
+ 	sweet_fb_wall_w = w;

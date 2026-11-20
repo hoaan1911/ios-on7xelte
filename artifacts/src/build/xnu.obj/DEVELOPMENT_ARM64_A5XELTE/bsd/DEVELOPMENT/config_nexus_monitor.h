@@ -1,0 +1,1 @@
+#define CONFIG_NEXUS_MONITOR 1

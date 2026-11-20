@@ -1,0 +1,12 @@
+KernelConfigTables.cpo: \
+  /Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/iokit/KernelConfigTables.cpp \
+  meta_features.h iokitcpp.h kdebug.h networking.h hibernation.h \
+  crypto.h config_dtrace.h mach_assert.h
+meta_features.h:
+iokitcpp.h:
+kdebug.h:
+networking.h:
+hibernation.h:
+crypto.h:
+config_dtrace.h:
+mach_assert.h:

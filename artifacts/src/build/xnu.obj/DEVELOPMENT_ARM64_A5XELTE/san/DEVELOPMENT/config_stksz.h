@@ -1,0 +1,1 @@
+#define CONFIG_STKSZ 0

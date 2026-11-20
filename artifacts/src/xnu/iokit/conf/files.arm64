@@ -1,0 +1,23 @@
+iokit/Families/IONVRAM/IONVRAMController.cpp				optional iokitcpp
+
+# Power Domains
+iokit/Kernel/IOPMrootDomain.cpp    					optional iokitcpp
+
+# SMP
+iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
+
+# SWEET device-tree platform (empty translation unit on other boards)
+iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
+
+iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+iokit/Kernel/arm/A5XELTEGPU.cpp                                 optional iokitcpp
+iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp

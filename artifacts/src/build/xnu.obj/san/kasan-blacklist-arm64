@@ -1,0 +1,118 @@
+# This file declares the list of source files that should be exempt from
+# AddressSanitizer instrumentation. Usually, this is because a file is used by
+# the AddressSanitizer runtime itself, or because the code executes before
+# the runtime has been initialized.
+
+[.*]
+
+# Blanket ignore non-sanitized functions
+fun:__nosan_*
+
+# Try really hard to avoid panicing while debugging
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/osfmk/kdp/*
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/osfmk/kern/debug.c
+
+[kernel-hwaddress|address]
+
+# Exclude linker sets
+type:struct linker_set_entry
+type:linker_set_entry
+type:struct startup_entry
+type:startup_entry
+type:struct kalloc_type_view
+
+# Exclude per-cpu data structures the assembly accesses
+type:vm_statistics64
+type:struct vm_statistics64
+type:vm_statistics64_data_t
+type:struct processor
+type:processor
+
+# Exclude KASan itself
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/san/memory/kasan.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/san/memory/kasan-fakestack.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/san/memory/kasan-x86_64.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/san/memory/kasan-memintrinsics.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/san/memory/kasan_dynamic_blacklist.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/san/memory/kasan-classic.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/san/memory/kasan-tbi.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/san/memory/kasan-helper.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/san/memory/kasan-report.c
+
+# Exclude other sanitizers
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/san/coverage/kcov.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/san/coverage/kcov_ksancov.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/san/coverage/kcov_stksz.c
+
+# Exclude dtrace function that does weird stack manipulations
+fun:fbt_perfCallback
+
+# Exclude leak detection code that reads all memory
+fun:_ZL18IOTrackingLeakScanPv
+
+# Exclude KASAN dependencies
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/osfmk/kern/btlog.c
+# XXX: could this be relaxed since fakestack is reentrant?
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/osfmk/kern/zalloc.c
+
+[.*]
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/san/memory/ubsan.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/san/memory/ubsan_log.c
+
+[bounds]
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/osfmk/corecrypto/*
+
+[alignment]
+
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/libsa/bootstrap.cpp
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/bsd/net/necp_client.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/pexpert/arm/pe_identify_machine.c
+
+[object-size]
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/osfmk/i386/locks_i386.c
+
+
+[signed-integer-overflow]
+
+# rdar://77997115&rdar://78024928
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/osfmk/console/video_console.c
+
+# rdar://77999724
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/osfmk/kern/ledger.c
+
+# rdar://78030612
+fun:memorystatus_cmd_get_memlimit_excess_np
+
+# rdar://79501524
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/osfmk/kern/clock.c
+
+# rdar://80254468
+fun:wait4_nocancel
+
+# rdar://79446799 (only the biggest offender, tcp_xmit_timer)
+fun:tcp_xmit_timer
+# ARM64 specific blacklist
+
+[kernel-hwaddress|address]
+
+# Exclude KASan runtime
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/san/memory/kasan-arm64.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/san/memory/kasan-tbi.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/san/memory/kasan-classic.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/san/memory/kasan-helper.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/osfmk/arm/machine_routines_common.c
+
+# These use a local variable to work out which stack we're on, but can end up with
+# a fakestack allocation.
+fun:ml_at_interrupt_context
+fun:ml_stack_remaining
+fun:ml_stack_base
+fun:ml_stack_size
+
+[kernel-hwaddress]
+# TBI specific
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/osfmk/arm/model_dep.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/osfmk/kern/backtrace.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/osfmk/arm64/cpu.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/osfmk/kern/ast.c
+src:/Users/runner/work/ios-on7xelte/ios-on7xelte/dxb/xnu/osfmk/arm64/pcb.c

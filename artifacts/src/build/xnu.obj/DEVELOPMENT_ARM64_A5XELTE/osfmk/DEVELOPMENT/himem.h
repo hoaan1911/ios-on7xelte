@@ -1,0 +1,1 @@
+#define NHIMEM 0

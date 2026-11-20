@@ -1,0 +1,9 @@
+module DarwinPrivate.machine [system] {
+  module cpu_capabilities {
+    header "machine/cpu_capabilities.h"
+    header "i386/cpu_capabilities.h"
+    header "arm/cpu_capabilities.h"
+
+    export *
+  }
+}

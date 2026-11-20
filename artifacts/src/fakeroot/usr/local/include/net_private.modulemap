@@ -1,0 +1,16 @@
+module DarwinPrivate.net [system] {
+  module if {
+    header "net/if_private.h"
+    export *
+  }
+
+  module if_var {
+    header "net/if_var_private.h"
+    export *
+  }
+
+  module route {
+    header "net/route_private.h"
+    export *
+  }
+}

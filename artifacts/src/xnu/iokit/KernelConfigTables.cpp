@@ -1,0 +1,118 @@
+/*
+ * Copyright (c) 1998-2012 Apple Inc. All rights reserved.
+ *
+ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
+ *
+ * This file contains Original Code and/or Modifications of Original Code
+ * as defined in and that are subject to the Apple Public Source License
+ * Version 2.0 (the 'License'). You may not use this file except in
+ * compliance with the License. The rights granted to you under the License
+ * may not be used to create, or enable the creation or redistribution of,
+ * unlawful or unlicensed copies of an Apple operating system, or to
+ * circumvent, violate, or enable the circumvention or violation of, any
+ * terms of an Apple operating system software license agreement.
+ *
+ * Please obtain a copy of the License at
+ * http://www.opensource.apple.com/apsl/ and read it before using this file.
+ *
+ * The Original Code and all software distributed under the License are
+ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
+ * Please see the License for the specific language governing rights and
+ * limitations under the License.
+ *
+ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
+ */
+/*
+ * NOTICE: This file was modified by SPARTA, Inc. in 2005 to introduce
+ * support for mandatory and extensible security protections.  This notice
+ * is included in support of clause 2.2 (b) of the Apple Public License,
+ * Version 2.0.
+ */
+
+const char * gIOKernelConfigTables =
+    "("
+#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+    "   {"
+    "     'IOClass'         = SweetPlatformExpert;"
+    "     'IOProviderClass' = IOPlatformExpertDevice;"
+#if defined(ARM64_BOARD_CONFIG_A5XELTE)
+    "     'IONameMatch'     = 'samsung,a5xelte';"
+#else
+    "     'IONameMatch'     = 'xiaomi,sweet';"
+#endif
+    "     'IOProbeScore'    = 10000:32;"
+    "   },"
+    "   {"
+    "     'IOClass'         = SweetCPU;"
+    "     'IOProviderClass' = IOPlatformDevice;"
+#if defined(ARM64_BOARD_CONFIG_A5XELTE)
+    "     'IONameMatch'     = 'arm,cortex-a53';"
+#else
+    "     'IONameMatch'     = 'qcom,kryo470';"
+#endif
+    "     'IOProbeScore'    = 10000:32;"
+    "   },"
+    "   {"
+    "     'IOClass'         = AppleKeyStore;"
+    "     'IOProviderClass' = IOResources;"
+    "     'IOMatchCategory' = AppleKeyStore;"
+    "   },"
+    "   {"
+    "     'IOClass'         = IOWatchdog;"
+    "     'IOProviderClass' = IOResources;"
+    "     'IOMatchCategory' = IOWatchdog;"
+    "   },"
+    "   {"
+    "     'IOClass'         = IOCoreSurfaceRoot;"
+    "     'IOProviderClass' = IOResources;"
+    "     'IOMatchCategory' = IOCoreSurfaceRoot;"
+    "   },"
+    "   {"
+    "     'IOClass'         = AppleCLCD;"
+    "     'IOProviderClass' = IOPlatformDevice;"
+#if defined(ARM64_BOARD_CONFIG_A5XELTE)
+    "     'IONameMatch'     = 'samsung,a5xelte-display';"
+#else
+    "     'IONameMatch'     = 'sweet,display';"
+#endif
+    "   },"
+    "   {"
+    "     'IOClass'         = SweetHIDButtons;"
+    "     'IOProviderClass' = IOResources;"
+    "     'IOMatchCategory' = SweetHIDButtons;"
+    "   },"
+    "   {"
+    "     'IOClass'         = SweetHIDTouch;"
+    "     'IOProviderClass' = IOResources;"
+    "     'IOMatchCategory' = SweetHIDTouch;"
+    "   },"
+/* 0337: this used to read `!defined(ARM64_BOARD_CONFIG_A5XELTE) || defined(...HEROLTE)`,
+ * which is why the J7 Prime showed powerd's 1 % icon: SweetBattery was compiled and linked
+ * but no personality ever matched it, so neither "SWEET BATTERY:" nor the fuel-gauge probe
+ * ran.  AppleCLCD above keeps its own A5XELTE guard because this board presents through
+ * SweetFB instead. */
+#if 1                                                   /* every board, A5XELTE included */
+    "   {"
+    "     'IOClass'         = SweetBattery;"
+    "     'IOProviderClass' = IOResources;"
+    "     'IOMatchCategory' = SweetBattery;"
+    "   },"
+#endif
+#if defined(ARM64_BOARD_CONFIG_A5XELTE)
+    "   {"
+    "     'IOClass'         = A5XELTEGPU;"
+    "     'IOProviderClass' = IOPlatformDevice;"
+    "     'IONameMatch'     = 'samsung,exynos7580-mali';"
+    "     'IOProbeScore'    = 10000:32;"
+    "   },"
+#endif
+#endif
+    "   {"
+    "     'IOClass'         = IOPanicPlatform;"
+    "     'IOProviderClass' = IOPlatformExpertDevice;"
+    "     'IOProbeScore'    = 0:32;"
+    "   }"
+    ")";

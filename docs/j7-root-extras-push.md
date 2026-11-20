@@ -90,11 +90,13 @@ What it does, in order:
    `fsck_hfs` on macOS) and mounts it read-write (`mount -t hfsplus -o loop,force`, or `hdiutil
    attach` plus `mount -t hfs` on macOS). If the volume still comes up read-only, the tool stops
    before changing anything;
-3. reports how many bundles `/Applications` already has and which ones are missing, then extracts
-   only the missing ones from the tar with their numeric owners (root:wheel) and checks that each
-   bundle's executable exists, is root-owned and is executable. That count is also the answer to
-   "how much of the root is really missing": the phone keeps its first-boot state, so the tool
-   only prints, it never replaces an existing bundle unless you pass `--replace`;
+3. reports how many bundles `/Applications` already has and then compares every install unit in the
+   tar member by member against the image, so a bundle that exists but is missing files inside it
+   (the usual case: an app that was pushed without its `PlugIns/*.appex`) is reported as *incomplete*
+   and only its missing members are extracted, with numeric owners (root:wheel). Each extracted
+   bundle's executable is checked to exist, be root-owned and be executable. Nothing already on the
+   phone is overwritten unless you pass `--replace`, and the tar's `.appex` count is printed: a tar
+   with no `.appex` at all cannot supply a widget extension, whatever the phone has;
 4. unmounts/detaches it and compares the copy with the pulled image at 4 KiB granularity;
 5. writes only those runs (usually a few hundred KiB: catalog B-tree, allocation bitmap, volume
    header, plus the ~1.5 MiB of bundle data) with `dd … conv=fsync`, **reads every run back and

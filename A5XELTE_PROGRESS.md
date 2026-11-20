@@ -606,3 +606,24 @@ tail bytes, stays sparse over 1 MiB of zeros, the comparison finds the edited mi
 last block as separate runs, and the write reproduces the edited image byte for byte on a fake device —
 while a corrupted write is still caught by the read-back. Not verified: no real HFS+ volume was mounted
 and nothing has been written to the phone yet.
+
+### "already on the phone" was a bundle-name check, and widgets need files inside those bundles
+
+The first successful dry run against the real J7 reported **174 bundles already in /Applications** and
+then `nothing to install` — because `install()` tested only whether `Applications/X.app` existed. A
+phone that was pushed once with an app-only tar has every bundle *by name* and still no
+`PlugIns/*.appex`, which is exactly the state that draws empty grey widget tiles, so that run would
+have written nothing at all.
+
+`install()` now builds the tar's member list per install unit and compares it against the image file by
+file: a present-but-incomplete unit is reported as `incomplete, N file(s) missing` with a sample, and
+only those members are extracted (`tar -T`, names reversed so a directory follows its own children —
+GNU tar recurses into a named directory and then calls the later child names "not found in archive").
+A tar carrying zero `.appex` now says so out loud, because such a tar cannot supply a widget extension
+however many app bundles it has.
+
+Verified with a synthetic phone tree plus tar: an app present without its `PlugIns/W.appex` is reported
+incomplete, the appex and its executable land with mode 755 while the existing executable is untouched,
+a second run reports every unit complete, `--replace` still re-extracts whole units, and the owner check
+still refuses an executable that is not root-owned. Not verified: the real tar's contents, which is the
+next thing to look at.

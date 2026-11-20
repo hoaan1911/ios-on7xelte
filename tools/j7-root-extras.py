@@ -283,26 +283,63 @@ def tar_targets(tar):
     return sorted(tops)
 
 
+def extract(mnt, tar, names):
+    """Extract these exact members. bsdtar does not promise numeric owners, so macOS gets an
+    explicit chown afterwards."""
+    flags = ['-xpf'] if DARWIN else ['--numeric-owner', '-xpf']
+    fd, listing = tempfile.mkstemp(prefix='j7list-')
+    try:
+        with os.fdopen(fd, 'w', newline='\n') as f:
+            # Reverse order puts a directory after its own children: GNU tar recurses into a named
+            # directory and then reports the later child names as "Not found in archive".
+            f.write('\n'.join(sorted(names, reverse=True)) + '\n')
+        run([*SUDO, 'tar', *flags, tar, '-C', mnt, '-T', listing])
+    finally:
+        os.unlink(listing)
+    if DARWIN:
+        for name in names if len(names) == 1 else sorted({install_unit(n) or n for n in names}):
+            run([*SUDO, 'chown', '-R', '0:0', os.path.join(mnt, name)])
+
+
 def install(mnt, tar, targets, replace):
     apps = os.path.join(mnt, 'Applications')
     present = set(os.listdir(apps)) if os.path.isdir(apps) else set()
-    print(f'{len(present)} bundle(s) already in /Applications on the phone')
-    todo = []
+    with tarfile.open(tar) as t:
+        want = {}  # install unit -> its members, so a present-but-incomplete bundle is caught
+        for member in t.getmembers():
+            unit = install_unit(member.name)
+            if unit:
+                # A directory member is stored as 'X/' and tarfile hands it back without the
+                # slash, so put it back: a -T lookup has to name the member exactly.
+                want.setdefault(unit, []).append(member.name + ('/' if member.isdir() else ''))
+    appexes = sum(1 for names in want.values() for name in names if name.endswith('.appex/'))
+    print(f'{len(present)} bundle(s) already in /Applications on the phone; the tar carries '
+          f'{len(targets)} unit(s), {appexes} of them .appex')
+    if not appexes:
+        print('WARNING: this tar has no .appex at all, so it cannot supply a widget extension: '
+              'rebuild it with "stage --os <mounted OS image> --all-apps"')
+    todo, partial = [], {}
     for target in targets:
-        exists = os.path.lexists(os.path.join(mnt, target))
-        state = 'already there' if exists else 'missing'
-        print(f'  {target}: {state}')
-        if not exists or replace:
+        here = os.path.join(mnt, target)
+        if not os.path.lexists(here):
+            print(f'  {target}: missing')
             todo.append(target)
-    if not todo:
-        print('nothing to install: every bundle in the tar is already on the phone')
+        elif replace:
+            print(f'  {target}: replacing')
+            todo.append(target)
+        else:
+            gone = [name for name in want.get(target, []) if not os.path.lexists(os.path.join(mnt, name))]
+            if gone:
+                partial[target] = gone
+                sample = ', '.join(gone[:2]) + (f' and {len(gone) - 2} more' if len(gone) > 2 else '')
+                print(f'  {target}: incomplete, {len(gone)} file(s) missing ({sample})')
+    if not todo and not partial:
+        print(f'nothing to install: all {len(targets)} unit(s) in the tar are complete on the phone')
         return False
     for target in todo:
-        # bsdtar does not promise numeric owners, so macOS gets an explicit chown below.
-        flags = ['-xpf'] if DARWIN else ['--numeric-owner', '-xpf']
-        run([*SUDO, 'tar', *flags, tar, '-C', mnt, target])
-        if DARWIN:
-            run([*SUDO, 'chown', '-R', '0:0', os.path.join(mnt, target)])
+        extract(mnt, tar, [target])
+    for target, gone in partial.items():
+        extract(mnt, tar, gone)
     # The kernel's exec and early launchd care about the owners of the executables.
     for target in todo:
         if not target.endswith('.app'):

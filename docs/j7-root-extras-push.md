@@ -154,18 +154,23 @@ ADB server didn't ACK
 So, in order:
 
 1. Watch the daemon itself (the client log above stops before the reason):
-   `ADB_TRACE=usb:v adb -L tcp:5037 nodaemon server`, Ctrl-C after the error line.
+   `ADB_TRACE=usb:v adb -L tcp:5037 nodaemon server`, Ctrl-C after the error line. If the shell
+   reports `Segmentation fault: 11` instead of an error line, it is a host-side crash, and
+   `ls -t ~/Library/Logs/DiagnosticReports | grep -i adb | head` names the faulting library.
 2. Use libusb instead of the legacy backend, for the server and for this tool:
-   `adb kill-server; export ADB_LIBUSB=1 LIBUSB=1; adb devices`
+   `adb kill-server; export ADB_LIBUSB=1 LIBUSB=1; ADB_LIBUSB=1 adb start-server; adb devices`
    `adb kill-server` often answers `cannot connect to daemon at tcp:5037: Connection refused`
    when the server already died — that is the normal answer, there was nothing to kill; carry on.
    The exports only last for that terminal, so the same shell has to run the tool.
    (`LIBUSB=1` is the old name, harmless to set as well.) If the server is already running from a
    previous backend you must `adb kill-server` first — the variable only affects a fresh server.
-3. If libusb does not see the device either, use platform-tools 35.0.1, which is libusb by
+3. Confirm which backend the server actually picked: `adb server-status` prints `usb_backend:`
+   (`LIBUSB` when the variable took effect). If it still says the legacy backend, the variable did
+   not reach the server — put it on the command itself, as in step 2, rather than `export`ing it.
+4. If libusb does not see the device either, use platform-tools 35.0.1, which is libusb by
    default: `curl -LO https://dl.google.com/android/repository/platform-tools_r35.0.1-darwin.zip`,
    unzip, and call that `adb` explicitly with `--adb /path/to/adb` (or put it first in `PATH`).
-4. Check nothing else holds the port: `lsof -nP -iTCP:5037` and kill whatever it lists.
+5. Check nothing else holds the port: `lsof -nP -iTCP:5037` and kill whatever it lists.
 
 The tool prints this same hint when `adb devices` returns an error, instead of just the raw adb
 output.

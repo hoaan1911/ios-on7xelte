@@ -56,18 +56,19 @@ whole stock app set instead of the six (`Settings`, `Photos`, ... about 215 MiB)
 
 ## 2. Push it into the phone root
 
-**This step needs Linux (or the Linux laptop), not Windows.** It loop-mounts the phone's HFS+
-USERDATA image read-write, and Windows has no HFS+ write support; the script says so and exits.
-On Windows, step 1 (`stage --tar`) works — it only copies and checks the tar — and `stage --ipsw`
-never worked there (it needs `apfs-fuse`). To push from a Windows PC, copy this whole folder plus
-`device/j7-root-extras.tar` to the Linux machine and run step 2 there; nothing else is needed,
-and the repo there does not have to be at the same path. `sudo -v` exists on Linux only — on
-Windows 11, `sudo` is a different program and its `-v` error is expected.
+**This step runs on Linux or macOS, not Windows.** It mounts the phone's HFS+ USERDATA image
+read-write and Windows cannot do that at all (no HFS+ write support, and the error you get is
+`AttributeError: module 'os' has no attribute 'geteuid'` from older copies of this tool). On
+Windows, step 1 (`stage --tar`) works — it only copies and checks the tar — and `stage --ipsw`
+never did (it needs `apfs-fuse`). Copy this whole folder plus `device/j7-root-extras.tar` to the
+Linux or macOS machine; nothing else is needed and the repo does not have to be at the same path.
+`sudo -v` exists on Linux/macOS only — on Windows 11, `sudo` is a different program and its `-v`
+error is expected.
 
 Phone: boot **TWRP**, plug the USB cable, do **not** mount Data (the script refuses if `/data`
 is mounted).
 
-On the Linux laptop, first run `sudo -v` (the step loop-mounts the HFS+ image; sudo must not ask for a
+On Linux or macOS, first run `sudo -v` (the step loop-mounts the HFS+ image; sudo must not ask for a
 password in the middle of it), then:
 
 ```bash
@@ -77,17 +78,22 @@ python3 tools/j7-root-extras.py push
 
 What it does, in order:
 
-1. pulls USERDATA once to `device/USERDATA-before.img` (~10–20 min for ~16–21 GiB) and keeps it
-   as the undo image. Needs about 2x the partition free on the PC (the edited copy is temporary);
-   `--image FILE` reuses a pull you already made this boot;
-2. copies that image, runs `fsck.hfsplus -fy` on the copy (the phone never unmounts cleanly) and
-   loop-mounts it read-write;
+1. pulls USERDATA once to `device/USERDATA-before.img` (~10–20 min) and keeps it as the undo
+   image. Free zero blocks are seeked over while pulling, so the file is sparse and takes the
+   volume's *used* size rather than the partition size. The working copy is a clone where the host
+   can do it (`cp -c` on APFS, `cp --reflink=auto` on btrfs/XFS) and a plain copy otherwise — only
+   the plain-copy case needs about 2x the partition free; `--image FILE` reuses a pull you already
+   made this boot;
+2. clones/copies that image, repairs it (the phone never unmounts cleanly: `fsck.hfsplus` on Linux,
+   `fsck_hfs` on macOS) and mounts it read-write (`mount -t hfsplus -o loop,force`, or `hdiutil
+   attach` plus `mount -t hfs` on macOS). If the volume still comes up read-only, the tool stops
+   before changing anything;
 3. reports how many bundles `/Applications` already has and which ones are missing, then extracts
    only the missing ones from the tar with their numeric owners (root:wheel) and checks that each
    bundle's executable exists, is root-owned and is executable. That count is also the answer to
    "how much of the root is really missing": the phone keeps its first-boot state, so the tool
    only prints, it never replaces an existing bundle unless you pass `--replace`;
-4. unmounts, repairs again and compares the copy with the pulled image at 4 KiB granularity;
+4. unmounts/detaches it and compares the copy with the pulled image at 4 KiB granularity;
 5. writes only those runs (usually a few hundred KiB: catalog B-tree, allocation bitmap, volume
    header, plus the ~1.5 MiB of bundle data) with `dd … conv=fsync`, **reads every run back and
    compares its SHA-256**, then `sync`s;
@@ -103,6 +109,34 @@ widget is added, `chronod` starting a `widgetkit-extension` process. If a widget
 after the push, that log line is the difference between "the extension is not installed" and
 "the extension is installed and does not render" — they need different fixes, and the second one
 is not a bundle problem.
+
+### On macOS (hackintosh or a real Mac)
+
+HFS+ is native to macOS (still fully supported in macOS 26), so this is the shortest path: the tool
+attaches the pulled image with `hdiutil`, runs `fsck_hfs -fy` on it and mounts it with `mount -t
+hfs`. Needs `python3` (Xcode command line tools) and `adb` (`brew install --cask
+android-platform-tools`); there is no `apfs-fuse` on macOS, so `stage --ipsw` stays Linux-only.
+
+Space: a pull of the whole partition plus a second full copy would need about 2x USERDATA, but on
+macOS the working copy is an **APFS clone** (`cp -c`), which costs almost nothing, and the pull
+skips zero blocks (the image is sparse), so only the used part is really on disk. In practice one
+partition's worth of *used* data is the ceiling — comfortably inside 30 GB unless USERDATA is
+nearly full, and the tool prints the partition size and refuses to start if the free space is
+too small. Older macOS releases use a full second copy, which is the 2x case.
+
+The image is attached by device and mounted outside `/Volumes`, so Spotlight does not index it and
+does not write anything into the phone's volume.
+
+Two macOS-26 notes: 26.4 betas had a `fsck_hfs`/auto-mount bug that makes HFS+ volumes show up
+read-only (Apple lists it as a bug with `diskutil mount /dev/diskN` as the workaround; 26.1 and
+26.3 are unaffected). The tool detects that case — it stops with "mounted read-only" before
+changing anything instead of half-installing. Use 26.3 if you have the choice.
+
+```bash
+sudo -v
+python3 tools/j7-root-extras.py push --dry-run
+python3 tools/j7-root-extras.py push
+```
 
 ## 3. Undo
 

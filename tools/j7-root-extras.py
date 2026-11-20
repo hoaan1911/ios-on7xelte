@@ -24,14 +24,18 @@ changed travel over adb -- the phone keeps its first-boot state, so nothing take
 
   restore undo a push: writes those same ranges back from device/USERDATA-before.img.
 
-Examples (Linux, root via sudo; run `sudo -v` first):
-  python3 tools/j7-root-extras.py stage --ipsw iPhone10,2_16.7.16_20H393_Restore.ipsw
-  python3 tools/j7-root-extras.py push
+Examples (Linux or macOS; root via sudo, so run `sudo -v` first):
+  python3 tools/j7-root-extras.py push           # works on Linux and macOS
   python3 tools/j7-root-extras.py restore
+  python3 tools/j7-root-extras.py stage --ipsw iPhone10,2_16.7.16_20H393_Restore.ipsw   # Linux only
 
 Windows: only `stage --tar` runs there (it just copies and checks the tar). `stage --os/--ipsw`,
-`push` and `restore` loop-mount the HFS+ USERDATA image, which Windows cannot do, so they exit
-with a message instead of a traceback: run those on the Linux laptop.
+`push` and `restore` mount the HFS+ USERDATA image, which Windows cannot do, so they exit with a
+message instead of a traceback.
+
+macOS: `push` and `restore` work (HFS+ is native there: hdiutil attaches the raw image, mount_hfs
+mounts it read-write, and the working copy is an APFS clone so it costs no space). `stage --ipsw`
+does not: apfs-fuse is Linux-only.
 
 Apple payload stays in device/j7-root-extras.tar and the pulled image; both are git-ignored.
 The tool never touches BOOT: the kernel and the boot arguments are not part of this.
@@ -54,6 +58,7 @@ UI_APPS = ('PosterBoard', 'PaperBoard', 'PreBoard', 'InputUI', 'MediaRemoteUI', 
 EXT_DIR = 'System/Library/ExtensionKit/Extensions'
 # os.geteuid does not exist on Windows, and nothing here needs root there: only the tar copy runs.
 POSIX = os.name == 'posix'
+DARWIN = POSIX and sys.platform == 'darwin'
 IS_ROOT = POSIX and getattr(os, 'geteuid', lambda: 1)() == 0
 SUDO = [] if IS_ROOT or not POSIX else ['sudo']
 
@@ -70,19 +75,27 @@ def precheck_sudo():
         sys.exit('this step mounts and repairs an HFS+ image as root: run "sudo -v" first')
 
 
-def require_linux(step, how):
-    """These steps loop-mount the phone's HFS+ image, which only Linux can write in place."""
+def require_posix(step, how):
+    """These steps mount the phone's HFS+ image; Windows cannot mount it at all."""
     if POSIX:
         return
-    sys.exit(f'{step} does not run on {sys.platform}: it loop-mounts the phone\'s HFS+ USERDATA\n'
+    sys.exit(f'{step} does not run on {sys.platform}: it mounts the phone\'s HFS+ USERDATA\n'
              f'image read-write, which Windows cannot do.\n'
              f'On Windows you can still run:  python3 tools/j7-root-extras.py stage --tar ...\n'
-             f'To {how}, copy this folder plus device/j7-root-extras.tar to the Linux laptop and\n'
-             f'run it there (that is where --ipsw staging and sudo live too).')
+             f'To {how}, run this on Linux or on macOS instead (both mount HFS+ natively).')
 
 
 def human(n):
     return f'{n / MIB:.1f} MiB'
+
+
+def fsck_cmd():
+    """The HFS+ repair tool: fsck_hfs on macOS, hfsprogs' fsck.hfsplus on Linux."""
+    for name in (('fsck_hfs', 'fsck.hfsplus') if DARWIN else ('fsck.hfsplus', 'fsck_hfs')):
+        path = shutil.which(name)
+        if path:
+            return [*SUDO, path, '-fy']
+    return None
 
 
 class Phone:
@@ -180,7 +193,7 @@ def stage_from_os(root, out, all_apps):
 
 
 def stage_from_ipsw(ipsw, board, out, all_apps):
-    require_linux('stage --ipsw', 'mount an IPSW OS image')
+    require_posix('stage --ipsw', 'mount an IPSW OS image')
     if not shutil.which('apfs-fuse'):
         sys.exit('apfs-fuse is missing: sudo pacman -S apfs-fuse (Arch), '
                  'sudo apt install apfs-fuse (Debian/Ubuntu)')
@@ -263,7 +276,11 @@ def install(mnt, tar, targets, replace):
         print('nothing to install: every bundle in the tar is already on the phone')
         return False
     for target in todo:
-        run([*SUDO, 'tar', '--numeric-owner', '-xpf', tar, '-C', mnt, target])
+        # bsdtar does not promise numeric owners, so macOS gets an explicit chown below.
+        flags = ['-xpf'] if DARWIN else ['--numeric-owner', '-xpf']
+        run([*SUDO, 'tar', *flags, tar, '-C', mnt, target])
+        if DARWIN:
+            run([*SUDO, 'chown', '-R', '0:0', os.path.join(mnt, target)])
     # The kernel's exec and early launchd care about the owners of the executables.
     for target in todo:
         if not target.endswith('.app'):
@@ -271,25 +288,64 @@ def install(mnt, tar, targets, replace):
         exe = os.path.join(mnt, target, os.path.basename(target)[:-4])
         if not os.path.isfile(exe):
             sys.exit(f'{target} has no executable named {os.path.basename(exe)} after extraction')
-        info = run([*SUDO, 'stat', '-c', '%u:%g %a', exe]).stdout.split()
-        if info[0] != '0:0':
-            sys.exit(f'{exe} is {info[0]} after extraction: the tar did not keep numeric owners')
-        if not int(info[1], 8) & 0o111:
-            sys.exit(f'{exe} is not executable (mode {info[1]})')
+        st = os.stat(exe)  # portable: GNU stat -c is not on macOS
+        if st.st_uid or st.st_gid:
+            sys.exit(f'{exe} is {st.st_uid}:{st.st_gid} after extraction: owners did not stick')
+        if not st.st_mode & 0o111:
+            sys.exit(f'{exe} is not executable (mode {oct(st.st_mode & 0o777)})')
     return True
 
 
+def sparse_write(out, data):
+    """Write a 4 KiB-aligned buffer, seeking over zero blocks so the image file stays sparse."""
+    holes = 0
+    start = None  # first block of the run waiting to be written
+    total = len(data) // BLOCK
+    for k in range(total + 1):
+        zero = k < total and data[k * BLOCK:(k + 1) * BLOCK].count(0) == BLOCK
+        if zero or k == total:
+            if start is not None:
+                out.write(data[start * BLOCK:k * BLOCK])
+                start = None
+            if zero:
+                holes += BLOCK
+                out.seek(BLOCK, os.SEEK_CUR)
+        elif start is None:
+            start = k
+    return holes
+
+
 def pull(phone, dev, image):
+    """Pull the whole partition, skipping free (zero) blocks: a 24 GiB partition whose HFSX
+    volume is half used lands as a ~12 GiB image, which is what makes a small free space work."""
     size = int(phone.sh(f'blockdev --getsize64 {dev}').strip())
+    if size % BLOCK:
+        sys.exit(f'{dev} is {size} bytes, not a whole number of {BLOCK}-byte blocks')
     print(f'USERDATA {dev}: {size >> 20} MiB -> {image} (this is the slow part, ~10-20 min)')
+    step = 8 * MIB
+    holes = 0
     with open(image, 'wb') as out:
         p = subprocess.Popen([phone.tool, 'exec-out', f'dd if={dev} bs=1048576 2>/dev/null'],
-                             stdout=out, stderr=subprocess.DEVNULL)
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        pending = b''
+        while True:
+            chunk = p.stdout.read(step)  # a pipe returns what is ready, never more
+            if not chunk:
+                break
+            pending += chunk
+            cut = len(pending) - len(pending) % BLOCK
+            if cut:
+                holes += sparse_write(out, pending[:cut])
+                pending = pending[cut:]
+        if pending:
+            out.write(pending)
         if p.wait():
             sys.exit(f'pulling {dev} failed')
+        out.truncate(size)
     got = os.path.getsize(image)
     if got != size:
         sys.exit(f'{image} is {got} bytes, {dev} is {size}: the pull was interrupted')
+    print(f'{human(size)} pulled, {human(holes)} of it was zero (not stored: the image is sparse)')
     return size
 
 
@@ -377,14 +433,53 @@ def write_runs(phone, dev, image, runs, tmpdir, limit):
     print(f'{human(written * BLOCK)} written and read back identical')
 
 
+def copy_image(src, dst):
+    """Second copy of the pulled image; a clone where the host can, so it costs no space."""
+    p = run([*SUDO, 'cp', '-c' if DARWIN else '--reflink=auto', src, dst], check=False)
+    if p.returncode or not os.path.isfile(dst) or os.path.getsize(dst) != os.path.getsize(src):
+        shutil.copyfile(src, dst)
+    return dst
+
+
+def attach_image(image, mnt):
+    """Mount the HFS+ image read-write. macOS attaches it as a device first; Linux loops it."""
+    if not DARWIN:
+        run([*SUDO, 'mount', '-t', 'hfsplus', '-o', 'loop,force', image, mnt])
+        return image
+    out = run([*SUDO, 'hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage',
+               '-nomount', '-readwrite', '-noverify', image]).stdout
+    dev = next((line.split('\t')[0].strip() for line in out.splitlines()
+                if line.split('\t')[0].strip().startswith('/dev/disk')), None)
+    if not dev:
+        sys.exit(f'hdiutil did not attach {image}:\n{out.strip()[-1500:]}')
+    fsck = fsck_cmd()
+    if fsck:
+        run([*fsck, dev], check=False)  # the phone never unmounts cleanly
+    run([*SUDO, 'mount', '-t', 'hfs', dev, mnt])
+    return dev
+
+
+def detach_image(handle, mnt):
+    run([*SUDO, 'umount', mnt], check=False)
+    if DARWIN and handle:
+        run([*SUDO, 'hdiutil', 'detach', handle], check=False)
+
+
+def writable(mnt):
+    """The volume must be read-write: a dirty HFS+ volume can come up read-only."""
+    probe = os.path.join(mnt, '.j7-write-test')
+    if run([*SUDO, 'touch', probe], check=False).returncode:
+        return False
+    run([*SUDO, 'rm', '-f', probe], check=False)
+    return True
+
+
 def do_push(args):
-    require_linux('push', 'install the bundles')
+    require_posix('push', 'install the bundles')
     if not os.path.isfile(args.tar):
         sys.exit(f'{args.tar} does not exist: run "stage" first (or download the '
                  f'j7-root-extras artifact)')
     precheck_sudo()
-    if not shutil.which('fsck.hfsplus'):
-        sys.exit('fsck.hfsplus is missing: sudo pacman -S hfsprogs / sudo apt install hfsprogs')
     phone = Phone(args.adb)
     dev = phone.userdata(args.dev)
     image = args.image
@@ -392,24 +487,32 @@ def do_push(args):
         image = args.before
         free = shutil.disk_usage(os.path.dirname(os.path.abspath(image)) or '.').free
         size = int(phone.sh(f'blockdev --getsize64 {dev}').strip())
-        if not args.force and free < 2 * size:
-            sys.exit(f'{image} needs about {2 * size >> 20} MiB free on this PC '
+        # macOS clones the working copy, so one image's worth is the ceiling; zero blocks are
+        # skipped while pulling, so the real need is usually much smaller than this.
+        need = size if DARWIN else 2 * size
+        if not args.force and free < need + 512 * MIB:
+            sys.exit(f'{image} needs about {need >> 20} MiB free on this PC '
                      f'({free >> 20} MiB free): free some, or pass --image with a fresh pull')
         pull(phone, dev, image)
     else:
         print(f'using {image} as the pre-change image (it must be a fresh pull of {dev})')
 
     work = args.work
-    print(f'working copy {work}')
-    shutil.copyfile(image, work)
+    print(f'working copy {work}' + (' (an APFS clone: no extra space)' if DARWIN else ''))
+    copy_image(image, work)
     run([*SUDO, 'chown', f'{os.getuid()}:{os.getgid()}', work], check=False)
-    run([*SUDO, 'fsck.hfsplus', '-fy', work], check=False)  # the phone never unmounts cleanly
+    if not DARWIN:
+        fsck = fsck_cmd()
+        if fsck:
+            run([*fsck, work], check=False)  # the phone never unmounts cleanly
 
     mnt = tempfile.mkdtemp(prefix='j7root-')
-    mounted = False
+    handle = None
     try:
-        run([*SUDO, 'mount', '-t', 'hfsplus', '-o', 'loop,force', work, mnt])
-        mounted = True
+        handle = attach_image(work, mnt)
+        if not writable(mnt):
+            sys.exit(f'{mnt} mounted read-only: the volume needs repairing first. Nothing was '
+                     f'changed; on macOS attach {work} with hdiutil and run fsck_hfs -fy on it.')
         targets = tar_targets(args.tar)
         changed_tree = install(mnt, args.tar, targets, args.replace)
         if args.dry_run:
@@ -419,13 +522,12 @@ def do_push(args):
             print('the phone root already has every bundle: nothing written')
             return 0
         run([*SUDO, 'sync'])
-        run([*SUDO, 'umount', mnt])
-        mounted = False
+        detach_image(handle, mnt)
+        handle = None
     finally:
-        if mounted:
-            run([*SUDO, 'umount', mnt], check=False)
+        if handle:
+            detach_image(handle, mnt)
         run([*SUDO, 'rmdir', mnt], check=False)
-    run([*SUDO, 'fsck.hfsplus', '-fy', work], check=False)
 
     size, runs = changed_runs(image, work, args.merge_gap_mib * MIB // BLOCK)
     total = sum(c for _, c in runs)
@@ -450,7 +552,7 @@ def do_push(args):
 
 
 def do_restore(args):
-    require_linux('restore', 'undo a push')
+    require_posix('restore', 'undo a push')
     if not os.path.isfile(args.runs):
         sys.exit(f'{args.runs} does not exist: nothing was pushed from here')
     if not os.path.isfile(args.before):
@@ -513,7 +615,7 @@ def main():
         if a.tar:
             stage_from_tar(a.tar, a.out)
         elif a.os:
-            require_linux('stage --os', 'stage from a mounted OS image')
+            require_posix('stage --os', 'stage from a mounted OS image')
             if not os.path.isdir(a.os):
                 sys.exit(f'{a.os} is not a directory')
             precheck_sudo()
@@ -523,6 +625,7 @@ def main():
         return 0
     if a.mode == 'push':
         return do_push(a)
+    # restore only writes ranges; nothing here needs the image mounted
     return do_restore(a)
 
 

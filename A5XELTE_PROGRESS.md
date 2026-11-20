@@ -557,3 +557,23 @@ image, so all three are Linux-only. WSL2 is not a workaround: Microsoft's kernel
 without `geteuid` and these three steps exit with one sentence saying so and pointing at the Linux
 machine, instead of a traceback. Verified by loading the module with `os.name = 'nt'` and calling
 each mode: `stage --tar` runs, the other three exit cleanly. Nothing was pushed to the phone.
+
+### macOS as the push host
+
+macOS can write HFS+ natively and macOS 26 still supports it, so the tool grew a second mount path:
+`hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount -readwrite` gives the image a
+`/dev/diskN` node, `fsck_hfs -fy` runs on that node (advisory; the phone never unmounts cleanly) and
+`mount -t hfs` mounts it read-write, `hdiutil detach` releases it. Registers as a check that the
+volume is actually writable before anything is touched — a dirty HFS+ volume can come up read-only,
+and macOS 26.4 betas had a `fsck_hfs`/auto-mount bug with exactly that symptom.
+
+Two space changes make 30 GB of free space enough: the pull skips all-zero 4 KiB blocks, so the
+14-16 GiB partition lands as roughly the volume's used size, and the working copy is an APFS clone
+(`cp -c`) instead of a second full file. Ownership is re-applied with `chown -R 0:0`
+after extraction because bsdtar does not promise numeric owners, and the executable check uses
+`os.stat` instead of GNU `stat -c`, which macOS lacks.
+
+Verified only on Linux: a fake adb stream (1 MiB data, 2 MiB zeros, 1 MiB data) produced a 4 MiB
+sparse image with 2 MiB holes and a change run at the expected block, and the Darwin code path with
+`run()` stubbed produced hdiutil attach, fsck_hfs on /dev/disk9, mount -t hfs, umount and hdiutil
+detach in that order. No mounting, pulling or writing was done on a Mac or on the phone.

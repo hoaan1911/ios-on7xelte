@@ -1,0 +1,9 @@
+# Apple payload from an IPSW, and the pulled phone root: both stay on this PC.
+# tools/j7-root-extras.py writes them here; never commit them.
+device/j7-root-extras/
+device/j7-root-extras.tar
+device/USERDATA-*.img
+device/USERDATA-changed.txt
+*.ipsw
+*.sparseimage
+__pycache__/

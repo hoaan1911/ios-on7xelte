@@ -482,3 +482,41 @@ Expected in the next log: a `wall` report line only when a picture file exists (
 the desktop keeps its graded background and no photograph at all), and either
 `A5XELTE FG: gauge on 0x... (hsi2c) at 0x3b, RSOC=...` or `hsi2c read of 2 byte(s) failed
 irq=… ts=… fifo=…` with an `irq` from the transfer itself instead of an inherited `0x2000c`.
+
+## 2026-11-20 — restoring the wallpaper gallery without a reflash
+
+**Why the gallery is empty is answered; getting the bundles in is the new step.** The tiles
+behind Settings > Wallpaper > Add New Wallpaper come from `PaperBoard`
+(`paperboard.wallpaper-service`) and `PosterBoard`'s poster extensions, and `PaperBoard` is a
+`/Applications` bundle this root was staged without. That is Apple payload, not a kernel
+behaviour, so no patch can add it and it cannot live in Git.
+
+**`tools/j7-root-extras.py` does it in place.** TWRP's kernel has no hfsplus driver and iOS has
+no shell, so the HFSX volume is edited on the PC, not on the phone:
+
+- `stage` takes the bundles out of the IPSW (`--ipsw`, mounted with apfs-fuse; `--os` for an
+  already-mounted OS image; `--tar` for the release asset) and writes
+  `device/j7-root-extras.tar` — gzip-free tar, numeric owners from the image, `device/` is
+  git-ignored so nothing Apple reaches the repository. Default set is the same six bundles
+  `tools/a5xelte-stage-ios-root.sh` stages, plus any `*Poster*` bundle under
+  `System/Library/ExtensionKit/Extensions`; `--all-apps` takes all of `/Applications`.
+- `push` (phone in TWRP, no Data mounted) pulls USERDATA once to
+  `device/USERDATA-before.img`, copies it, `fsck.hfsplus -fy`, loop-mounts it read-write,
+  prints what `/Applications` already has, extracts only the missing bundles with
+  `tar --numeric-owner`, checks each executable is root:wheel and executable, unmounts, repairs,
+  then writes only the 4 KiB runs that differ with `dd conv=fsync` — each run read back and
+  compared by SHA-256 — and records them in `device/USERDATA-changed.txt`.
+- `restore` writes those same runs back from the pre-change image, with the same comparison.
+
+Neither path touches BOOT: the kernel, ADT and boot arguments are unchanged, and because
+USERDATA keeps its existing contents there is no data migration and no hour-long first boot.
+The changed delta is normally a few hundred KiB of HFS metadata plus ~1.5 MiB of bundle data;
+`--max-changed-mib 512` refuses anything that looks like a wrong image instead of a bundle
+install. Resource forks are not carried by tar (the six audited bundles have none).
+
+`.github/workflows/j7-root-extras.yml` packs the same tar straight out of the IPSW on a macOS
+runner and attaches it to a private release, so the laptop does not need a 6 GB IPSW download.
+
+Not device-verified: no bundle has been pushed to the phone yet, so "the gallery lists its
+posters" is the expected result of this step, not an observation. The evidence to collect is
+the next boot log: `PaperBoard` must appear as an `exec` where it has never appeared before.

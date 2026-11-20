@@ -1,0 +1,109 @@
+name: j7-root-extras
+
+# Pack the /Applications bundles the staged J7 root is missing (the wallpaper gallery:
+# PaperBoard and the poster extensions) straight out of the iPhone IPSW, as a small tar
+# attached to a PRIVATE release. Nothing Apple enters the repository, and the laptop does
+# not have to download a 6 GB IPSW: tools/j7-root-extras.py push installs the tar into the
+# phone root in place, writing only the blocks that changed (no reflash, no first boot).
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_device:
+        description: ipsw.me identifier of the IPSW to take the bundles from
+        default: "iPhone10,2"
+      board:
+        description: BuildManifest board of that device (d21ap = iPhone 8 Plus)
+        default: "d21ap"
+      ios_version:
+        description: iOS version
+        default: "16.7.16"
+      all_apps:
+        description: "1 = every /Applications bundle (about 215 MiB), 0 = the display/wallpaper six"
+        default: "0"
+
+permissions:
+  contents: write
+
+jobs:
+  extras:
+    if: github.event.repository.private == true
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the OS image of the IPSW
+        run: |
+          set -euo pipefail
+          url=$(curl -sf "https://api.ipsw.me/v4/device/${{ inputs.ipsw_device || 'iPhone10,2' }}?type=ipsw" | python3 -c "
+          import json, sys
+          fw = [f for f in json.load(sys.stdin)['firmwares'] if f['version'] == '${{ inputs.ios_version || '16.7.16' }}']
+          print(fw[0]['url'])")
+          echo "IPSW: $url"
+          mkdir -p ipsw
+          python3 tools/remotezip.py "$url" BuildManifest.plist ipsw
+          path=$(python3 - ipsw/BuildManifest.plist <<'PY'
+          import plistlib, sys
+          m = plistlib.load(open(sys.argv[1], 'rb'))
+          ident = next(i for i in m['BuildIdentities']
+                       if i['Info']['DeviceClass'].lower() == '${{ inputs.board || 'd21ap' }}'
+                       and 'Erase' in i['Info'].get('Variant', ''))
+          print(ident['Manifest']['OS']['Info']['Path'])
+          PY
+          )
+          echo "OS member: $path"
+          python3 tools/remotezip.py "$url" "$path" ipsw
+          mv "ipsw/$path" ipsw/os.dmg
+          ls -l ipsw
+
+      - name: Pack the wallpaper bundles
+        run: |
+          set -euo pipefail
+          os=$(hdiutil attach -nobrowse -readonly -owners on ipsw/os.dmg | awk -F'\t' '/\/Volumes\// {print $NF}' | tail -1)
+          echo "OS mounted at $os"
+          root="$os/root"
+          [ -d "$root/Applications" ] || { echo "no /Applications under $root" >&2; exit 1; }
+          list=extras.txt
+          : > "$list"
+          if [ "${{ inputs.all_apps || '0' }}" = "1" ]; then
+            for bundle in "$root"/Applications/*.app; do
+              printf 'Applications/%s\n' "${bundle##*/}" >> "$list"
+            done
+          else
+            for app in PosterBoard PaperBoard PreBoard InputUI MediaRemoteUI ClockAngel; do
+              if [ -d "$root/Applications/$app.app" ]; then
+                printf 'Applications/%s.app\n' "$app" >> "$list"
+              else
+                echo "absent from this IPSW: $app"
+              fi
+            done
+          fi
+          # Poster extensions: the gallery's own tiles. Already in the staged root on this
+          # device, but harmless and explicit when present.
+          if [ -d "$root/System/Library/ExtensionKit/Extensions" ]; then
+            for ext in "$root/System/Library/ExtensionKit/Extensions"/*Poster*; do
+              [ -d "$ext" ] || continue
+              printf 'System/Library/ExtensionKit/Extensions/%s\n' "${ext##*/}" >> "$list"
+            done
+          fi
+          cat "$list"
+          # Numeric owners: iOS wants root:wheel on these, and tar keeps what the image has.
+          sudo tar -cpf j7-root-extras.tar -C "$root" -T "$list"
+          sudo chown "$(id -u):$(id -g)" j7-root-extras.tar
+          tar -tvf j7-root-extras.tar | head -5
+          ls -l j7-root-extras.tar
+          shasum -a 256 j7-root-extras.tar | tee SHA256
+          hdiutil detach "$os"
+
+      - name: Publish as a private release asset
+        run: |
+          set -euo pipefail
+          tag="j7-root-extras-${{ github.run_id }}"
+          gh release create "$tag" j7-root-extras.tar SHA256 \
+            --title "Wallpaper gallery bundles for the J7 iOS root" \
+            --notes "Apple software for the owner's own device. Do not make this repository or release public."
+          echo "Asset: $tag / j7-root-extras.tar -> download it next to the repo and run"
+          echo "  python3 tools/j7-root-extras.py stage --tar device/j7-root-extras.tar"
+          echo "  python3 tools/j7-root-extras.py push"

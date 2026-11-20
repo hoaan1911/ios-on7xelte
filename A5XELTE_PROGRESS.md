@@ -585,3 +585,24 @@ That is the legacy USB backend 37.x brought back for macOS; `ADB_LIBUSB=1` selec
 and platform-tools 35.0.1 is libusb by default. The tool now prints that hint when `adb devices`
 returns an error, and `docs/j7-root-extras-push.md` has an "ADB server didn't ACK on macOS" section.
 Nothing was run against the phone or an HFS+ image on the Mac yet.
+
+### macOS reached the phone, and the J7's USERDATA does not end on a block boundary
+
+adb 37.0.1 on that Mac keeps the daemon down in its legacy USB backend until `ADB_LIBUSB=1` is on the
+command that starts the server; with libusb the J7 appears as `52103bedfa51642f  recovery` and every
+later step works. The first real device fact from it: `blockdev --getsize64` reports USERDATA as
+**23,531,077,120 bytes**, i.e. 4096 x 5,744,891 plus 3,584 — a 32 GB handset, and a partition that is
+not a whole number of 4 KiB blocks, which the tool refused outright.
+
+That refusal was wrong: the alternate HFS+ volume header sits in the last 1024 bytes of the volume, so
+the short last block has to travel too. The pull, the 4 KiB change comparison and the write now all
+carry a short final block at its real length (`ceil` blocks, `min(n*BLOCK, size - off*BLOCK)`, read-back
+truncated to the written length), and the by-name lookup walks every `/dev/block/*/by-name/{USERDATA,
+userdata}` layout before falling back to `mmcblk0p25`. A signature check reads the first 8 KiB for
+`H+`/`HX` before the pull, so a wrong `--dev` costs 8 KiB instead of 22 GiB.
+
+Verified with a fake adb and a 3 MiB + 3,584-byte "partition": the pull keeps the exact size and the
+tail bytes, stays sparse over 1 MiB of zeros, the comparison finds the edited middle block and the short
+last block as separate runs, and the write reproduces the edited image byte for byte on a fake device —
+while a corrupted write is still caught by the read-back. Not verified: no real HFS+ volume was mounted
+and nothing has been written to the phone yet.

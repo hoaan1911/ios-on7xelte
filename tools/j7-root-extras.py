@@ -142,14 +142,18 @@ class Phone:
         return p.stdout
 
     def userdata(self, explicit=None):
-        """Resolve the raw USERDATA block device (by-name first, then the J7's p25)."""
+        """Resolve the raw USERDATA block device: every by-name layout TWRP uses, then the J7's p25."""
         if explicit:
             return explicit
-        for path in ('/dev/block/by-name/USERDATA', '/dev/block/platform/soc/by-name/USERDATA',
-                     '/dev/block/mmcblk0p25'):
-            got = self.sh(f'readlink -f {path} 2>/dev/null', check=False).strip()
-            if got.startswith('/dev/block/'):
-                return got
+        names = ' '.join(f'/dev/block/{d}by-name/{n}' for d in
+                         ('', 'bootdevice/', 'platform/*/', 'platform/*/*/')
+                         for n in ('USERDATA', 'userdata'))
+        got = self.sh(f'for p in {names}; do [ -e "$p" ] && readlink -f "$p" && break; '
+                      f'done 2>/dev/null', check=False).strip()
+        if got.startswith('/dev/block/'):
+            return got
+        print('no by-name USERDATA entry in TWRP: trying /dev/block/mmcblk0p25')
+        return '/dev/block/mmcblk0p25'
         sys.exit('cannot find the USERDATA block device in TWRP; pass --dev')
 
 
@@ -333,13 +337,25 @@ def sparse_write(out, data):
     return holes
 
 
-def pull(phone, dev, image):
+def hfs_offset(phone, dev):
+    """Byte offset of the HFS+ volume header in the first 8 KiB, or None if there is none."""
+    head = phone.bytes_out(f'dd if={dev} bs=1024 count=8 2>/dev/null')
+    found = [head.find(m) for m in (b'H+', b'HX') if head.find(m) >= 0]
+    return min(found) if found else None
+
+
+def pull(phone, dev, image, force=False):
     """Pull the whole partition, skipping free (zero) blocks: a 24 GiB partition whose HFSX
     volume is half used lands as a ~12 GiB image, which is what makes a small free space work."""
     size = int(phone.sh(f'blockdev --getsize64 {dev}').strip())
+    at = hfs_offset(phone, dev)
+    if at is None and not force:
+        sys.exit(f'no HFS+ volume signature in the first 8 KiB of {dev}: that is not the iOS root. '
+                 f'Pass --dev with the right block device (or --force if you are sure).')
     if size % BLOCK:
-        sys.exit(f'{dev} is {size} bytes, not a whole number of {BLOCK}-byte blocks')
-    print(f'USERDATA {dev}: {size >> 20} MiB -> {image} (this is the slow part, ~10-20 min)')
+        print(f'{dev} is {size} bytes: its last block is only {size % BLOCK} bytes, and it is kept '
+              f'(the alternate HFS+ volume header sits in the last 1024 bytes of the volume)')
+    print(f'USERDATA {dev}: {size >> 20} MiB -> {image} (this is the slow part: tens of minutes)')
     step = 8 * MIB
     holes = 0
     with open(image, 'wb') as out:
@@ -370,17 +386,18 @@ def pull(phone, dev, image):
 def changed_runs(before, after, gap_blocks):
     """4 KiB block runs that differ, merging gaps so one push covers nearby edits."""
     size = os.path.getsize(after)
-    if os.path.getsize(before) != size or size % BLOCK:
+    if os.path.getsize(before) != size:
         sys.exit('the two images are not the same size')
-    total = size // BLOCK
+    total = -(-size // BLOCK)  # the last block of the partition can be shorter than 4 KiB
     step = (8 << 20) // BLOCK
     runs = []
     with open(before, 'rb') as fb, open(after, 'rb') as fa:
         base = 0
         while base < total:
             n = min(step, total - base)
-            bb, ba = fb.read(n * BLOCK), fa.read(n * BLOCK)
-            if len(bb) != n * BLOCK or len(ba) != n * BLOCK:
+            want = min(n * BLOCK, size - base * BLOCK)
+            bb, ba = fb.read(want), fa.read(want)
+            if len(bb) != want or len(ba) != want:
                 sys.exit('an image ended early while comparing')
             if bb == ba:  # the common case: 8 MiB compared at once
                 base += n
@@ -420,6 +437,7 @@ def read_range(path, start, count):
 
 def write_runs(phone, dev, image, runs, tmpdir, limit):
     """Push and dd each run, then read it back and compare its SHA-256."""
+    size = os.path.getsize(image)
     total = sum(c for _, c in runs)
     print(f'writing {len(runs)} run(s), {human(total * BLOCK)} over adb')
     written = 0
@@ -428,7 +446,7 @@ def write_runs(phone, dev, image, runs, tmpdir, limit):
         while left:
             n = min(left, limit)
             data = read_range(image, off, n)
-            if len(data) != n * BLOCK:
+            if len(data) != min(n * BLOCK, size - off * BLOCK):
                 sys.exit(f'run {start}+{count} is past the end of {image}')
             local = os.path.join(tmpdir, 'j7blk')
             with open(local, 'wb') as f:
@@ -439,6 +457,7 @@ def write_runs(phone, dev, image, runs, tmpdir, limit):
                 sys.exit(f'the block file arrived as {got} of {len(data)} bytes (recovery /tmp full?)')
             phone.sh(f'dd if=/tmp/j7blk of={dev} bs={BLOCK} seek={off} count={n} conv=fsync || exit 1')
             back = phone.bytes_out(f'dd if={dev} bs={BLOCK} skip={off} count={n} 2>/dev/null')
+            back = back[:len(data)]  # the last block of the partition ends at its real size
             if hashlib.sha256(back).digest() != hashlib.sha256(data).digest():
                 sys.exit(f'READ-BACK MISMATCH at block {off}+{n}: nothing further was written. '
                          f'The pre-change image is still at {image}')
@@ -511,7 +530,7 @@ def do_push(args):
         if not args.force and free < need + 512 * MIB:
             sys.exit(f'{image} needs about {need >> 20} MiB free on this PC '
                      f'({free >> 20} MiB free): free some, or pass --image with a fresh pull')
-        pull(phone, dev, image)
+        pull(phone, dev, image, args.force)
     else:
         print(f'using {image} as the pre-change image (it must be a fresh pull of {dev})')
 

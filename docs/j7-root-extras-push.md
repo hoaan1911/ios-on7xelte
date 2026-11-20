@@ -78,7 +78,9 @@ python3 tools/j7-root-extras.py push
 
 What it does, in order:
 
-1. pulls USERDATA once to `device/USERDATA-before.img` (~10–20 min) and keeps it as the undo
+1. resolves USERDATA (every `by-name` layout TWRP uses, then the J7's `mmcblk0p25`), checks that
+   the first 8 KiB really hold an `H+`/`HX` volume signature, then pulls it once to
+   `device/USERDATA-before.img` (a few tens of minutes on a 24 GiB partition) and keeps it as the undo
    image. Free zero blocks are seeked over while pulling, so the file is sparse and takes the
    volume's *used* size rather than the partition size. The working copy is a clone where the host
    can do it (`cp -c` on APFS, `cp --reflink=auto` on btrfs/XFS) and a plain copy otherwise — only
@@ -98,6 +100,17 @@ What it does, in order:
    header, plus the ~1.5 MiB of bundle data) with `dd … conv=fsync`, **reads every run back and
    compares its SHA-256**, then `sync`s;
 6. saves the written ranges to `device/USERDATA-changed.txt`.
+
+A partition whose size is not a whole number of 4 KiB blocks is handled. The J7's is
+23,531,077,120 bytes — 4096 × 5,744,891 **plus 3,584** — and the short last block is pulled,
+compared and written back at its real length, because the alternate HFS+ volume header lives in the
+last 1024 bytes of the volume and losing it would make the next mount see a damaged volume.
+
+Two guards sit in front of that pull: the volume signature check above (a wrong `--dev` stops before
+22 GiB are copied), and the free-space check, which compares the partition size against the disk. The
+space check is deliberately pessimistic — it cannot know how much of the volume is free space until
+the pull has happened — so on a 24 GiB partition with little room left, `--force` after checking
+`df -h` is the intended way past it, not a bigger disk.
 
 Reboot out of TWRP into the normal boot (same `j7-xnu-boot.img`, same arguments). Open
 **Settings > Wallpaper > Add New Wallpaper**: the poster tiles should be listed now, and a widget

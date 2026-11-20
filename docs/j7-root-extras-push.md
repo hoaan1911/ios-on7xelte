@@ -133,7 +133,7 @@ python3 tools/j7-root-extras.py inspect --path Applications/PaperBoard.app/PlugI
 ```
 
 `inspect` mounts `device/USERDATA-before.img` **read-only** (no `fsck`, no writes) and lists what is
-really in the root, so ""is that extension on the phone?"" is answered without a pull or a push.
+really in the root, so "is that extension on the phone?" is answered without a pull or a push.
 
 Do not write into that mount by hand, and do not copy files into it from Finder:
 

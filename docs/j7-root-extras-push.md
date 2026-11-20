@@ -56,10 +56,18 @@ whole stock app set instead of the six (`Settings`, `Photos`, ... about 215 MiB)
 
 ## 2. Push it into the phone root
 
+**This step needs Linux (or the Linux laptop), not Windows.** It loop-mounts the phone's HFS+
+USERDATA image read-write, and Windows has no HFS+ write support; the script says so and exits.
+On Windows, step 1 (`stage --tar`) works — it only copies and checks the tar — and `stage --ipsw`
+never worked there (it needs `apfs-fuse`). To push from a Windows PC, copy this whole folder plus
+`device/j7-root-extras.tar` to the Linux machine and run step 2 there; nothing else is needed,
+and the repo there does not have to be at the same path. `sudo -v` exists on Linux only — on
+Windows 11, `sudo` is a different program and its `-v` error is expected.
+
 Phone: boot **TWRP**, plug the USB cable, do **not** mount Data (the script refuses if `/data`
 is mounted).
 
-On the laptop, first run `sudo -v` (the step loop-mounts the HFS+ image; sudo must not ask for a
+On the Linux laptop, first run `sudo -v` (the step loop-mounts the HFS+ image; sudo must not ask for a
 password in the middle of it), then:
 
 ```bash

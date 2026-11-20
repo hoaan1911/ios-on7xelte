@@ -29,6 +29,10 @@ Examples (Linux, root via sudo; run `sudo -v` first):
   python3 tools/j7-root-extras.py push
   python3 tools/j7-root-extras.py restore
 
+Windows: only `stage --tar` runs there (it just copies and checks the tar). `stage --os/--ipsw`,
+`push` and `restore` loop-mount the HFS+ USERDATA image, which Windows cannot do, so they exit
+with a message instead of a traceback: run those on the Linux laptop.
+
 Apple payload stays in device/j7-root-extras.tar and the pulled image; both are git-ignored.
 The tool never touches BOOT: the kernel and the boot arguments are not part of this.
 """
@@ -48,7 +52,10 @@ MIB = 1 << 20
 # Same list as tools/a5xelte-stage-ios-root.sh: the display/lock-screen/wallpaper services.
 UI_APPS = ('PosterBoard', 'PaperBoard', 'PreBoard', 'InputUI', 'MediaRemoteUI', 'ClockAngel')
 EXT_DIR = 'System/Library/ExtensionKit/Extensions'
-SUDO = [] if os.geteuid() == 0 or os.name != 'posix' else ['sudo']
+# os.geteuid does not exist on Windows, and nothing here needs root there: only the tar copy runs.
+POSIX = os.name == 'posix'
+IS_ROOT = POSIX and getattr(os, 'geteuid', lambda: 1)() == 0
+SUDO = [] if IS_ROOT or not POSIX else ['sudo']
 
 
 def run(cmd, check=True, capture=True, **kw):
@@ -61,6 +68,17 @@ def run(cmd, check=True, capture=True, **kw):
 def precheck_sudo():
     if SUDO and run([*SUDO, '-n', 'true'], check=False).returncode:
         sys.exit('this step mounts and repairs an HFS+ image as root: run "sudo -v" first')
+
+
+def require_linux(step, how):
+    """These steps loop-mount the phone's HFS+ image, which only Linux can write in place."""
+    if POSIX:
+        return
+    sys.exit(f'{step} does not run on {sys.platform}: it loop-mounts the phone\'s HFS+ USERDATA\n'
+             f'image read-write, which Windows cannot do.\n'
+             f'On Windows you can still run:  python3 tools/j7-root-extras.py stage --tar ...\n'
+             f'To {how}, copy this folder plus device/j7-root-extras.tar to the Linux laptop and\n'
+             f'run it there (that is where --ipsw staging and sudo live too).')
 
 
 def human(n):
@@ -162,6 +180,7 @@ def stage_from_os(root, out, all_apps):
 
 
 def stage_from_ipsw(ipsw, board, out, all_apps):
+    require_linux('stage --ipsw', 'mount an IPSW OS image')
     if not shutil.which('apfs-fuse'):
         sys.exit('apfs-fuse is missing: sudo pacman -S apfs-fuse (Arch), '
                  'sudo apt install apfs-fuse (Debian/Ubuntu)')
@@ -359,6 +378,7 @@ def write_runs(phone, dev, image, runs, tmpdir, limit):
 
 
 def do_push(args):
+    require_linux('push', 'install the bundles')
     if not os.path.isfile(args.tar):
         sys.exit(f'{args.tar} does not exist: run "stage" first (or download the '
                  f'j7-root-extras artifact)')
@@ -430,6 +450,7 @@ def do_push(args):
 
 
 def do_restore(args):
+    require_linux('restore', 'undo a push')
     if not os.path.isfile(args.runs):
         sys.exit(f'{args.runs} does not exist: nothing was pushed from here')
     if not os.path.isfile(args.before):
@@ -492,6 +513,7 @@ def main():
         if a.tar:
             stage_from_tar(a.tar, a.out)
         elif a.os:
+            require_linux('stage --os', 'stage from a mounted OS image')
             if not os.path.isdir(a.os):
                 sys.exit(f'{a.os} is not a directory')
             precheck_sudo()

@@ -543,3 +543,17 @@ Not device-verified: no bundle has been pushed yet. The distinguishing evidence 
 log is `PaperBoard` as an `exec`, and `chronod` starting a `widgetkit-extension` process when a
 widget is added. If a widget is still grey with its extension present, the remaining problem is in
 the render path, not in the bundle set.
+
+## 2026-11-20 — the extras tool on Windows
+
+`tools/j7-root-extras.py` crashed on Windows before doing anything: `os.geteuid()` does not exist
+there, so the module-level `SUDO` line raised `AttributeError`. The crash was the first thing the
+user hit, not a tar problem.
+
+Only `stage --tar` can work on Windows (it copies and owner-checks the tar; no mounting). `push`
+and `restore` loop-mount the HFS+ USERDATA image read-write, and `stage --os/--ipsw` mounts an APFS
+image, so all three are Linux-only. WSL2 is not a workaround: Microsoft's kernel is built without
+`CONFIG_HFSPLUS_FS`, and adb over USB needs `usbipd-win` on top. The tool now computes `SUDO`
+without `geteuid` and these three steps exit with one sentence saying so and pointing at the Linux
+machine, instead of a traceback. Verified by loading the module with `os.name = 'nt'` and calling
+each mode: `stage --tar` runs, the other three exit cleanly. Nothing was pushed to the phone.

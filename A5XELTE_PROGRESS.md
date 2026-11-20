@@ -520,3 +520,26 @@ runner and attaches it to a private release, so the laptop does not need a 6 GB 
 Not device-verified: no bundle has been pushed to the phone yet, so "the gallery lists its
 posters" is the expected result of this step, not an observation. The evidence to collect is
 the next boot log: `PaperBoard` must appear as an `exec` where it has never appeared before.
+
+## 2026-11-20 — the CI packer's mount path, and where widgets come from
+
+**The first `j7-root-extras` run (4468486141) failed on a path that does not exist on macOS.**
+`hdiutil attach` mounts the OS image's system volume *at the mount point itself*, so
+`Applications/` is `/Volumes/SydneyUpdate20H392.D21D211OS/Applications`. Only `apfs-fuse`, the
+laptop's route, presents that same tree under `root/`, which is why `tools/j7-root-extras.py`
+probes both. The workflow now does the same, prints the tree it chose, and fails with a listing of
+the mount instead of a bare "no /Applications" if neither has it. That check failing was not a
+missing-bundle finding.
+
+**Widgets are the same kind of gap.** A widget is a `widgetkit-extension` appex embedded in its
+app's `PlugIns` folder (or under `System/Library/ExtensionKit/Extensions`) that `chronod` hosts and
+renders once the app is installed. A root staged down to six `/Applications` bundles has no widget
+extensions for Calendar, Clock, Weather and so on, and what is left on the screen is the empty
+black/grey host tile. `j7-root-extras` therefore packs all of `/Applications` by default now
+(~215 MiB, the same in-place push, no reflash): the gallery bundles and the widget extensions
+travel together. `all_apps=0` still selects the six display bundles alone.
+
+Not device-verified: no bundle has been pushed yet. The distinguishing evidence in the next boot
+log is `PaperBoard` as an `exec`, and `chronod` starting a `widgetkit-extension` process when a
+widget is added. If a widget is still grey with its extension present, the remaining problem is in
+the render path, not in the bundle set.

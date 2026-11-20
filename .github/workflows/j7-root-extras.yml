@@ -18,8 +18,8 @@ on:
         description: iOS version
         default: "16.7.16"
       all_apps:
-        description: "1 = every /Applications bundle (about 215 MiB), 0 = the display/wallpaper six"
-        default: "0"
+        description: "1 = every /Applications bundle (about 215 MiB, includes the widget app extensions), 0 = the display/wallpaper six"
+        default: "1"
 
 permissions:
   contents: write
@@ -58,13 +58,24 @@ jobs:
           mv "ipsw/$path" ipsw/os.dmg
           ls -l ipsw
 
-      - name: Pack the wallpaper bundles
+      - name: Pack the wallpaper and widget bundles
         run: |
           set -euo pipefail
           os=$(hdiutil attach -nobrowse -readonly -owners on ipsw/os.dmg | awk -F'\t' '/\/Volumes\// {print $NF}' | tail -1)
           echo "OS mounted at $os"
-          root="$os/root"
-          [ -d "$root/Applications" ] || { echo "no /Applications under $root" >&2; exit 1; }
+          # hdiutil mounts the OS image's system volume at the mount point itself, so
+          # Applications/ sits right there. apfs-fuse, the laptop's route, shows the same
+          # tree under root/. Accept either instead of assuming one.
+          root="$os"
+          if [ ! -d "$root/Applications" ] && [ -d "$os/root/Applications" ]; then
+            root="$os/root"
+          fi
+          [ -d "$root/Applications" ] || {
+            echo "no Applications directory under $os or $os/root; the mount holds:" >&2
+            ls -la "$os" >&2
+            exit 1
+          }
+          echo "/Applications source: $root/Applications"
           list=extras.txt
           : > "$list"
           if [ "${{ inputs.all_apps || '0' }}" = "1" ]; then
@@ -88,6 +99,8 @@ jobs:
               printf 'System/Library/ExtensionKit/Extensions/%s\n' "${ext##*/}" >> "$list"
             done
           fi
+          [ -s "$list" ] || { echo "the bundle list is empty: nothing was found to pack" >&2; exit 1; }
+          echo "$(wc -l < "$list") bundle(s):"
           cat "$list"
           # Numeric owners: iOS wants root:wheel on these, and tar keeps what the image has.
           sudo tar -cpf j7-root-extras.tar -C "$root" -T "$list"

@@ -6,6 +6,12 @@ staged without (`docs/a5xelte-root-application-omission.md`). Those are Apple fi
 cannot live in Git and they are not a kernel patch: they have to be written into the HFSX root
 on USERDATA.
 
+**Widgets come from the same place.** A widget is a `widgetkit-extension` appex embedded in its
+app's `PlugIns` folder (or in `System/Library/ExtensionKit/Extensions`), and `chronod` renders it
+after the app is installed. On this root a widget whose app bundle is absent has no extension to
+render, and what is left on screen is the empty black/grey host tile. Packing `/Applications`
+whole therefore brings the widget extensions in with the apps.
+
 Two things make that awkward:
 
 - TWRP's kernel has **no hfsplus driver**, so the volume cannot be edited from the phone;
@@ -20,14 +26,19 @@ BOOT is not touched at all. The kernel, the ADT and the boot arguments stay exac
 ## 1. Get the bundles (one time)
 
 **A. From the bundles release (no download of a 6 GB IPSW).** Run the `j7-root-extras` workflow
-(Actions > j7-root-extras > Run workflow). It packs `PosterBoard`, `PaperBoard`, `PreBoard`,
-`InputUI`, `MediaRemoteUI`, `ClockAngel` and any `*Poster*` extension out of the iPhone 8 Plus
-IPSW (it refuses to run in a public repository), attaches a ~1.5 MiB `j7-root-extras.tar` to a
-private release, and prints the asset tag. Download that tar into `device/j7-root-extras.tar`.
+(Actions > j7-root-extras > Run workflow). It packs every `/Applications` bundle out of the
+iPhone 8 Plus IPSW — about 215 MiB, which is what the wallpaper gallery *and* the widget
+extensions inside the app bundles need — plus any `*Poster*` extension, refuses to run in a
+public repository, attaches `j7-root-extras.tar` to a private release, and prints the asset tag.
+Download that tar into `device/j7-root-extras.tar`.
 
 ```bash
 python3 tools/j7-root-extras.py stage --tar device/j7-root-extras.tar   # re-checks owners, 1 s
 ```
+
+Run the workflow with `all_apps = 0` to pack only `PosterBoard`, `PaperBoard`, `PreBoard`,
+`InputUI`, `MediaRemoteUI` and `ClockAngel` instead (about 1.5 MiB, gallery only), or pass
+`--all-apps` to your own `stage` below.
 
 **B. From your own IPSW on the laptop** (needs `apfs-fuse`; the OS image is mounted read-only):
 
@@ -65,7 +76,9 @@ What it does, in order:
    loop-mounts it read-write;
 3. reports how many bundles `/Applications` already has and which ones are missing, then extracts
    only the missing ones from the tar with their numeric owners (root:wheel) and checks that each
-   bundle's executable exists, is root-owned and is executable;
+   bundle's executable exists, is root-owned and is executable. That count is also the answer to
+   "how much of the root is really missing": the phone keeps its first-boot state, so the tool
+   only prints, it never replaces an existing bundle unless you pass `--replace`;
 4. unmounts, repairs again and compares the copy with the pulled image at 4 KiB granularity;
 5. writes only those runs (usually a few hundred KiB: catalog B-tree, allocation bitmap, volume
    header, plus the ~1.5 MiB of bundle data) with `dd … conv=fsync`, **reads every run back and
@@ -73,8 +86,15 @@ What it does, in order:
 6. saves the written ranges to `device/USERDATA-changed.txt`.
 
 Reboot out of TWRP into the normal boot (same `j7-xnu-boot.img`, same arguments). Open
-**Settings > Wallpaper > Add New Wallpaper**: the poster tiles should be listed now. The first
-boot after this is a normal boot — no data migration, no hour-long first boot.
+**Settings > Wallpaper > Add New Wallpaper**: the poster tiles should be listed now, and a widget
+added to the Home Screen or Today View should draw its content instead of the empty grey tile.
+The first boot after this is a normal boot — no data migration, no hour-long first boot.
+
+What the log should then show: `PaperBoard` as an `exec` where it has never appeared, and, when a
+widget is added, `chronod` starting a `widgetkit-extension` process. If a widget is still grey
+after the push, that log line is the difference between "the extension is not installed" and
+"the extension is installed and does not render" — they need different fixes, and the second one
+is not a bundle problem.
 
 ## 3. Undo
 
@@ -96,3 +116,6 @@ comparison. Keep the image until the gallery works.
   may, and they would run without theirs.
 - Only USERDATA content changes. If the gallery is still empty after this, the next line of
   evidence is the boot log: `PaperBoard` should now appear as an `exec`.
+- Very large additions are slow for the same reason the rest of this port is: the diff is computed
+  and written over adb, so 215 MiB of new bundles is minutes, not seconds. The phone's HFSX volume
+  had about 2.1 GiB free when this was written.

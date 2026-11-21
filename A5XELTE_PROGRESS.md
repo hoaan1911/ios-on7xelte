@@ -764,3 +764,39 @@ the perf windows; the operating point is not verified until a boot log reports i
 Image `artifacts/j7-boot-44879118860/j7-xnu-boot.img`, 16,674,832 bytes,
 sha256 `a29ced6edf2eec2dcb6e342d755a9ecf081f3b310e66f10d815cf142cd1b5f8f` (xnu run 44878722876,
 0395 built and the image carries its log strings). Not yet flashed.
+
+## 2026-11-21 — the 1794 MHz image stopped before the logo: the switch is not a clock
+
+The 0395 image (`a29ced6e…5b8f`) showed no Apple logo and produced no new log: the log the user
+pulled was the previous boot's. That is what a stopped CPU clock looks like from the outside. The
+raise runs in `AppleCLCD::start`, before the logo is handed to the panel and before the kernel
+flushes its ring to storage, so a core that stops inside `j7_cpu_clock()` writes nothing anywhere
+and leaves the old log in place.
+
+**Why 0395 stopped.** It switched the cores to the MIF switch *before* touching the PLL and wrote
+CMU_MIF `+0x858`/`+0x458`. The status it polled at `+0x608` bits 12:13 is the mux's selection,
+`1 << src`, not a clock-present signal: it reads 2 as soon as the mux has selected that input,
+whether or not the switch is running. Unlike 0380's failure (cores on OSCCLK at 26 MHz, machine
+alive, `cpu_mhz=38`) this one produced nothing at all, which fits the cores being parked on a dead
+input rather than on the always-running oscillator.
+
+**The transition that is known to run here is OSCCLK.** 0380 never wrote `+0x204`, so the switch
+input's 0 source was OSCCLK, and the boot survived at 26 MHz: it only failed because it waited for
+status `1` where the switch reads `2` and returned before programming the PLL. Patch **0396** keeps
+exactly that detour and drops all CMU_MIF access: ARMCLK to the switch input (`+0x208` bit 12),
+poll `+0x608` for 2, write lock time `P*150` and `PLL_CON0` (M 276 / P 4 / S 0 = 1794 MHz), poll
+lock 29, move back and poll 1. The polls use `IODelay`, not `IOSleep`, because at 26 MHz a
+scheduling sleep is an eternity; a mux that does not move is put back and a PLL that never locks
+gets its old CON0 back with the cores returned to it.
+
+**GPU: the 900 MHz step was never on in these boots.** The GPU PLL only moved when `j7gpuclk=900`
+was in the boot args, and the last cmdline did not carry it, so G3D stayed at the bootloader's
+343 MHz. The herolte branch reaches its speed with Mesa's Panfrost on the Mali-T880 (its own
+`gpu/eagl` + `hakios-gl`, and AIR→NIR for Metal); this port already runs the same Panfrost stack
+through `sweetgl.dylib` on the T830, so the GPU clock is the whole of the available GPU-side gain
+without writing a Metal driver. Patch **0397** defaults `j7gpuclk` to 900 MHz, the rate the 0374
+boot read back, so every boot gets it.
+
+Expected in the next log: `A5XELTE CPU: CPUCL0 … asked for 1794000`, `… -> 1794000 kHz`,
+`cpu_mhz=1794`, and `A5XELTE CLK: G3D 900 MHz -> … reads back … 900000 kHz`. If 1794 does not
+lock, the same image logs `PLL never locked` and stays at 902; `j7cpu=1586` is the rated step.

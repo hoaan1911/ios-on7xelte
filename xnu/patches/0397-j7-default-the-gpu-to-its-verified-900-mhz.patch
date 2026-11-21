@@ -1,0 +1,33 @@
+From: j7
+Subject: j7: default the GPU PLL to its verified 900 MHz
+
+The last boot cmdline carried j7gpu=7 but not j7gpuclk, so the G3D PLL stayed at the 343 MHz
+the bootloader leaves and the 900 MHz step the 0374 boot verified was never reached.  The
+GPU is the same Mali-T830 running Mesa's Panfrost driver that the herolte port uses on its
+T880, so its clock is the whole of the GPU-side speed available without writing a Metal
+driver, and there is no reason to make every boot repeat an argument for it.
+
+Default j7gpuclk to 900 MHz: the value is range-checked, the PLL is written at the P and S
+the bootloader chose (P 13, S 1 makes the output M MHz, so M=900 is an 1800 MHz VCO), and
+the register is read back and decoded into the log.  j7gpuclk=0 keeps the bootloader rate.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -795,9 +795,12 @@
+ 				 * j7gpuclk=<kHz> reprograms PLL_CON0 - M 343 -> 900 at the same P 13, S 1,
+ 				 * which is 1800 MHz in the VCO and 900 out. The top byte of CON0 is kept
+ 				 * because what those bits mean is not documented. */
+-				int want = 0;
+-				if (PE_parse_boot_argn("j7gpuclk", &want, sizeof(want)) && want >= 200 &&
+-				    want <= 1000 && (uint32_t)want != pll) {
++				/* 900 MHz is the rate the 0374 boot read back and the only GPU step
++				 * measured on this phone; default to it so no boot argument is needed.
++				 * j7gpuclk=0 keeps whatever the bootloader left. */
++				int want = 900;
++				PE_parse_boot_argn("j7gpuclk", &want, sizeof(want));
++				if (want >= 200 && want <= 1000 && (uint32_t)want != pll) {
+ 					uint32_t gp_p = (gp != 0) ? gp : 13u;
+ 					uint32_t gp_s = gs;
+ 					/* Fout = 26 MHz * M / (P << S), so M = Fout * (P << S) / 26 MHz.

@@ -849,3 +849,33 @@ from the last boot. Not flashed or booted here.
 Expected in the next log: `SWEET FB: AppleCLCD 1080x1920`, `A5XELTE CLK: G3D 900 MHz -> M=900 P=13
 S=1` then `G3D reads back … 900000 kHz`, `cpu_mhz=902` (unchanged, by design), and a boot that
 reaches userland. `j7gpuclk=0` in the same image reverts the GPU to 343 MHz without a rebuild.
+
+## 2026-11-21 — the same silence again, so the /product node comes out
+
+The 0398+0399 image was silent too: no Apple logo and no new log line. That is three images in a
+row (0395, 0396+0397, 0398+0399) that fail in the same place, and the kernel side now has no
+clock code that runs by default - `j7cpu` is 0 and the GPU block only touches CMU_G3D, a separate
+domain. The one thing all three black-screen images share and none of the working boots had is the
+ADT: they carried the 12,464-byte tree with Apple's `/product` node from the private-repo IPSW
+fetch, while every boot that reached `sweet-progress` used the 9,864-byte entry-only tree. The node
+parses and round-trips, so this is not a proof that it is the cause, but it is the last single
+variable that changed between "draws" and "silent".
+
+So the fetch is now opt-in: a `product_node` workflow input, default **off**. With it off the
+"Fetch the iPhone device tree" step is skipped entirely, `tools/mkadt_j7prime.py` warns and builds
+the entry-only ADT, and nothing from the IPSW enters the image. Turn it back on with
+`-f product_node=true` once the phone boots again; the repository's visibility itself is unchanged
+(still private, so the old behaviour is one input away).
+
+New image: `artifacts/j7-boot-44911576305/j7-xnu-boot.img`, 16,672,784 bytes, sha256
+`05efad31793b63d114aef2028025efd6d9ce1027626525e70b619e0034e9eb50`, sha1
+`f3309437710d16707740f9d18e9d8108017676d9`, md5 `2a855201da3f1487c4a09c242b8d0684` (xnu run
+44905960778 = 0398+0399, boot run 44911576305, `board=d21ap`, `iphone8=false`,
+`product_node=false`; ADT 9,864 bytes, top level chosen/defaults/cpus/arm-io/buttons/
+a5xelte-fbcon/a5xelte-emmc, no `product`). The cmdline is byte-identical to the last boot, so this
+is the ADT alone. `G3D reads back` is still in the image. Not flashed or booted here.
+
+Expected in the next log if the node was the problem: `SWEET FB: AppleCLCD 1080x1920`, then
+`A5XELTE CLK: G3D 900 MHz -> M=900 P=13 S=1` and `G3D reads back … 900000 kHz`, `cpu_mhz=902`,
+and userland. If it is silent again the ADT is cleared and the next step is the panel handoff in
+`AppleCLCD::start` itself - the one function every failing boot dies inside.

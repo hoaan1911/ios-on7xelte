@@ -760,3 +760,7 @@ never reports is untouched, and a PLL that never locks gets its old CON0 back an
 returned to it, so the worst case is the 902 MHz the bootloader left. Expected in the next log:
 `A5XELTE CPU: CPUCL0 ... asked for 1794000` followed by `... -> 1794000 kHz`, and `cpu_mhz=1794` in
 the perf windows; the operating point is not verified until a boot log reports it.
+
+Image `artifacts/j7-boot-44879118860/j7-xnu-boot.img`, 16,674,832 bytes,
+sha256 `a29ced6edf2eec2dcb6e342d755a9ecf081f3b310e66f10d815cf142cd1b5f8f` (xnu run 44878722876,
+0395 built and the image carries its log strings). Not yet flashed.

@@ -1,0 +1,41 @@
+From: j7
+Subject: j7: leave the CPU clock off until the mux map is confirmed
+
+The two boots that asked for 1794 MHz both stopped before the logo and left no new log: 0395
+parked the cores on the MIF switch, 0396 on the oscillator, and neither came back.  The raise runs
+in AppleCLCD::start, before the kernel ever flushes its ring to storage, so a core that stops there
+writes nothing anywhere and leaves the previous boot's log in place - which is exactly what the
+phone showed both times.
+
+That is not a reason to keep spending flashes on it: 0380 already measured what a wrong ARMCLK
+move costs (cpu_mhz=38), and the evidence now points at the mux map itself rather than at the
+switch or the oscillator.  j7cpu now defaults to 0, so the image boots at the bootloader's 902 MHz
+operating point - the state every log so far was recorded in - and j7_cpu_clock() still exists for
+an explicit j7cpu=1794 test once the vendor ARMCLK mux register is confirmed.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -675,10 +675,17 @@
+ 		}
+ 	}
+ 	{
+-		/* j7cpu=<kHz> raises both clusters to that top DVFS step; the vendor table's
+-		 * cl0_max_support_idx row is 1794 MHz, and 0 keeps the bootloader's 902 MHz.
+-		 * A small value is MHz. */
+-		int cpu = 1794;
++		/* j7cpu=<kHz> raises both clusters to that top DVFS step; 0 - the default -
++		 * leaves the bootloader's 902 MHz operating point alone.  A small value is MHz.
++		 *
++		 * It is off by default because both boots that asked for the top step stopped
++		 * before the logo and left no new log: 0395 parked the cores on the MIF switch,
++		 * 0396 on the oscillator, and neither came back.  Whatever stops them lives in
++		 * the ARMCLK mux path this tree believes is +0x208 bit 12, and until that map is
++		 * confirmed against the vendor source a boot that asks for the top step costs
++		 * the phone its display and its log.  Pass j7cpu=1794 to try it with every other
++		 * part of the boot known good. */
++		int cpu = 0;
+ 		PE_parse_boot_argn("j7cpu", &cpu, sizeof(cpu));
+ 		if (cpu > 0 && cpu < 100000) {
+ 			cpu *= 1000;

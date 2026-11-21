@@ -1,0 +1,155 @@
+From: j7
+Subject: j7: raise the GPU PLL on every boot, not only when the clock dump is asked for
+
+0397 changed the j7gpuclk default to 900 MHz, but the whole CMU_G3D block - the readback, the
+M/P/S write, the log line - sits inside the j7clk gate, and j7clk dumps CMU_MIF and is off by
+default.  On a cmdline without j7clk=1 the GPU PLL was never touched, so the "900 MHz by default"
+image still ran the GPU at the bootloader's 343 MHz: the change was dead code.
+
+Move the CMU_G3D block out of the gate so it runs at every boot, keep CMU_MIF behind j7clk as
+before, and leave the rest of the sequence alone: 900 MHz is the rate the 0374 boot read back on
+this phone, j7gpuclk=0 keeps the bootloader rate, and the register is read back and decoded.  The
+GPU is a separate clock domain, so this cannot take the CPU with it the way the ARMCLK move did.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -743,71 +743,75 @@
+ 			} else {
+ 				IOLog("A5XELTE CLK: no map\n");
+ 			}
+-			/* CMU_G3D (0x11460000), documented offsets only. The GPU core runs from this
+-			 * PLL through CLK_CON_DIV_G3D_BUS, so both numbers are needed before its
+-			 * frequency can be raised: the divider is 0-based, result = pll / (div + 1). */
+-			IOMemoryDescriptor *gdesc = IOMemoryDescriptor::withPhysicalAddress(
+-			    0x11460000ULL, 0x1000, kIODirectionNone);
+-			IOMemoryMap *gmap = gdesc != NULL ? gdesc->map(kIOMapInhibitCache) : NULL;
+-			if (gmap != NULL) {
+-				volatile uint32_t *g = (volatile uint32_t *)gmap->getVirtualAddress();
+-				uint32_t con0 = g[0x100 / 4];
+-				uint32_t gm = (con0 >> 16) & 0x3ff;
+-				uint32_t gp = (con0 >> 8) & 0x3f;
+-				uint32_t gs = con0 & 0x7;
+-				uint32_t div = g[0x400 / 4] & 0x7u;
+-				uint64_t pll = (gp != 0 && gs < 7) ? 26000ULL * gm / ((uint64_t)gp << gs) : 0;
+-				IOLog("A5XELTE CLK: G3D PLL_CON0=%08x M=%u P=%u S=%u en=%u -> %llu kHz\n",
+-				    con0, gm, gp, gs, (con0 >> 31) & 1, pll);
+-				IOLog("A5XELTE CLK: G3D MUX=%08x DIV_BUS=%08x DIV_APB=%08x -> %llu kHz\n",
+-				    g[0x208 / 4], g[0x400 / 4], g[0x404 / 4], pll / (uint64_t)(div + 1));
+-				/* The core runs at pll / (div + 1) and the divider is already 0, so the
+-				 * only way up is the PLL itself: 343 MHz, against a T830 rated far higher.
+-				 * j7gpuclk=<kHz> reprograms PLL_CON0 - M 343 -> 900 at the same P 13, S 1,
+-				 * which is 1800 MHz in the VCO and 900 out. The top byte of CON0 is kept
+-				 * because what those bits mean is not documented. */
+-				/* 900 MHz is the rate the 0374 boot read back and the only GPU step
+-				 * measured on this phone; default to it so no boot argument is needed.
+-				 * j7gpuclk=0 keeps whatever the bootloader left. */
+-				int want = 900;
+-				PE_parse_boot_argn("j7gpuclk", &want, sizeof(want));
+-				if (want >= 200 && want <= 1000 && (uint32_t)want != pll) {
+-					uint32_t gp_p = (gp != 0) ? gp : 13u;
+-					uint32_t gp_s = gs;
+-					/* Fout = 26 MHz * M / (P << S), so M = Fout * (P << S) / 26 MHz.
+-					 * The first version multiplied by P instead of dividing, wrote M = 0,
+-					 * and took the core from 343 MHz down to 256: the register read back
+-					 * as a1000d01 with an empty M field. j7gpuclk is in MHz. */
+-					uint64_t m64 = ((uint64_t)want * 1000000ULL *
+-					    ((uint64_t)gp_p << gp_s)) / 26000000ULL;
+-					if (m64 < 10 || m64 > 1023) {
+-						IOLog("A5XELTE CLK: G3D %d MHz needs M=%llu, out of range\n",
+-						    want, m64);
+-					} else {
+-						uint32_t m = (uint32_t)m64;
+-						uint32_t con0new = (con0 & 0xff000000u) | ((m & 0x3ffu) << 16) |
+-						    ((gp_p & 0x3fu) << 8) | (gp_s & 0x7u);
+-						IOLog("A5XELTE CLK: G3D %d MHz -> M=%u P=%u S=%u CON0 %08x -> %08x "
+-						    "(VCO %llu kHz)\n", want, m, gp_p, gp_s, con0, con0new,
+-						    26000ULL * m / gp_p);
+-						g[0x100 / 4] = con0new;
+-						IODelay(200);
+-						uint32_t back = g[0x100 / 4];
+-						uint32_t bm = (back >> 16) & 0x3ff;
+-						uint64_t now = (gp_p != 0) ?
+-						    26000ULL * bm / ((uint64_t)gp_p << gp_s) : 0;
+-						IOLog("A5XELTE CLK: G3D reads back %08x -> %llu kHz\n",
+-						    back, now);
+-					}
+-				}
+-			} else {
+-				IOLog("A5XELTE CLK: no G3D map\n");
+-			}
+-			OSSafeReleaseNULL(gmap);
+-			OSSafeReleaseNULL(gdesc);
+ 			OSSafeReleaseNULL(map);
+ 			OSSafeReleaseNULL(desc);
+ 		}
++		/* CMU_G3D (0x11460000), documented offsets only.  This is not a dump: the GPU
++		 * runs at the bootloader's 343 MHz until this PLL is written, and 900 MHz is the
++		 * step the 0374 boot read back on this phone.  The core runs at pll / (div + 1)
++		 * (the divider is 0-based), so the PLL is the only way up.  This block used to
++		 * sit inside the j7clk gate above, so the j7gpuclk default never reached the
++		 * register on a cmdline without j7clk=1: the 900 MHz default was dead code.
++		 * j7gpuclk=0 keeps whatever the bootloader left. */
++		IOMemoryDescriptor *gdesc = IOMemoryDescriptor::withPhysicalAddress(
++		    0x11460000ULL, 0x1000, kIODirectionNone);
++		IOMemoryMap *gmap = gdesc != NULL ? gdesc->map(kIOMapInhibitCache) : NULL;
++		if (gmap != NULL) {
++			volatile uint32_t *g = (volatile uint32_t *)gmap->getVirtualAddress();
++			uint32_t con0 = g[0x100 / 4];
++			uint32_t gm = (con0 >> 16) & 0x3ff;
++			uint32_t gp = (con0 >> 8) & 0x3f;
++			uint32_t gs = con0 & 0x7;
++			uint32_t div = g[0x400 / 4] & 0x7u;
++			uint64_t pll = (gp != 0 && gs < 7) ? 26000ULL * gm / ((uint64_t)gp << gs) : 0;
++			IOLog("A5XELTE CLK: G3D PLL_CON0=%08x M=%u P=%u S=%u en=%u -> %llu kHz\n",
++			    con0, gm, gp, gs, (con0 >> 31) & 1, pll);
++			IOLog("A5XELTE CLK: G3D MUX=%08x DIV_BUS=%08x DIV_APB=%08x -> %llu kHz\n",
++			    g[0x208 / 4], g[0x400 / 4], g[0x404 / 4], pll / (uint64_t)(div + 1));
++			/* The core runs at pll / (div + 1) and the divider is already 0, so the
++			 * only way up is the PLL itself: 343 MHz, against a T830 rated far higher.
++			 * j7gpuclk=<kHz> reprograms PLL_CON0 - M 343 -> 900 at the same P 13, S 1,
++			 * which is 1800 MHz in the VCO and 900 out. The top byte of CON0 is kept
++			 * because what those bits mean is not documented. */
++			/* 900 MHz is the rate the 0374 boot read back and the only GPU step
++			 * measured on this phone; default to it so no boot argument is needed.
++			 * j7gpuclk=0 keeps whatever the bootloader left. */
++			int want = 900;
++			PE_parse_boot_argn("j7gpuclk", &want, sizeof(want));
++			if (want >= 200 && want <= 1000 && (uint32_t)want != pll) {
++				uint32_t gp_p = (gp != 0) ? gp : 13u;
++				uint32_t gp_s = gs;
++				/* Fout = 26 MHz * M / (P << S), so M = Fout * (P << S) / 26 MHz.
++				 * The first version multiplied by P instead of dividing, wrote M = 0,
++				 * and took the core from 343 MHz down to 256: the register read back
++				 * as a1000d01 with an empty M field. j7gpuclk is in MHz. */
++				uint64_t m64 = ((uint64_t)want * 1000000ULL *
++				    ((uint64_t)gp_p << gp_s)) / 26000000ULL;
++				if (m64 < 10 || m64 > 1023) {
++					IOLog("A5XELTE CLK: G3D %d MHz needs M=%llu, out of range\n",
++					    want, m64);
++				} else {
++					uint32_t m = (uint32_t)m64;
++					uint32_t con0new = (con0 & 0xff000000u) | ((m & 0x3ffu) << 16) |
++					    ((gp_p & 0x3fu) << 8) | (gp_s & 0x7u);
++					IOLog("A5XELTE CLK: G3D %d MHz -> M=%u P=%u S=%u CON0 %08x -> %08x "
++					    "(VCO %llu kHz)\n", want, m, gp_p, gp_s, con0, con0new,
++					    26000ULL * m / gp_p);
++					g[0x100 / 4] = con0new;
++					IODelay(200);
++					uint32_t back = g[0x100 / 4];
++					uint32_t bm = (back >> 16) & 0x3ff;
++					uint64_t now = (gp_p != 0) ?
++					    26000ULL * bm / ((uint64_t)gp_p << gp_s) : 0;
++					IOLog("A5XELTE CLK: G3D reads back %08x -> %llu kHz\n",
++					    back, now);
++				}
++			}
++		} else {
++			IOLog("A5XELTE CLK: no G3D map\n");
++		}
++		OSSafeReleaseNULL(gmap);
++		OSSafeReleaseNULL(gdesc);
+ 	}
+ 	{
+ 		int nowait = 0;

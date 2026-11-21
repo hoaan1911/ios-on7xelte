@@ -800,3 +800,11 @@ boot read back, so every boot gets it.
 Expected in the next log: `A5XELTE CPU: CPUCL0 … asked for 1794000`, `… -> 1794000 kHz`,
 `cpu_mhz=1794`, and `A5XELTE CLK: G3D 900 MHz -> … reads back … 900000 kHz`. If 1794 does not
 lock, the same image logs `PLL never locked` and stays at 902; `j7cpu=1586` is the rated step.
+
+Image `artifacts/j7-boot-44902100379/j7-xnu-boot.img`, 16,674,832 bytes, sha256
+`439b0baeca049cc42e3c52b2983e6e1757445f73b6980e656fcbc2bbdf7d115c`, sha1
+`52e397b27ecdb397fee726b8a6a544e275361c79`, md5 `9aa3b0a9702c405e60e805a70e8f1131`
+(xnu run 44901664589 with 0396+0397, boot run 44902100379). The image carries
+`did not take the oscillator`, `PLL never locked at` and `G3D reads back`, and no longer carries
+0395's `did not move to the switch`; cmdline is the same as the previous boot, so the only change
+on the phone is the kernel. Not flashed or booted here.

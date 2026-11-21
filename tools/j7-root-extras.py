@@ -12,9 +12,11 @@ changed travel over adb -- the phone keeps its first-boot state, so nothing take
                           /run/media/$USER/087-86698-044 (the tree that holds Applications/)
             --tar FILE    j7-root-extras.tar from the j7-root-extras workflow
           Default set: PosterBoard, PaperBoard, PreBoard, InputUI, MediaRemoteUI, ClockAngel
-          (the same list tools/a5xelte-stage-ios-root.sh stages) plus any *Poster* extension
-          bundle under System/Library/ExtensionKit/Extensions. --all-apps takes all of
-          /Applications (about 215 MiB; check free space on the phone first).
+          (the same list tools/a5xelte-stage-ios-root.sh stages) plus
+          System/Library/ExtensionKit/Extensions and ExtensionKit.framework: that tree is what
+          hosts a widget extension and what the wallpaper gallery's poster extensions live in,
+          and a root staged without it draws grey widget tiles and an empty gallery. --all-apps
+          takes all of /Applications (about 215 MiB; check free space on the phone first).
 
   push    with the phone in TWRP and adb working:
             pulls USERDATA once to device/USERDATA-before.img (kept for undo),
@@ -63,6 +65,9 @@ MIB = 1 << 20
 # Same list as tools/a5xelte-stage-ios-root.sh: the display/lock-screen/wallpaper services.
 UI_APPS = ('PosterBoard', 'PaperBoard', 'PreBoard', 'InputUI', 'MediaRemoteUI', 'ClockAngel')
 EXT_DIR = 'System/Library/ExtensionKit/Extensions'
+# ExtensionKit hosts widget extensions and owns the poster extensions the wallpaper gallery
+# lists, so a root staged without it shows grey widgets and no gallery.
+SYSTEM_DIRS = (EXT_DIR, 'System/Library/Frameworks/ExtensionKit.framework')
 # os.geteuid does not exist on Windows, and nothing here needs root there: only the tar copy runs.
 POSIX = os.name == 'posix'
 DARWIN = POSIX and sys.platform == 'darwin'
@@ -181,11 +186,13 @@ def collect(root, all_apps):
             targets.append(f'Applications/{name}')
         elif not all_apps:
             missing.append(name)
-    ext = os.path.join(root, EXT_DIR)
-    if os.path.isdir(ext):
-        for name in sorted(os.listdir(ext)):
-            if 'Poster' in name and os.path.isdir(os.path.join(ext, name)):
-                targets.append(f'{EXT_DIR}/{name}')
+    # Everything under ExtensionKit, not only the names with Poster in them: the gallery's
+    # tiles and the widget hosts both come from this tree.  The phone image has no
+    # System/Library/ExtensionKit at all (inspect says "not on this image"), which is why the
+    # gallery lists nothing and a widget draws an empty grey tile.
+    for rel in SYSTEM_DIRS:
+        if os.path.isdir(os.path.join(root, rel)):
+            targets.append(rel)
     return targets, missing
 
 
@@ -265,18 +272,18 @@ def stage_from_tar(tar, out):
 
 # ---------------------------------------------------------------- phone image
 
-BUNDLE_SUFFIXES = ('.app', '.appex', '.bundle')
+BUNDLE_SUFFIXES = ('.app', '.appex', '.bundle', '.framework')
 
 
 def install_unit(name):
-    """The directory a tar member belongs to: Applications/X.app, .../Extensions/X.appex."""
+    """The bundle a tar member belongs to: Applications/X.app, .../Extensions/X.appex.
+    A bare directory or loose file has no unit: installing one would report "System/Library
+    incomplete" for a tree that only needs the bundles inside it."""
     parts = [p for p in name.strip('/').split('/') if p and p != '.']
-    if not parts:
-        return None
     for index, part in enumerate(parts):
         if part.endswith(BUNDLE_SUFFIXES):
             return '/'.join(parts[:index + 1])
-    return '/'.join(parts[:2]) if len(parts) > 1 else parts[0]
+    return None
 
 
 def tar_targets(tar):

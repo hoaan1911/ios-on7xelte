@@ -667,3 +667,60 @@ stubbed `run`/`copy_image` on Darwin: the failing read-only mount, the detach, t
 the second attach and the final mount all happen in that order, and the clone is removed; the
 read-write path and the Linux path are unchanged. Not verified: a real dirty HFS+ volume on macOS (no
 Mac here) — that run is the user's next step.
+
+## 2026-11-21 — the purple is our own gradient, and ExtensionKit is not on the root at all
+
+Two answers came out of the same evening: one from the boot log, one from the phone image.
+
+**The log says where the 50 ms goes.** In the interaction windows of the 2026-11-20 image the
+present is still 44–62 ms and the row build is nearly all of it:
+
+    A5XELTE FB: frames=2 elapsed_ms=5412 fps=0.3 bytes=16588800 avg_copy_us=61933 max_copy_us=65934
+    A5XELTE FB: copy split build_us=100134 src_us=6279 store_us=3662      (2 frames)
+    A5XELTE FB: frames=9 elapsed_ms=11156 fps=0.8 avg_copy_us=44558
+    A5XELTE FB: copy split build_us=341784 src_us=22100 store_us=12844      (9 frames)
+
+So of a 58 ms present, 50 ms is `build_us`, 3 ms is the source read (0389's two-pixel row copy,
+working) and 2 ms is the panel store. The build is still two passes over every pixel: 0389 moved the
+picture decision to one per *source* pixel but left the run-length expansion below it, which scans
+the output row for equal neighbours before writing it. 1334 rows × (750 decisions + 1080 run scans)
+at `cpu_mhz=908` is the 50 ms.
+
+**The purple is this driver.** With no picture file, every wide run of near-black pixels was
+replaced by `bg`, a vertical gradient built from the row index:
+
+    const uint32_t bg = 0xff000000u | ((12u + (ramp * 40u >> 8)) << 16) |
+        ((16u + (ramp * 26u >> 8)) << 8) | (40u + (ramp * 70u >> 8));
+
+12/16/40 at the top of the panel and 52/42/110 at the bottom: blue with a red lift, i.e. purple,
+painted exactly where the desktop draws its dark background. The picture that gradient existed for
+was removed in 0392, so on this image it replaced the desktop's own near-black for nothing.
+
+**Patch 0394 removes both.** The gradient, its ramp and the whole per-source-pixel pass that looked
+for dark runs are gone: with no picture file the client's row is handed to the panel unchanged, so
+the desktop's black arrives as black. The expansion is a flat `row[x] = in[column[x]]` over the
+output row instead of a run scan, and the shadow row is only copied when the unchanged-row skip can
+actually read it (`fFlip` is on, so it never did — 4 MB of cached stores per frame were dead).
+Expected in the next log: `copy split build_us` well under the current 50 ms per frame and `fps` up
+from the user's 7–9 in an interaction window.
+
+**The gallery and the widgets have one missing tree.** `tools/j7-root-extras.py inspect` on
+`device/USERDATA-before.img` now works on the hackintosh (the dirty-journal clone repair from
+`aba1e89`), and its two answers were:
+
+    System/Library/ExtensionKit/Extensions is not on this image
+    d 1564 Applications/PaperBoard.app/PlugIns/LegacyPoster.appex
+
+The root was staged without `System/Library/ExtensionKit`, so the phone has no ExtensionKit
+framework and no extension directory at all. That is one cause for both remaining symptoms: a
+`widgetkit-extension` is started by ExtensionKit, and the wallpaper gallery's poster extensions are
+ExtensionKit extensions, so `chronod` has nothing to host (grey widget tiles) and `PaperBoard` has
+nothing to list (empty gallery) even though its app bundle is on the volume.
+
+`stage` therefore packs `System/Library/ExtensionKit/Extensions` and
+`System/Library/Frameworks/ExtensionKit.framework` out of the OS image with the app bundles, and
+`install_unit()` no longer treats a bare directory as an install unit (a `System/Library` unit would
+have been reported incomplete on every run). `j7-root-extras.yml` packs the same two trees.
+Not verified: nothing has been pushed since, so "PaperBoard execs and the gallery lists posters" is
+still the expected result of the push, not an observation. `docs/j7-root-extras-push.md` has the
+three commands.

@@ -12,6 +12,13 @@ after the app is installed. On this root a widget whose app bundle is absent has
 render, and what is left on screen is the empty black/grey host tile. Packing `/Applications`
 whole therefore brings the widget extensions in with the apps.
 
+**The host itself was missing.** `inspect --path System/Library/ExtensionKit/Extensions` on the
+pulled image answers "not on this image": this root was staged without ExtensionKit at all. That is
+one cause for both symptoms, because ExtensionKit is what starts a `widgetkit-extension` process and
+what the gallery's poster extensions are loaded through. `stage` now packs
+`System/Library/ExtensionKit/Extensions` and `System/Library/Frameworks/ExtensionKit.framework` from
+the OS image along with the app bundles.
+
 Two things make that awkward:
 
 - TWRP's kernel has **no hfsplus driver**, so the volume cannot be edited from the phone;
@@ -28,8 +35,9 @@ BOOT is not touched at all. The kernel, the ADT and the boot arguments stay exac
 **A. From the bundles release (no download of a 6 GB IPSW).** Run the `j7-root-extras` workflow
 (Actions > j7-root-extras > Run workflow). It packs every `/Applications` bundle out of the
 iPhone 8 Plus IPSW — about 215 MiB, which is what the wallpaper gallery *and* the widget
-extensions inside the app bundles need — plus any `*Poster*` extension, refuses to run in a
-public repository, attaches `j7-root-extras.tar` to a private release, and prints the asset tag.
+extensions inside the app bundles need — plus `System/Library/ExtensionKit/Extensions` and
+`ExtensionKit.framework`, refuses to run in a public repository, attaches `j7-root-extras.tar` to a
+private release, and prints the asset tag.
 Download that tar into `device/j7-root-extras.tar`.
 
 ```bash
@@ -37,7 +45,8 @@ python3 tools/j7-root-extras.py stage --tar device/j7-root-extras.tar   # re-che
 ```
 
 Run the workflow with `all_apps = 0` to pack only `PosterBoard`, `PaperBoard`, `PreBoard`,
-`InputUI`, `MediaRemoteUI` and `ClockAngel` instead (about 1.5 MiB, gallery only), or pass
+`InputUI`, `MediaRemoteUI` and `ClockAngel` instead (about 1.5 MiB, gallery only, ExtensionKit
+still included), or pass
 `--all-apps` to your own `stage` below.
 
 **B. From your own IPSW on the laptop** (needs `apfs-fuse`; the OS image is mounted read-only):
@@ -134,6 +143,25 @@ python3 tools/j7-root-extras.py inspect --path Applications/PaperBoard.app/PlugI
 
 `inspect` mounts `device/USERDATA-before.img` **read-only** (no writes to it) and lists what is
 really in the root, so "is that extension on the phone?" is answered without a pull or a push.
+
+### The answer on this phone, and what to push next
+
+The two commands above returned `System/Library/ExtensionKit/Extensions is not on this image` and a
+single entry, `Applications/PaperBoard.app/PlugIns/LegacyPoster.appex`. So the poster extensions and
+the ExtensionKit tree this root should have carried are absent — the same tree that hosts widget
+extensions. Check the framework too, then pack and push:
+
+```bash
+python3 tools/j7-root-extras.py inspect --path System/Library/Frameworks/ExtensionKit.framework
+python3 tools/j7-root-extras.py stage --os /run/media/$USER/<the mounted OS image>   # prints its targets
+python3 tools/j7-root-extras.py push --dry-run
+python3 tools/j7-root-extras.py push          # phone in TWRP, nothing mounted
+```
+
+`stage` prints `System/Library/ExtensionKit/Extensions` and
+`System/Library/Frameworks/ExtensionKit.framework` when the OS image has them; if it prints neither,
+the mounted image is not the tree that holds the system volume and the poster extensions have to
+come from the IPSW's own OS image instead (`stage --ipsw`, Linux + `apfs-fuse` only).
 
 On macOS the first mount can be refused with
 

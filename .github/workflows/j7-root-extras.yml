@@ -91,14 +91,16 @@ jobs:
               fi
             done
           fi
-          # Poster extensions: the gallery's own tiles. Already in the staged root on this
-          # device, but harmless and explicit when present.
-          if [ -d "$root/System/Library/ExtensionKit/Extensions" ]; then
-            for ext in "$root/System/Library/ExtensionKit/Extensions"/*Poster*; do
-              [ -d "$ext" ] || continue
-              printf 'System/Library/ExtensionKit/Extensions/%s\n' "${ext##*/}" >> "$list"
-            done
-          fi
+          # ExtensionKit: the widget hosts and the wallpaper gallery's poster extensions. The
+          # phone image has no System/Library/ExtensionKit at all, so this is the tree that
+          # turns grey widget tiles and an empty gallery back on.
+          for rel in System/Library/ExtensionKit System/Library/Frameworks/ExtensionKit.framework; do
+            if [ -d "$root/$rel" ]; then
+              printf '%s\n' "$rel" >> "$list"
+            else
+              echo "absent from this IPSW: $rel"
+            fi
+          done
           [ -s "$list" ] || { echo "the bundle list is empty: nothing was found to pack" >&2; exit 1; }
           echo "$(wc -l < "$list") bundle(s):"
           cat "$list"

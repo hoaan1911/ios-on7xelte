@@ -1,0 +1,101 @@
+From: j7
+Subject: j7: hand the panel exactly what the client painted
+
+The user reports purple where the desktop is black and 50 ms of row build in a 58 ms
+present.  Both come from the same place.
+
+The purple is this driver's own background: with no picture file on the volume, every
+wide run of near-black pixels was replaced by a gradient that runs from 12/16/40 at the
+top of the panel to 52/42/110 at the bottom.  That is a blue with a red lift - purple -
+and it is painted exactly where the desktop draws its dark background.  Nothing needs
+replacing there any more: the picture that gradient existed for was removed in 0392, and
+the client already drew the pixels it wants on screen.  The gradient, the ramp and the
+whole per-source-pixel pass that looked for those runs go away; only a picture file that
+really exists still paints.
+
+The other half is that pass.  0389 moved the picture decision to one per source pixel,
+so the run-length expansion below it is now only a lookup and a store.  Keeping the old
+scan meant a second walk over every output pixel looking for equal neighbours: 1334 rows
+of 750 decisions plus 1080 run scans, on a CPU left at the bootloader's 908 MHz.  The
+expansion is a flat loop over the output row now.
+
+The shadow row is also only written when it is read.  It exists for the unchanged-row
+skip, which is off whenever the double buffer is on, and fFlip is on: that skip can
+never fire, so the 4 MB of cached copies per frame were dead stores.
+
+Expected in the next log: `copy split build_us` down from 50 ms per frame, `fps` up from
+7-9 in an interaction window, and no purple in the desktop's black - the panel shows the
+client's own near-black.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1366,14 +1366,11 @@
+ 			sweet_fb_src_ns += ns;
+ 		}
+ 		in = srcrow;
+-		/* The desktop behind the icons arrives as opaque black, not as transparency: a whole frame
+-		 * carried only 4320 fully transparent pixels, and every swap record carries a single
+-		 * non-zero layer id, so there is no wallpaper layer to composite. Replace wide runs of
+-		 * opaque black instead - a wallpaper area is hundreds of pixels across, a glyph stem is
+-		 * one or two - so text and icons survive. */
+-		const uint32_t ramp = (uint32_t)py * 256u / (uint32_t)(fHeight ? fHeight : 1);
+-		const uint32_t bg = 0xff000000u | ((12u + (ramp * 40u >> 8)) << 16) |
+-		    ((16u + (ramp * 26u >> 8)) << 8) | (40u + (ramp * 70u >> 8));
++		/* With no picture to paint there is nothing to replace here: the client already drew
++		 * exactly what it wants on screen.  The gradient that used to fill every wide run of
++		 * near-black was 12/16/40 at the top of the panel and 52/42/110 at the bottom, which is
++		 * the purple the user sees where the desktop is supposed to be black, and the pass that
++		 * looked for those runs cost a second walk over the whole row. */
+ 		if (r != previous && skipUnchanged && fShadow != NULL &&
+ 		    memcmp(fShadow + (uint64_t)r * fLogicalW, in, (size_t)w * 4) == 0) {
+ 			/* Unchanged since the last present: the panel rows already hold it. */
+@@ -1387,7 +1384,7 @@
+ 		}
+ 		if (r != previous) {
+ 			buildStart = mach_absolute_time();
+-			if (fShadow != NULL) {
++			if (skipUnchanged && fShadow != NULL) {
+ 				memcpy(fShadow + (uint64_t)r * fLogicalW, in, (size_t)w * 4);
+ 			}
+ 			/* The picture's row for this logical row, once per row. */
+@@ -1431,32 +1428,13 @@
+ 						sweet_fb_alpha0++;
+ 					}
+ 				}
+-			} else if (wrow == NULL) {
+-				/* No picture at all: keep the plain gradient for a dark background.  The
+-				 * boot logo screen has a picture but is not ready yet, and stays black. */
+-				for (int32_t c = 0; c < w; c++) {
+-					const uint32_t v = srcrow[c];
+-					const uint32_t cr = (v >> 16) & 0xffu, cg = (v >> 8) & 0xffu;
+-					const uint32_t cb = v & 0xffu;
+-					const uint32_t cmax = cr > cg ? (cr > cb ? cr : cb) : (cg > cb ? cg : cb);
+-					if ((v >> 24) == 0xffu && cmax <= 0x28u) {
+-						srcrow[c] = bg;
+-					}
+-				}
+ 			}
+-			/* One source pixel becomes one or two output pixels: write the run, not the
+-			 * output pixel, so the source is read once per pixel instead of gathered. */
+-			int32_t x = 0;
+-			while (x < pw) {
+-				int32_t c = column[x];
+-				int32_t end = x + 1;
+-				while (end < pw && column[end] == c) {
+-					end++;
+-				}
+-				const uint32_t v = in[c];
+-				for (; x < end; x++) {
+-					row[x] = v;
+-				}
++			/* One source pixel becomes one or two output pixels.  The picture decision above
++			 * is already made per source pixel, so the expansion is a lookup and a store:
++			 * scanning for a run of equal neighbours first only added a second pass over
++			 * every output pixel, and the row build measured 50 ms of a 58 ms present. */
++			for (int32_t x = 0; x < pw; x++) {
++				row[x] = in[column[x]];
+ 			}
+ 			previous = r;
+ 			{

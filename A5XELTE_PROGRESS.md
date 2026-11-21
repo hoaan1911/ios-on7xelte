@@ -808,3 +808,44 @@ Image `artifacts/j7-boot-44902100379/j7-xnu-boot.img`, 16,674,832 bytes, sha256
 `did not take the oscillator`, `PLL never locked at` and `G3D reads back`, and no longer carries
 0395's `did not move to the switch`; cmdline is the same as the previous boot, so the only change
 on the phone is the kernel. Not flashed or booted here.
+
+## 2026-11-21 — the OSCCLK image was silent too, and the 900 MHz GPU step was dead code
+
+The 0396 image (`439b0baec…d115c`) showed the same thing as 0395: no Apple logo, no new log. Two
+different ARMCLK transitions, the same silence. That is the answer to "which part of the move is
+wrong": it is not the switch versus the oscillator, because both of them stop the machine in
+`AppleCLCD::start`, before the panel is handed a frame and before the persistent ring is ever
+flushed to storage. 0380's `cpu_mhz=38` boot remains the only measured evidence of an ARMCLK move
+on this phone, and it is equally consistent with "the mux never moved and something else slowed
+down" as with the cores reaching 26 MHz. Until the vendor ARMCLK mux register is confirmed at
+`+0x208` bit 12 - and `+0x608` as its status - every boot that asks for the top step buys a black
+screen. Patch **0398** makes `j7cpu` default to 0, so the clock is left at the bootloader's 902 MHz
+operating point, which is the state every log so far was recorded in. `j7cpu=1794` is still there
+for an explicit test.
+
+**The GPU never reached 900 MHz either, for a plain code reason.** 0397 changed the `j7gpuclk`
+default, but the whole CMU_G3D block - the readback, the M/P/S write and the `G3D reads back` line -
+was nested inside the `j7clk` gate, and `j7clk` is the CMU_MIF dump, off by default and absent from
+the phone's cmdline. So the "900 MHz by default" image still ran the T830 at the bootloader's
+343 MHz: the default was dead code. Patch **0399** moves the CMU_G3D block out of the gate so it
+runs on every boot, keeps CMU_MIF behind `j7clk`, and leaves the 0374-verified sequence alone
+(900 MHz, `j7gpuclk=0` keeps the loader rate, readback logged). The GPU is a separate clock domain,
+so this cannot take the CPU down with it the way the ARMCLK move does.
+
+**Checked while looking for a second cause:** the ADT grew from 9,864 to 12,464 bytes at the first
+black-screen image, because that is when the private-repository `/product` fetch started producing
+Apple's node (the older tree has none). The new tree parses, has no duplicate top-level names, and
+re-serialises byte-identically, so it is not malformed; it is `product` with 61 properties and no
+children. If this image is silent as well, that node is the next thing to remove - the workflow's
+private-only fetch is the switch for it.
+
+Image `artifacts/j7-boot-44906332073/j7-xnu-boot.img`, 16,674,832 bytes, sha256
+`e9a44e43e4d73a8e2c1b77616784bee37e4f3da5f18efc9408ef34b2fd3651de`, sha1
+`089d50ff5af87408315bcffcd34fa3d54ba568e0`, md5 `ef989823df8192ec6fbe6790dc8ffb78`
+(xnu run 44905960778 with 0396+0397+0398+0399, boot run 44906332073, `iphone8=false`). It carries
+`G3D reads back` and `did not take the oscillator` (dead code now), and the cmdline is unchanged
+from the last boot. Not flashed or booted here.
+
+Expected in the next log: `SWEET FB: AppleCLCD 1080x1920`, `A5XELTE CLK: G3D 900 MHz -> M=900 P=13
+S=1` then `G3D reads back … 900000 kHz`, `cpu_mhz=902` (unchanged, by design), and a boot that
+reaches userland. `j7gpuclk=0` in the same image reverts the GPU to 343 MHz without a rebuild.

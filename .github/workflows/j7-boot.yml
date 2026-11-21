@@ -17,6 +17,10 @@ on:
       ios_version:
         description: "iOS version of the IPSW the device tree /product node is taken from"
         default: "16.7.16"
+      product_node:
+        description: "Graft Apple's /product node from the IPSW into the ADT (private repositories only). Off = entry-only ADT, 9,864 bytes."
+        type: boolean
+        default: false
       iphone8:
         description: "Internal resolution: render an iPhone 8 screen (750x1334 @2x) and scale it to the panel (needs the kernel built with 0315). Adds sweetfb_scale=1 sweetfb_lw=750 sweetfb_lh=1334 to the boot args."
         type: boolean
@@ -65,6 +69,7 @@ jobs:
           CC=aarch64-linux-gnu-gcc LD=aarch64-linux-gnu-ld OBJCOPY=aarch64-linux-gnu-objcopy \
             sh shim/j7prime/build-xnu-boot.sh
       - name: Fetch the iPhone device tree (the ADT /product node)
+        if: ${{ inputs.product_node }}
         run: |
           set -euo pipefail
           # MobileGestalt reads the model name, device class and artwork from /product. Without it

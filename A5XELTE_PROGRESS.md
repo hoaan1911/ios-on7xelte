@@ -641,3 +641,29 @@ Added `inspect` so the pulled image can be read without a pull or a write: it at
 prints sizes, optionally filtered by `--glob`. Verified against a fake mount: read-only flag reaches
 `attach_image`, listing and globbing are correct, and a missing image exits instead of mounting.
 Not verified: a real HFS+ mount of the image (no macOS here).
+
+### macOS will not mount a dirty HFS+ journal read-only, so `inspect` repairs a clone
+
+The first `inspect` runs on the hackintosh failed before listing anything:
+
+```
+command failed: sudo mount -t hfs -o rdonly /dev/disk6 /var/folders/.../j7look-et221l1c
+mount_hfs: Invalid argument
+mount: /private/var/.../j7look-et221l1c failed with 1
+```
+
+`hdiutil -readonly` attached the image fine; the mount is what fails. That is the journal, not the
+image: a USERDATA pulled from TWRP was never unmounted, so the HFS+ journal is dirty, and macOS
+refuses to mount a dirty journal read-only at all (`hfs: early journal init: volume on disk6 is
+read-only and journal is dirty. Can not mount volume.` / `hfs_mountfs: ... failed, erroring out` /
+`hfs_mount: hfs_mountfs returned error=22`), which the mount_hfs wrapper prints as EINVAL. The
+read-write path never hit it because it runs `fsck_hfs -fy` first.
+
+`attach_image` now returns `(handle, clone)`: it tries the read-only mount, and when that is refused
+it copies the image to `<image>.look` (an APFS clone: no extra space), runs `fsck_hfs -fy` on the
+copy, attaches that and mounts it, and `inspect` deletes the copy when it exits. The pulled image is
+never repaired, because it is the baseline the next `push` diffs against the device. Verified with
+stubbed `run`/`copy_image` on Darwin: the failing read-only mount, the detach, the clone, the fsck,
+the second attach and the final mount all happen in that order, and the clone is removed; the
+read-write path and the Linux path are unchanged. Not verified: a real dirty HFS+ volume on macOS (no
+Mac here) — that run is the user's next step.

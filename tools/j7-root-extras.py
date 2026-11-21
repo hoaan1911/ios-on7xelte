@@ -26,6 +26,9 @@ changed travel over adb -- the phone keeps its first-boot state, so nothing take
 
   inspect list a path inside the pulled image, mounted read-only, without pulling anything again:
             python3 tools/j7-root-extras.py inspect --path Applications --glob '*.appex'
+          A phone partition is never unmounted cleanly and macOS will not mount a dirty HFS+
+          journal read-only, so inspect repairs a throw-away clone when the mount is refused;
+          the pulled image is never modified (it is the baseline the next push diffs against).
 
 Examples (Linux or macOS; root via sudo, so run `sudo -v` first):
   python3 tools/j7-root-extras.py push           # works on Linux and macOS
@@ -520,25 +523,56 @@ def copy_image(src, dst):
 
 
 def attach_image(image, mnt, readonly=False):
-    """Mount the HFS+ image. macOS attaches it as a device first; Linux loops it."""
+    """Mount the HFS+ image. macOS attaches it as a device first; Linux loops it.
+
+    Returns (handle, clone). A read-only mount of a volume that was not unmounted cleanly is
+    impossible on macOS: with a dirty journal hfs(5) answers "volume ... is read-only and journal
+    is dirty" and mount_hfs exits with EINVAL. Then a clone is repaired and mounted instead, and
+    `clone` is its path for the caller to delete. The image itself is never repaired: it is the
+    pre-push baseline, and changing it would make the next push diff the wrong thing.
+    """
     if not DARWIN:
         opts = 'loop,force' + (',ro' if readonly else '')
         run([*SUDO, 'mount', '-t', 'hfsplus', '-o', opts, image, mnt])
-        return image
-    mode = '-readonly' if readonly else '-readwrite'
-    out = run([*SUDO, 'hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage',
-               '-nomount', mode, '-noverify', image]).stdout
-    dev = next((line.split('\t')[0].strip() for line in out.splitlines()
+        return image, None
 
-                if line.split('\t')[0].strip().startswith('/dev/disk')), None)
-    if not dev:
-        sys.exit(f'hdiutil did not attach {image}:\n{out.strip()[-1500:]}')
+    def attach(path, mode):
+        out = run([*SUDO, 'hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage',
+                   '-nomount', mode, '-noverify', path]).stdout
+        dev = next((line.split('\t')[0].strip() for line in out.splitlines()
+                    if line.split('\t')[0].strip().startswith('/dev/disk')), None)
+        if not dev:
+            sys.exit(f'hdiutil did not attach {path}:\n{out.strip()[-1500:]}')
+        return dev
+
+    dev = attach(image, '-readonly' if readonly else '-readwrite')
     if not readonly:
         fsck = fsck_cmd()
         if fsck:
             run([*fsck, dev], check=False)  # the phone never unmounts cleanly
-    run([*SUDO, 'mount', '-t', 'hfs', *(['-o', 'rdonly'] if readonly else []), dev, mnt])
-    return dev
+        run([*SUDO, 'mount', '-t', 'hfs', dev, mnt])
+        return dev, None
+    if not run([*SUDO, 'mount', '-t', 'hfs', '-o', 'rdonly', dev, mnt], check=False).returncode:
+        return dev, None
+
+    print('the volume was not unmounted cleanly, and macOS cannot mount a dirty HFS+ journal\n'
+          'read-only (that is the mount_hfs "Invalid argument"): repairing a clone for this look,\n'
+          'the pulled image itself stays exactly as it came off the phone')
+    run([*SUDO, 'hdiutil', 'detach', dev], check=False)
+    clone = f'{image}.look'
+    copy_image(image, clone)
+    run([*SUDO, 'chown', f'{os.getuid()}:{os.getgid()}', clone], check=False)
+    fsck = fsck_cmd()
+    if not fsck:
+        sys.exit(f'fsck_hfs is missing, so the dirty volume cannot be repaired: install it, or '
+                 f'run inspect on {image} from Linux')
+    run([*fsck, clone], check=False)
+    dev = attach(clone, '-readwrite')
+    for opts in (['-o', 'rdonly'], []):
+        if not run([*SUDO, 'mount', '-t', 'hfs', *opts, dev, mnt], check=False).returncode:
+            return dev, clone
+    run([*SUDO, 'hdiutil', 'detach', dev], check=False)
+    sys.exit(f'could not mount the repaired copy {clone} either: nothing was written to {image}')
 
 
 def detach_image(handle, mnt):
@@ -591,7 +625,7 @@ def do_push(args):
     mnt = tempfile.mkdtemp(prefix='j7root-')
     handle = None
     try:
-        handle = attach_image(work, mnt)
+        handle, _ = attach_image(work, mnt)
         if not writable(mnt):
             sys.exit(f'{mnt} mounted read-only: the volume needs repairing first. Nothing was '
                      f'changed; on macOS attach {work} with hdiutil and run fsck_hfs -fy on it.')
@@ -641,9 +675,9 @@ def do_inspect(args):
         sys.exit(f'{args.image} does not exist: it is an image "push" pulled')
     precheck_sudo()
     mnt = tempfile.mkdtemp(prefix='j7look-')
-    handle = None
+    handle = clone = None
     try:
-        handle = attach_image(args.image, mnt, readonly=True)
+        handle, clone = attach_image(args.image, mnt, readonly=True)
         base = os.path.join(mnt, args.path.strip('/')) if args.path else mnt
         if not os.path.isdir(base):
             sys.exit(f'{args.path} is not on this image')
@@ -668,6 +702,8 @@ def do_inspect(args):
     finally:
         if handle:
             detach_image(handle, mnt)
+        if clone:
+            run([*SUDO, 'rm', '-f', clone], check=False)
         run([*SUDO, 'rmdir', mnt], check=False)
 
 

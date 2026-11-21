@@ -132,8 +132,21 @@ python3 tools/j7-root-extras.py inspect --path System/Library/ExtensionKit/Exten
 python3 tools/j7-root-extras.py inspect --path Applications/PaperBoard.app/PlugIns --glob '*.appex'
 ```
 
-`inspect` mounts `device/USERDATA-before.img` **read-only** (no `fsck`, no writes) and lists what is
+`inspect` mounts `device/USERDATA-before.img` **read-only** (no writes to it) and lists what is
 really in the root, so "is that extension on the phone?" is answered without a pull or a push.
+
+On macOS the first mount can be refused with
+
+```
+mount_hfs: Invalid argument
+```
+
+That is not a broken image: the volume comes off a phone partition that was never unmounted, so its
+journal is dirty, and hfs(5) cannot mount a dirty journal **read-only** (`early journal init: volume
+... is read-only and journal is dirty` → `hfs_mountfs returned error=22` = EINVAL). The tool then
+makes a throw-away copy next to the image (`device/USERDATA-before.img.look`, an APFS clone so it
+costs no space), runs `fsck_hfs -fy` on it and lists that. The pulled image is never repaired — it is
+the baseline the next `push` diffs against — and the copy is deleted when `inspect` exits.
 
 Do not write into that mount by hand, and do not copy files into it from Finder:
 
@@ -196,7 +209,9 @@ So, in order:
    `adb kill-server; export ADB_LIBUSB=1 LIBUSB=1; ADB_LIBUSB=1 adb start-server; adb devices`
    `adb kill-server` often answers `cannot connect to daemon at tcp:5037: Connection refused`
    when the server already died — that is the normal answer, there was nothing to kill; carry on.
-   The exports only last for that terminal, so the same shell has to run the tool.
+   The exports only last for that terminal, so the same shell has to run the tool. Put them in
+   `~/.zshrc` (`export ADB_LIBUSB=1`) and run `adb kill-server` once, if you would rather not repeat
+   the prefix on every call; that covers plain `adb devices` as well as this tool.
    (`LIBUSB=1` is the old name, harmless to set as well.) If the server is already running from a
    previous backend you must `adb kill-server` first — the variable only affects a fresh server.
 3. Confirm which backend the server actually picked: `adb server-status` prints `usb_backend:`

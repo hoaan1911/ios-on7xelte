@@ -879,3 +879,40 @@ Expected in the next log if the node was the problem: `SWEET FB: AppleCLCD 1080x
 `A5XELTE CLK: G3D 900 MHz -> M=900 P=13 S=1` and `G3D reads back … 900000 kHz`, `cpu_mhz=902`,
 and userland. If it is silent again the ADT is cleared and the next step is the panel handoff in
 `AppleCLCD::start` itself - the one function every failing boot dies inside.
+
+## 2026-11-21 — the /product node is not it: two images, two candidate causes
+
+The entry-only ADT (9,864 bytes, no `product`) booted exactly as silently as the 12,464-byte one,
+so the Apple node is ruled out. With the ADT and the cmdline back to the values every working boot
+used, the only remaining difference between the last boot that drew and these is the kernel:
+patches 0394-0399. Two kernels were built to split that range without another guess:
+
+**A - does the GPU write stop it?** Patch 0399 moved the CMU_G3D block out of the `j7clk` gate, so
+the 900 MHz PLL write now runs on every boot inside `AppleCLCD::start`, and it is the only clock
+*write* left in that path (the CPU block is skipped at `j7cpu=0`). 0374 read 900 MHz back once, but
+this tree never raises BUCK4 with it, so it is a higher clock at the bootloader's GPU voltage. That
+is testable with no rebuild: the same kernel with `j7gpuclk=0` in the cmdline skips the write and
+only logs the registers.
+
+- `artifacts/j7-boot-44915548052/j7-xnu-boot.img`, 16,672,784 bytes, sha256
+  `617fa1c16b851c1bb8298b0106a64de1b4706a01d94b1c833b15ce7223792d11`, sha1
+  `5d89758410ea7587f6089b05f43b726cf57738c8`, md5 `a0aca4c5d048fdf7e918de4a43c7f391`
+  (xnu run 44905960778 = 0394-0399, boot run 44915548052, `product_node=false`, cmdline as the
+  last boot plus `j7gpuclk=0`).
+
+**B - is it any of those patches at all?** The last kernel that drew anything was the 0393 series,
+so tag `j7-0393` points at that commit (`ad84bc6`) and it was rebuilt through today's workflow:
+`did not take the oscillator` and `did not move to the switch` are absent, `G3D reads back` is
+still there from 0374's gated block. Packed with the same ADT and cmdline as the last boot.
+
+- `artifacts/j7-boot-44916011653/j7-xnu-boot.img`, 16,672,784 bytes, sha256
+  `86138fe4e13d10831d3e1133e2d2ba3d2e5e284d86e56f4dcb7e6ddfa2151604`, sha1
+  `a5626d53e047d4fb7b6116e747dec66860e1dab6`, md5 `af58c4bfb11d159c77ba0b710af207b2`
+  (xnu run 44915658764 on tag `j7-0393`, boot run 44916011653).
+
+Decision tree, one flash at a time: **A boots** -> the 900 MHz GPU write is the killer, and 0399
+goes back behind a boot argument with the voltage raise as the next question. **A silent, B boots**
+-> the GPU is cleared and the difference left in that range is 0394, the row build that runs in
+`scaledCopy` on the first present. **Both silent** -> the regression is not in these patches, and
+the next thing to compare is the kernel build itself against the run that last drew. Neither image
+is flashed or booted here.

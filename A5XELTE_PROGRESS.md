@@ -724,3 +724,39 @@ have been reported incomplete on every run). `j7-root-extras.yml` packs the same
 Not verified: nothing has been pushed since, so "PaperBoard execs and the gallery lists posters" is
 still the expected result of the push, not an observation. `docs/j7-root-extras-push.md` has the
 three commands.
+
+## 2026-11-21 — the 38 MHz boot explained: OSCCLK, not the switch
+
+The 0380 boot that came up at 38 MHz is now fully explained by Samsung's own clock source, and the
+CPU can be raised properly. The vendor kernel (`drivers/soc/samsung/pwrcal/S5E7870`) has:
+
+    CLK_MUX(CPUCL0_MUX_CLK_CPUCL0, cpucl0_mux_clk_cpucl0_p, CLK_CON_MUX_CLK_CPUCL0, 12, 1, ...)
+    cpucl0_mux_clk_cpucl0_p[] = { CLK(CPUCL0_MUX_CPUCL0_PLL), CLK(CPUCL0_MUX_CLKCMU_CPUCL0_SWITCH_USER) };
+    cpucl0_mux_clkcmu_cpucl0_switch_user_p[] = { CLK(OSCCLK), CLK(MIF_GATE_CLKCMU_CPUCL0_SWITCH) };
+
+so +0x208 bit 12 does move ARMCLK to the switch — but only if the switch-source mux at **+0x204
+bit 12** has first selected the MIF switch (bit 27 = 0 takes it out of hardware control). 0380 never
+wrote +0x204, so the "switch" input was OSCCLK at 26 MHz; that is the 38 MHz.  Two further facts
+from `pwrcal-cmu.c` and `pwrcal-dfs.c`:
+
+- `pwrcal_mux_set_src()` waits for `status == (1 << src)`, i.e. **2** when selecting the switch and
+  **1** when selecting the PLL. 0380 waited for 1 both times, so it timed out after the move had
+  already happened and returned with the PLL never programmed.
+- the PLL write is more than M/P/S: `_clk_pll141xx_set_pms()` writes the lock time at +0x000 as
+  `P * 150`, clears bit 26 and sets bit 5 of PLL_CON0, and only polls the lock bit 29 when the
+  PLL is enabled.
+
+The CPU DFS table in `exynos7870.dtsi` (a6lte, same SoC) carries 1794 MHz at **900 mV**, the same
+voltage as the 902 MHz bootloader step, and `cl0_max_support_idx = 2` points at that row — so the
+top step needs no PMIC write, and 1794 is the ceiling rather than 1586. `asv` caps a non-fused part
+at 1586, so 1586 stays the fallback if 1794 does not lock. The table's divider members are not in
+the DFS table (it has switches and a PLL only), which is why ARMCLK is the PLL output and the
++0x400/+0x404 dividers are reported, not written.
+
+`xnu/patches/0395` implements exactly that sequence: gate and source mux, switch divider to its
+800 MHz step, ARMCLK onto the switch and status polled for 2, lock time + PLL_CON0 and polled for
+29, ARMCLK back and status polled for 1, source mux/divider/gate restored. A cluster whose switch
+never reports is untouched, and a PLL that never locks gets its old CON0 back and the cores
+returned to it, so the worst case is the 902 MHz the bootloader left. Expected in the next log:
+`A5XELTE CPU: CPUCL0 ... asked for 1794000` followed by `... -> 1794000 kHz`, and `cpu_mhz=1794` in
+the perf windows; the operating point is not verified until a boot log reports it.

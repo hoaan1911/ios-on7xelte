@@ -1,0 +1,241 @@
+From: j7
+Subject: j7: put both CPU clusters on the 1794 MHz DVFS step, the vendor way
+
+Every perf window measured cpu_mhz=900 and the panel row cost 50 ms to build, because the
+bootloader leaves both clusters at 902 MHz and this tree has no cpufreq driver, so nothing ever
+asks for more.  The cpufreq node of the vendor device tree carries 1794 MHz at the same 900 mV as
+902 and points cl0_max_support_idx at that row, so the top step needs no PMIC write.
+
+0380 tried to raise it and came up at 38 MHz for two reasons, both now visible in Samsung's
+pwrcal/S5E7870 source.  It never selected the MIF switch on the cluster's switch-source mux
+(+0x204 bit 12, bit 27 out of hardware control), so moving the cores "onto the switch" moved them
+onto OSCCLK at 26 MHz.  It also waited for the mux status to read 1, while the vendor waits for
+1 << src - 2 for the switch - so it timed out after the move had already happened and returned
+with the PLL never programmed.
+
+j7_cpu_clock() now does what dfs_trans_pre/dfs_transition/dfs_trans_post do: switch gate on and
+the MIF switch selected on the source mux, the switch divider set to its 800 MHz step, ARMCLK
+moved onto the switch and the +0x608 status polled for 2, the PLL lock time written as P * 150
+and PLL_CON0 programmed with M 276 / P 4 / S 0 plus the bits the vendor keeps (bit 5 set, bit 26
+clear, enable 31) and polled for locked 29, ARMCLK moved back and the status polled for 1, then
+the source mux, divider and gate restored.  A cluster that never reports the switch is left
+untouched, and a PLL that never locks gets its old CON0 back and the cores returned to it, so the
+worst case is the 902 MHz this boot started from.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -233,30 +233,79 @@
+ 
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ /*
+- * Read the CPU cluster clocks, and leave them alone.
++ * Raise both CPU clusters to the top step of the SoC's DVFS table.
+  *
+- * The Exynos7870 is rated 1586 MHz, this tree has no cpufreq driver, and the bootloader leaves
+- * both clusters at the 902 MHz operating point, so every perf window measured cpu_mhz=900.
+- * Reading the clock is safe:
++ * The cpufreq node of the vendor device tree carries 1794 MHz at the same 900 mV as the 902 MHz
++ * operating point the bootloader leaves both clusters at, and its cl0_max_support_idx points at
++ * that 1794 MHz row.  This tree has no cpufreq driver, so nothing ever asks for more and every
++ * perf window measured cpu_mhz=900 while the panel row cost 50 ms to build.
++ *
++ * The registers are the ones Samsung's own clock code (pwrcal/S5E7870) documents:
+  *   CMU_CPUCL0 0x10900000, CMU_CPUCL1 0x10800000
+- *     +0x100 PLL_CON0, M 16:25, P 8:13, S 0:2
+- *     +0x400/+0x404 the two ARMCLK dividers, bits 0:2, value + 1
++ *     +0x000 PLL lock time, written P * 150
++ *     +0x100 PLL_CON0, M 16:25, P 8:13, S 0:2, bit 5 set, bit 26 clear, enable 31, locked 29
++ *     +0x204 the switch source mux: bit 12 = 1 selects the MIF switch, bit 27 = 0 takes that
++ *             selection out of hardware control
++ *     +0x208 the ARMCLK mux, bit 12: 0 = the cluster PLL, 1 = the switch input
++ *     +0x608 its status, bits 12:13, which reads 1 << the value written (2 for the switch)
++ *   CMU_MIF 0x10460000
++ *     +0x858/+0x85c the switch gate for cluster 0/1, bit 0
++ *     +0x458/+0x45c the switch divider, bits 0:1; 0 is the switch table's 800 MHz step
++ *
++ * 0380 died at 38 MHz because of two mistakes.  It never selected the MIF switch on the source
++ * mux at +0x204, so moving the cores "onto the switch" moved them onto OSCCLK, 26 MHz.  And it
++ * waited for the status to read 1, while the vendor code waits for 1 where the value was 1 and
++ * 2 where it was 2 - 1 << src - so it decided the move had failed and returned while the cores
++ * really were on the oscillator branch.  The PLL was never programmed, and every store and every
++ * timing loop then ran at standby clock.
+  *
+- * Writing it is not, and 0380 found out how not.  A PLL cannot be reprogrammed while the cores
+- * run from it, so the cores have to be moved off it first - and the switch gate and divider this
+- * tree believed were at CMU_MIF +0x858/+0x458 are not where they are.  The boot after that patch
+- * logged "CPUCL0 did not leave the PLL, left alone" and then the perf window reported
+- * cpu_mhz=38: 2.4 s per frame, half a minute per touch.  That number comes from j7m_cpu_mhz(),
+- * a timing loop, so the machine really was running at 38 MHz - far worse than the 902 MHz the
+- * bootloader leaves.  Until the vendor pwrcal sequence is confirmed, read and report only.
++ * The sequence is the vendor DFS one: enable the switch gate and select it on the source mux,
++ * set the switch divider to its 800 MHz step, move ARMCLK onto the switch and wait for the
++ * status, program the PLL and its lock time and poll for lock, move ARMCLK back and wait, then
++ * put the switch source back the way it was.  A cluster whose switch never reports is left
++ * untouched; a PLL that never locks gets the old value back and the cores are returned to it,
++ * so the worst case is the 902 MHz operating point this boot started from.
+  */
++static bool
++j7_cpu_pll(unsigned khz, uint32_t *m_out)
++{
++	/* 26 MHz * M / (P << S) with the vendor's P = 4, S = 0 rows: 244 is 1586, 276 is 1794. */
++	const uint32_t m = (uint32_t)((uint64_t)khz * 4u / 26000u);
++	const uint64_t got = 26000ULL * m / 4u;
++
++	if (m < 64u || m > 0x3ffu || got + 1000u < khz || got > khz + 1000u) {
++		return false;
++	}
++	*m_out = m;
++	return true;
++}
++
+ static void
+ j7_cpu_clock(unsigned khz)
+ {
+-	static const struct { uint64_t cmu; const char *name; } cpu[] = {
+-		{ 0x10900000ULL, "CPUCL0" },
+-		{ 0x10800000ULL, "CPUCL1" },
++	static const struct {
++		uint64_t cmu;
++		const char *name;
++		uint32_t gate, swdiv;
++	} cpu[] = {
++		{ 0x10900000ULL, "CPUCL0", 0x858u, 0x458u },
++		{ 0x10800000ULL, "CPUCL1", 0x85cu, 0x45cu },
+ 	};
++	uint32_t m;
++
++	if (!j7_cpu_pll(khz, &m)) {
++		IOLog("A5XELTE CPU: %u kHz is not a step this PLL makes\n", khz);
++		return;
++	}
++	IOMemoryDescriptor *mifDesc = IOMemoryDescriptor::withPhysicalAddress(
++	    0x10460000ULL, 0x1000, kIODirectionNone);
++	IOMemoryMap *mifMap = mifDesc != NULL ? mifDesc->map(kIOMapInhibitCache) : NULL;
++	if (mifMap == NULL) {
++		IOLog("A5XELTE CPU: no CMU_MIF map\n");
++		OSSafeReleaseNULL(mifDesc);
++		return;
++	}
++	volatile uint32_t *mif = (volatile uint32_t *)mifMap->getVirtualAddress();
+ 	for (unsigned i = 0; i < sizeof(cpu) / sizeof(cpu[0]); i++) {
+ 		IOMemoryDescriptor *desc = IOMemoryDescriptor::withPhysicalAddress(
+ 		    cpu[i].cmu, 0x1000, kIODirectionNone);
+@@ -272,11 +321,101 @@
+ 		const uint64_t pll = (cp != 0 && cs < 7) ? 26000ULL * cm / ((uint64_t)cp << cs) : 0;
+ 		const uint32_t d1 = c[0x400 / 4] & 7u, d2 = c[0x404 / 4] & 7u;
+ 		const uint64_t arm = pll / ((uint64_t)(d1 + 1) * (uint64_t)(d2 + 1));
+-		IOLog("A5XELTE CPU: %s PLL_CON0=%08x M=%u P=%u S=%u -> %llu kHz, div %u/%u -> %llu kHz, left as the bootloader set it (asked for %u)\n",
+-		    cpu[i].name, con0, cm, cp, cs, pll, d1, d2, arm, khz);
++		const uint32_t umux0 = c[0x204 / 4], mux0 = c[0x208 / 4];
++		const uint32_t gate0 = mif[cpu[i].gate / 4], swdiv0 = mif[cpu[i].swdiv / 4];
++		unsigned n;
++		bool switched = false, locked = false;
++
++		IOLog("A5XELTE CPU: %s PLL_CON0=%08x M=%u P=%u S=%u -> %llu kHz, div %u/%u -> %llu kHz, mux %u, asked for %u\n",
++		    cpu[i].name, con0, cm, cp, cs, pll, d1, d2, arm, (mux0 >> 12) & 3u, khz);
++		if (arm >= khz) {
++			IOLog("A5XELTE CPU: %s is already at %llu kHz\n", cpu[i].name, arm);
++			OSSafeReleaseNULL(map);
++			OSSafeReleaseNULL(desc);
++			continue;
++		}
++		/* Switch source: gate on, the MIF switch on the source mux, the 800 MHz step. */
++		mif[cpu[i].gate / 4] = gate0 | 1u;
++		c[0x204 / 4] = (c[0x204 / 4] | (1u << 12)) & ~(1u << 27);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		IOSleep(1);
++		mif[cpu[i].swdiv / 4] = swdiv0 & ~3u;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		IOSleep(1);
++		/* ARMCLK onto the switch: bit 12 set, status reads 2. */
++		c[0x208 / 4] = (mux0 & ~(1u << 12)) | (1u << 12);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (n = 0; n < 100; n++) {
++			if (((c[0x608 / 4] >> 12) & 3u) == 2u) {
++				switched = true;
++				break;
++			}
++			IOSleep(1);
++		}
++		if (!switched) {
++			IOLog("A5XELTE CPU: %s did not move to the switch (status %08x), left alone\n",
++			    cpu[i].name, c[0x608 / 4]);
++			c[0x204 / 4] = umux0;
++			mif[cpu[i].swdiv / 4] = swdiv0;
++			mif[cpu[i].gate / 4] = gate0;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			OSSafeReleaseNULL(map);
++			OSSafeReleaseNULL(desc);
++			continue;
++		}
++		/* PLL: its lock time, then M/P/S with the bits the vendor code keeps set and clear. */
++		c[0x000 / 4] = 4u * 150u;
++		c[0x100 / 4] = (con0 & ~0x03ff3f07u & ~(1u << 26)) |
++		    (1u << 31) | (1u << 5) | (m << 16) | (4u << 8);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (n = 0; n < 100; n++) {
++			if (c[0x100 / 4] & (1u << 29)) {
++				locked = true;
++				break;
++			}
++			IOSleep(1);
++		}
++		if (!locked) {
++			IOLog("A5XELTE CPU: %s PLL never locked at %u kHz (%08x), putting the old one back\n",
++			    cpu[i].name, khz, c[0x100 / 4]);
++			c[0x100 / 4] = con0;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			for (n = 0; n < 100; n++) {
++				if (c[0x100 / 4] & (1u << 29)) {
++					break;
++				}
++				IOSleep(1);
++			}
++		}
++		/* ARMCLK back to the PLL: bit 12 clear, status reads 1. */
++		c[0x208 / 4] = mux0 & ~(1u << 12);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (n = 0; n < 100; n++) {
++			if (((c[0x608 / 4] >> 12) & 3u) == 1u) {
++				break;
++			}
++			IOSleep(1);
++		}
++		/* Switch source back: hardware control, the divider and gate the bootloader had. */
++		c[0x204 / 4] = umux0;
++		mif[cpu[i].swdiv / 4] = swdiv0;
++		mif[cpu[i].gate / 4] = gate0;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		{
++			const uint32_t run = c[0x100 / 4];
++			const uint32_t rm = (run >> 16) & 0x3ffu, rp = (run >> 8) & 0x3fu,
++			    rs = run & 7u;
++			const uint64_t now = (rp != 0 && rs < 7)
++			    ? 26000ULL * rm / ((uint64_t)rp << rs) : 0;
++			IOLog("A5XELTE CPU: %s on PLL_CON0=%08x, mux %u -> %llu kHz%s\n",
++			    cpu[i].name, run, (c[0x608 / 4] >> 12) & 3u, now,
++			    locked ? "" : " (old rate)");
++		}
+ 		OSSafeReleaseNULL(map);
+ 		OSSafeReleaseNULL(desc);
+ 	}
++	OSSafeReleaseNULL(mifMap);
++	OSSafeReleaseNULL(mifDesc);
+ }
+ #endif
+ 
+@@ -600,9 +739,9 @@
+ 		}
+ 	}
+ 	{
+-		/* j7cpu=<kHz> is only reported.  The clock is not written: the switch away from
+-		 * the PLL is not at the offsets this tree used and the attempt left the whole
+-		 * machine at 38 MHz (see j7_cpu_clock).  A small value is MHz. */
++		/* j7cpu=<kHz> raises both clusters to that top DVFS step; the vendor table's
++		 * cl0_max_support_idx row is 1794 MHz, and 0 keeps the bootloader's 902 MHz.
++		 * A small value is MHz. */
+ 		int cpu = 1794;
+ 		PE_parse_boot_argn("j7cpu", &cpu, sizeof(cpu));
+ 		if (cpu > 0 && cpu < 100000) {

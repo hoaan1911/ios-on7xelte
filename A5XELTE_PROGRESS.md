@@ -916,3 +916,55 @@ goes back behind a boot argument with the voltage raise as the next question. **
 `scaledCopy` on the first present. **Both silent** -> the regression is not in these patches, and
 the next thing to compare is the kernel build itself against the run that last drew. Neither image
 is flashed or booted here.
+
+## 2026-11-21 — both bisect images silent: the cmdline lost its second half
+
+Both A and B came up black with no log, and image B was the 0393 kernel rebuilt, which cleared the
+patches. The cause is in the images, not in the phone, not in macOS and not in the kernel: every
+image from `44879118860` onward was packed with a **188-character** boot argument string instead of
+the 522-character one every booting image used. The payload's `cmdline[608]` is where this is filed:
+
+    44678509937 (booting, 2026-11-20)  530 chars
+    44879118860 / 44902100379 / 44906332073 / 44911576305 / 44915548052 / 44916011653  188-199 chars
+
+The truncated string stops after `sweetfb_lh=1334` and drops exactly the switches that make a boot
+visible:
+
+    rd=emmcroot0 emmcroot=USERDATA emmcwrite=1 a5log=1 rootrw=1 a5fb_noconsole=1
+    cs_enforcement_disable=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1
+    wdt=-1 -wdt_no_pmu wdt_test=no_user_checkin j7nospawn=bluetoothd,fairplayd.H2
+    j7clk=1 j7gpuclk=900 j7fb_flip=1 j7cpu=1794
+
+Without `a5log=1` nothing writes the persistent log, so "no log" was literal and not a hang in the
+logger; without `rd=emmcroot0` there is no root device and no `ignition`; with the watchdog left on
+(`wdt=-1 -wdt_no_pmu` gone) the boot is reset instead of dying where it was; `a5fb_noconsole=1` and
+`j7fb_flip=1` are gone too, so the panel is never handed over. A boot with those missing can produce
+exactly what was reported: black, silent, no new log, every time, with any kernel.
+
+**Not macOS.** The two kernel builds that straddle the change ran on the same image and toolchain:
+`44574976269` (booting) and `44677377375` (first silent) both print `ProductVersion: 15.8.2`,
+`BuildVersion: 24H232`, `Xcode 16.0`, `MacOSX15.0.sdk`, and neither log shows a runner update. The
+`__TEXT` segment did shrink by 507,904 bytes between the two, but that is 0392 removing the embedded
+wallpaper picture and is harmless: the smaller `__TEXT` is the one that booted on 2026-11-20.
+
+The fix is a repack, no kernel change:
+
+- `artifacts/j7-boot-44928291250/j7-xnu-boot.img`, 16,672,784 bytes, sha256
+  `b052b9fdd3282cd377b3b90faac8cc5ee2b645ce1e3472f0f65b63ecf9165ccf`, sha1
+  `611c8e07dfbdfddf8131b7f564dc511c05b83b81`, md5 `55fe0dd50167c15702f29f3d69ceabee`
+  (xnu run 44905960778 = 0394-0399, boot run 44928291250, entry-only 9,864-byte ADT,
+  `product_node=false`). Its ten kernel segments hash identically to image A, so this is A's kernel
+  with the working cmdline.
+
+The two unproven clock writes stay off while the boot is being re-established: `j7cpu=0` keeps
+0395's OSCCLK sequence behind its `if (cpu > 0 && cpu < 100000)` gate and `j7gpuclk=0` keeps 0399's
+CMU_G3D block to the readback. `j7clk=1` is kept because the G3D block is outside that gate now and
+the log line is the evidence for the next step.
+
+Exact dispatch, copied so it is not retyped shortened:
+
+    gh workflow run j7-boot.yml --ref main -f kernel_run_id=44905960778 -f board=d21ap \
+      -f ios_version=16.7.16 -f iphone8=false -f product_node=false -f cmdline='debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress j7hw=1 j7gpu=7 sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib,SWEET_TRACE=0 rd=emmcroot0 emmcroot=USERDATA emmcwrite=1 a5log=1 rootrw=1 a5fb_noconsole=1 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt=-1 -wdt_no_pmu wdt_test=no_user_checkin j7nospawn=bluetoothd,fairplayd.H2 j7clk=1 j7gpuclk=0 j7fb_flip=1 j7cpu=0 sweetfb_scale=1 sweetfb_lw=750 sweetfb_lh=1334'
+
+Before flashing any image, read its payload at `0x48` and check that `a5log=1`, `rd=emmcroot0` and
+`wdt=-1` are in it. Nothing was flashed or booted here.

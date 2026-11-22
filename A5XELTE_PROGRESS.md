@@ -1117,3 +1117,55 @@ That image is `artifacts/j7-boot-45006943434/j7-xnu-boot.img` - 16,672,784 bytes
 45006156845 (0394-0400, the run log lists 0400 among the patches) and boot run 45006943434.
 ADT 9,864 bytes, canvas 750x1334 / display-scale 2, cmdline 480 chars: the same one as the
 lock-screen boot with `j7gpuclk=900` in place of `j7gpuclk=0`, one `sweetfb_scale/lw/lh` tail.
+
+## 2026-11-22 — the 900 MHz GPU image boots black, and 0400 never reached the kernel
+
+`j7-xnu-boot.img` from boot run 45006943434 was flashed and the phone stayed black: no first logo,
+no second logo, no lock screen. The captured log is 140,680 bytes and it is **not** a broken boot —
+the system is up and interactive on a panel that is being fed black:
+
+- `A5XELTE CLK: G3D 900 MHz -> M=900 P=13 S=1 CON0 a1570d01 -> a3840d01 (VCO 1800000 kHz)` then
+  `G3D reads back a3840d01 -> 900000 kHz`. The raise took effect, on every boot, as 0399 intended.
+- `8/8 CPUs`, `A5XELTE FB: double buffer on, scanout 0x87b88000 and 0x88518000`, DECON
+  `WINCON0=0001e001`, `SWEET FB: AppleCLCD ... presented as 750x1334`.
+- `exec backboardd` -> `SWEET SURF: backboardd create id 3 750x1334`, swaps 1-11, then
+  `exec SpringBoard` -> `SWEET SURF: SpringBoard create id 4 184x124` and `SpringBoard trap 0`.
+- `SWEET FB: display on` / `display off` both appear, and the tail of the log is the user pressing
+  the power key and touching the panel: the phone is alive, only the picture is missing.
+- The one damning line: `A5XELTE FB: frames=3 elapsed_ms=450605 fps=0.0 bytes=0` — seven and a half
+  minutes in which backboardd posted three swaps with **no bytes to copy**, i.e. the client's
+  surface is empty. The kernel keeps copying to the panel; the content never arrives.
+
+### The single variable was the GPU clock
+
+0400 was in the tree but the build log says it was skipped:
+
+    [warning] Skipping patch .../0400-j7-ask-the-gauge-where-the-bus-map-says-it-is.patch ...
+    error: patch failed: bsd/dev/a5xelte_battery.c
+
+and the log proves it, because the scan printed the old table again (`0x13830000`-`0x13850000`
+as S3C, `0x13860000`-`0x13890000` as hsi2c, no `0x10510000`). 0400 had asked to add
+`fg_addr << 1` to the S3C path, which 0391 already did, so the first hunk failed and `patch`
+dropped the patch whole. The kernel in `45006943434` is therefore 0394-0399, byte for byte the one
+that reached the lock screen, and the only difference from that boot is one boot argument:
+`j7gpuclk=900` instead of `j7gpuclk=0`.
+
+So the ARM's 900 MHz is fine and the G3D raise at 343 -> 900 is what kills the picture. The write
+happens in `AppleCLCD::start`, *after* `A5XELTEGPU` has already brought the GPU out of reset and
+run its job tests, so it is a live clock change to a running Mali block at the bootloader's 343 MHz
+voltage. Samsung's own 7870 GPU table (a6lte `gpu_cooling_table`) lists the real operating points:
+1001000, 845000, 728000, 545000, 343000 — 900 is not one of them, and the top two need the G3D
+buck raised with them. Frequency alone is not enough on this part; the rail is set by the PMIC on
+hsi2c0, which is the same bus the gauge needs.
+
+### This image
+
+- `xnu/patches/0400-...patch` rewritten against the tree as it really is: the address-form hunk is
+  gone (0391 owns it), only the bus table remains. Validated with `patch -p1 --dry-run` against the
+  `a5xelte_battery.c` from xnu run 45006156845's `xnu-peek` artifact, and applied for real to that
+  copy to confirm the result is the table 0400 describes.
+- Next boot: patches 0394-0400, the same ADT/board, `j7gpuclk=0` restored, so the display comes
+  back and the one new thing in the kernel is the gauge bus table. CPU clock untouched.
+- GPU speed is not abandoned, it moves: raise 343 -> 845/1001 MHz *before* `A5XELTEGPU` starts
+  (which is where the GPU is reset anyway), and only with the G3D buck set to the matching step.
+  That needs the PMIC path 0400 is opening.

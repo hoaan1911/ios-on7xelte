@@ -1,0 +1,88 @@
+From: j7
+Subject: j7: leave the GPU-only buffers out of the cache passes, and time them for real
+
+j7m_cache() walked every mapped buffer object at each submit and each wait, tens of MiB of
+them (the 32 MiB tiler heap alone) at about forty submits a second, whether or not the CPU
+had ever touched a byte.  A client can now mark a BO GPU-only (new selector 20), and
+j7m_cache() skips it; the map selector flushes a freshly mapped BO once, so the dirty lines
+the CPU left behind go into memory before the GPU starts writing there.
+
+The timing counters the framebuffer prints were always 0: CNTFRQ_EL0 reads 0 on this phone
+because S-Boot never sets it, so j7m_now_us() returned 0 before dividing.  Use the ADT's
+26 MHz timebase instead, which is the rate CNTVCT_EL0 counts at here.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -50,7 +50,8 @@
+     __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
+     __asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r"(count));
+     if (freq == 0) {
+-        return 0;
++        freq = 26000000u;   /* CNTFRQ_EL0 is 0 here (S-Boot never sets it): the ADT's 26 MHz
++                             * timebase, the rate the rest of the platform counts at */
+     }
+     return count / (freq / 1000000u);
+ }
+@@ -435,6 +436,7 @@
+     uint64_t start;                 /* va + the client's offset into the first page */
+     uint64_t size;
+     bool used;
++    bool gpuOnly;                   /* the CPU never touches it: left out of the cache passes (selector 20) */
+     uint64_t *pas;                  /* one PA per page, cached at map time: the submit check never
+                                      * has to ask the memory descriptor again */
+ };
+@@ -1703,6 +1705,7 @@
+     bo->start = va;
+     bo->size = size;
+     bo->used = true;
++    bo->gpuOnly = false;
+     bo->pas = pas;
+     j7m_note('m', static_cast<unsigned>(bo - gJ7M.bos) + 1, va, size);
+     j7m_map_verify(bo);
+@@ -1715,7 +1718,7 @@
+ {
+     for (unsigned i = 0; i < J7M_MAX_BOS; i++) {
+         struct J7MaliBo &b = gJ7M.bos[i];
+-        if (!b.used) {
++        if (!b.used || b.gpuOnly) {
+             continue;
+         }
+         IOMemoryDescriptor *d = b.umd ? b.umd : static_cast<IOMemoryDescriptor *>(b.md);
+@@ -1836,6 +1839,10 @@
+                 break;
+             }
+             bo->start = bo->va + (addr - base);
++            /* The CPU has just written this memory through its cache. Put it into DRAM once,
++             * now: a GPU-only BO (selector 20) is left out of the cache passes afterwards, and a
++             * dirty line evicted later would overwrite what the GPU wrote. */
++            md->performOperation(kIOMemoryIncoherentIOFlush, 0, end - base);
+             {
+                 static unsigned mapped;
+                 if (mapped++ < J7M_VERIFY_LOG) {
+@@ -1961,6 +1968,24 @@
+             ret = kIOReturnSuccess;
+         }
+         break;
++    case 20:    /* cache policy: in (gpu va, gpu_only 0/1). Every submit and every wait walked the
++                 * cache of every mapped BO, tens of MiB of them (the 32 MiB tiler heap alone)
++                 * however little the CPU had touched; a BO the CPU never maps (Mesa's INVISIBLE
++                 * ones: heap, polygon list, GPU-only targets) is left out. The client says 0 again
++                 * when it first maps one. */
++        ret = kIOReturnBadArgument;
++        if (args->scalarInputCount == 2) {
++            ret = kIOReturnNotFound;
++            for (unsigned i = 0; i < J7M_MAX_BOS; i++) {
++                if (gJ7M.bos[i].used && gJ7M.bos[i].owner == this &&
++                    gJ7M.bos[i].start == args->scalarInput[0]) {
++                    gJ7M.bos[i].gpuOnly = args->scalarInput[1] != 0;
++                    ret = kIOReturnSuccess;
++                    break;
++                }
++            }
++        }
++        break;
+     case 4:     /* info: out (gpu id, shader/tiler/L2 present, JS present, AS present) */
+         if (args->scalarOutputCount >= 6) {
+             args->scalarOutput[0] = gJ7MGpuId;

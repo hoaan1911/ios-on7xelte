@@ -1181,3 +1181,41 @@ tail - the same string the lock-screen boot used. What to look for in the next l
 `A5XELTE FG: nothing on 0x10510000 ...` or, if the PMIC bus answers, a
 `gauge on 0x10510000 (hsi2c) at 0x.., RSOC=..` line and a `SWEET BATTERY` that is no longer the
 static 100%.
+
+## 2026-11-22 — the GPU cache passes can skip the buffers the CPU never touches (0401)
+
+A different assistant proposed a GPU speed patch in plain text instead of a `.patch` file; it is
+now `xnu/patches/0401-j7-leave-gpu-only-buffers-out-of-the-cache-passes.patch`, regenerated from
+`iokit/Kernel/arm/A5XELTEGPU.cpp` as the tree actually has it (the text patch's first hunk also
+carried a `bo->md = NULL` context the real file does not have at that spot, so it would not have
+applied). `patch -p1 --dry-run` and a real apply against the `xnu-peek` copy succeed, and the
+applied result was diffed against the intended file.
+
+What it changes:
+
+- `j7m_now_us()` used to return 0 when `CNTFRQ_EL0` reads 0, which is what S-Boot leaves here, so
+  the `store_us`/`flush_us`/`wait_us` counters in the framebuffer's perf line were always 0 and the
+  cache-pass cost was never measured. 0401 falls back to the ADT's 26 MHz timebase, which is the
+  rate `CNTVCT_EL0` counts at on this SoC.
+- `struct J7MaliBo` grows a `gpuOnly` flag, and `j7m_cache()` skips those BOs at submit and wait
+  instead of running a cache operation over their whole length. A new user-client **selector 20**
+  (`in: gpu va, 0/1`) sets it for a BO the CPU never maps — Mesa's `INVISIBLE` heap, polygon list
+  and GPU-only targets.
+- The map selector (case 0) flushes each freshly mapped BO once, so the dirty lines the CPU left
+  behind reach DRAM before the GPU writes there and before the BO can drop out of later passes.
+
+Two limits worth stating before a boot is spent on it:
+
+- Selector 20 only finds BOs with `owner == this`, i.e. client memory. The 32 MiB tiler heap and
+  the other kernel-allocated BOs have `owner = NULL` and stay in the cache passes; if that is where
+  the cost is, they need to be marked at allocation instead.
+- Nothing in this tree sends selector 20 yet: the client is `sweetgl.dylib`
+  (`tools/sweetgl-mali/sweet_drm_mali.c`), built by the separate `mesa-build` workflow, not part of
+  a boot image. Until the user-space half sends it, 0401 only makes the timing counters real.
+
+Also: `j7m_cache()` runs on `kIOMemoryIncoherentIOStore` at submit and the matching flush at wait,
+so a wrong `gpuOnly` on a BO the CPU does write turns into stale GPU reads, not a panic. The flag is
+cleared on unmap (`bzero(bo, ...)` in `j7m_bo_free`) and set to 0 by every map.
+
+The image for this is boot run 45057155792 with `j7gpuclk=0` and the same cmdline as the lock-screen
+boot, so the display stays up and the only new kernel code is 0401.

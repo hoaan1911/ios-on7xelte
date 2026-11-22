@@ -1111,3 +1111,9 @@ value there, so the S3C path has been addressing `0x3b` instead of `0x76`), `HSI
 clocked and pinmuxed.
 
 Next image: patches 0394-0400, same ADT and board, cmdline as above with `j7gpuclk=900`.
+
+That image is `artifacts/j7-boot-45006943434/j7-xnu-boot.img` - 16,672,784 bytes, sha256
+`f639e6a26cc6f4b411fc27f04fca3e021f3ed9fc4583f67cd604799f55b3873e`, built from xnu run
+45006156845 (0394-0400, the run log lists 0400 among the patches) and boot run 45006943434.
+ADT 9,864 bytes, canvas 750x1334 / display-scale 2, cmdline 480 chars: the same one as the
+lock-screen boot with `j7gpuclk=900` in place of `j7gpuclk=0`, one `sweetfb_scale/lw/lh` tail.

@@ -1217,5 +1217,11 @@ Also: `j7m_cache()` runs on `kIOMemoryIncoherentIOStore` at submit and the match
 so a wrong `gpuOnly` on a BO the CPU does write turns into stale GPU reads, not a panic. The flag is
 cleared on unmap (`bzero(bo, ...)` in `j7m_bo_free`) and set to 0 by every map.
 
-The image for this is boot run 45057155792 with `j7gpuclk=0` and the same cmdline as the lock-screen
-boot, so the display stays up and the only new kernel code is 0401.
+That image is `artifacts/j7-boot-45044194430/j7-xnu-boot.img` - 16,672,784 bytes, sha256
+`e0a835f8a2d0ad34d68c30cf9343eb6d2067ddde316f9b3927b3876186d9fb29`, built from xnu run
+45043321404 (its `xnu-peek` carries `case 20` at line 1971, `gpuOnly` in `j7m_cache` and
+`26000000u` in `j7m_now_us`, and `skipped-patches.txt` lists only the four donor patches) and boot
+run 45044194430. Cmdline is the lock-screen string with `j7gpuclk=0`, `j7cpu=0`, `j7clk=1`, so the
+display comes back and the only new kernel code is 0401; payload sha256
+`b0e8853b6409896b008371b6cc09f1d4326284fdbedc0c32c8f6649e5929b8a9` (the previous image's was
+`0370702...`).

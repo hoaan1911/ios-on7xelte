@@ -1169,3 +1169,15 @@ hsi2c0, which is the same bus the gauge needs.
 - GPU speed is not abandoned, it moves: raise 343 -> 845/1001 MHz *before* `A5XELTEGPU` starts
   (which is where the GPU is reset anyway), and only with the G3D buck set to the matching step.
   That needs the PMIC path 0400 is opening.
+
+That image is `artifacts/j7-boot-45037628074/j7-xnu-boot.img` - 16,672,784 bytes, sha256
+`5dc4703ea18e8cdf8a92efbfca39d018d76daf9a674486deb2d0fa8b84d295e4`, built from xnu run
+45036778529 (the run's `xnu-peek` artifact carries the new table at `0x10510000`/`0x138f0000` and
+`skipped-patches.txt` no longer lists 0400) and boot run 45037628074.
+
+ADT 9,864 bytes and, apart from mkadt's 64-byte random seed, byte-identical to the lock-screen
+image's ADT; cmdline 478 chars with `j7gpuclk=0`, `j7cpu=0`, `j7clk=1` and one `sweetfb_scale/lw/lh`
+tail - the same string the lock-screen boot used. What to look for in the next log:
+`A5XELTE FG: nothing on 0x10510000 ...` or, if the PMIC bus answers, a
+`gauge on 0x10510000 (hsi2c) at 0x.., RSOC=..` line and a `SWEET BATTERY` that is no longer the
+static 100%.

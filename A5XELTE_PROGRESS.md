@@ -968,3 +968,60 @@ Exact dispatch, copied so it is not retyped shortened:
 
 Before flashing any image, read its payload at `0x48` and check that `a5log=1`, `rd=emmcroot0` and
 `wdt=-1` are in it. Nothing was flashed or booted here.
+
+## 2026-11-22 — it was never the kernel: the ADT canvas stopped matching the boot args
+
+The corrected cmdline was flashed and the phone was still black with no new log, so the truncation
+was only half the story. Two things came out of comparing the artifacts instead of guessing.
+
+**The kernel has never been shown to be at fault.** The image that booted on 2026-11-20,
+`44678509937`, was repacked here from the three candidate kernel artifacts with `tools/mkpayload.py`
+and its ten segments hash **identically** to run `44677377375` - the run the earlier notes called
+"the first silent kernel". Same bytes, one booted and one did not, so nothing about 0392, 0393 or
+the toolchain is implicated by that comparison.
+
+**The ADT canvas changed at `44906332073` and never came back.** Every boot image that ever drew a
+frame carries `disp0/canvas-width 750`, `canvas-height 1334`, `chosen/display-scale 2` - the iPhone 8
+internal canvas, from `-f iphone8=true`. From `44906332073` onward every image was dispatched with
+`iphone8=false`, so `mkadt_j7prime.py` wrote the native panel instead:
+
+    44678509937 (booted)   ADT 9,864   canvas 750x1334   scale 2
+    44879118860            ADT 12,464  canvas 750x1334   scale 2   188-char cmdline
+    44902100379            ADT 12,464  canvas 750x1334   scale 2   188-char cmdline
+    44906332073            ADT 12,464  canvas 1080x1920  scale 3   188-char cmdline
+    44911576305            ADT  9,864  canvas 1080x1920  scale 3   188-char cmdline
+    44915548052            ADT  9,864  canvas 1080x1920  scale 3   199-char cmdline
+    44916011653            ADT  9,864  canvas 1080x1920  scale 3   188-char cmdline
+    44928291250            ADT  9,864  canvas 1080x1920  scale 3   478-char cmdline
+
+Every one of those images still carried `sweetfb_scale=1 sweetfb_lw=750 sweetfb_lh=1334` in the boot
+args, because that tail was typed into the `cmdline` input as well as appended by `iphone8`. The
+kernel was therefore told to render and scale a 750x1334 canvas while the device tree it reads
+described a 1080x1920 one. The two numbers the framebuffer derives its geometry from disagreed, and
+`AppleCLCD::start` is where the phone died - before the logo and before the ring is flushed, which
+is exactly the reported symptom: black frame and yesterday's log. `44928291250` is the first image
+to carry a correct cmdline *and* the mismatched canvas, which is why fixing the cmdline alone changed
+nothing.
+
+Nothing else moved: `shim/`, `tools/mkpayload.py`, `tools/mkadt_j7prime.py`, `tools/mkj7img.py` and
+`device/` are unchanged since `ad84bc6` (the commit the booting image was built from), and
+`xnu/patches/` only gained 0394-0399 (+783 lines, no deletions).
+
+Rebuilt as a single variable against the flash that just failed - the same kernel segments, the same
+478-char cmdline, only the canvas restored to the one every working boot used:
+
+- `artifacts/j7-boot-44994592514/j7-xnu-boot.img`, 16,672,784 bytes, sha256
+  `b58ac11608de48bf205f5742d3ef9f794c92a3b8be6e168baaf08eee66a97b44`
+  (xnu run 44905960778 = 0394-0399, boot run 44994592514, `board=d21ap`, `iphone8=true`,
+  `product_node=false`; ADT 9,864 bytes, canvas 750x1334, display-scale 2; cmdline 478 chars with
+  `a5log=1`, `rd=emmcroot0`, `emmcroot=USERDATA`, `wdt=-1 -wdt_no_pmu`, `a5fb_noconsole=1`,
+  `j7fb_flip=1`, `j7clk=1`, `j7cpu=0`, `j7gpuclk=0` and one `sweetfb_scale/lw/lh` tail).
+
+If it boots: the canvas was the whole black-screen cause, the clock work was never the problem, and
+`j7gpuclk=900` becomes the next single variable. If it is still silent, the only difference left
+against a booting image is the kernel, and `j7-0394` (tag at `bf85592`, xnu run 44994311506) is
+building a 0394-only kernel to split that range - pack it with the same `iphone8=true` dispatch.
+
+Rule for the next dispatch: the ADT canvas and the `sweetfb_*` boot args are one setting. Either
+`-f iphone8=true` and no `sweetfb_*` in the `cmdline` input, or `-f iphone8=false` and no
+`sweetfb_*` tail at all. Never one without the other.

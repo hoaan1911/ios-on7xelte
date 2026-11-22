@@ -1,0 +1,72 @@
+From: j7
+Subject: j7: ask the gauge on the buses the SoC actually has, at 7-bit addresses
+
+The boot log now reaches the lock screen, so this is the last unverified block on the phone,
+and the scan it prints says the scan itself was asking in the wrong places:
+
+    A5XELTE FG: nothing on 0x13830000, stat=0xf0 con=0xe3
+    A5XELTE FG: nothing on 0x13840000, stat=0xf0 con=0xe3
+    A5XELTE FG: nothing on 0x13850000, stat=0xf0 con=0xe3
+    A5XELTE FG: nothing on 0x13860000 (hsi2c), istat=0 ts=0 ctl=0x9
+    ...
+    A5XELTE FG: nothing on 0x138c0000 (hsi2c), istat=0 ts=0x2000c ctl=0
+
+Two mistakes are visible in those lines.
+
+**The bus table mixes the two I2C blocks this SoC has.**  Per the Exynos 7870 device tree,
+`0x13830000`-`0x13890000` are the six S3C2440 controllers (i2c0-i2c5), `0x138a0000`-`0x138c0000`
+are hsi2c1-hsi2c3, `0x138d0000`/`0x138e0000` are i2c7/i2c8, `0x138f0000`/`0x13950000`/`0x13960000`
+are hsi2c4-hsi2c6, and **hsi2c0 - the controller the PMIC sits on - is `0x10510000`, in the MIF
+domain, and was never probed at all.**  The table had 0x13860000-0x13890000 marked as high-speed
+controllers and never asked 0x10510000, 0x138f0000, 0x13950000 or 0x13960000, so four of the
+seven high-speed controllers and the one bus the bootloader has certainly left running were
+missing, and four S3C controllers were driven through the high-speed register map (which is why
+they read back the `ctl=0x9` that was written to IICCON).
+
+**The address went out 7-bit on both paths.**  0393 moved the table to 7-bit values (0x3b, 0x36,
+0x33) because that is what HSI2C_ADDR wants, but the S3C path still writes the byte straight into
+IICDS, which wants the 8-bit form: it has been addressing 0x3b instead of 0x76 since then, on
+every S3C controller.  0379 had this right with 0x76 and 0393 lost it.
+
+Both paths now get the form they want: IICDS gets `fg_addr << 1`, HSI2C_ADDR keeps the 7-bit
+value in bits 19:10.  The table lists both kinds of controller separately so each bus is driven
+through its own register map, and hsi2c0 - the PMIC bus, the one bus whose clock and pinmux the
+bootloader proved by using it to bring the phone up - is asked first.  The gauge register map is
+unchanged: RSOC 0x08, RVBAT 0x04, RCUR_CC 0x06, RBATCAP 0x0e.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/bsd/dev/a5xelte_battery.c
++++ b/bsd/dev/a5xelte_battery.c
+@@ -125,7 +125,9 @@
+ 		fg_wr(FG_CON, 0xe3u);
+ 		fg_wr(FG_FILTER, 7u);
+ 		fg_wr(FG_STAT, receive ? FG_MODE_RX : FG_MODE_TX);
+-		fg_wr(FG_DS, (uint32_t)fg_addr | (receive ? 1u : 0u));
++		/* IICDS takes the 8-bit form of the address: fg_addr is kept 7-bit because
++		 * that is what HSI2C_ADDR wants, so shift it here. */
++		fg_wr(FG_DS, (((uint32_t)fg_addr << 1) & 0xffu) | (receive ? 1u : 0u));
+ 		delay(1);
+ 		fg_wr(FG_STAT, (receive ? FG_MODE_RX : FG_MODE_TX) | 0x20u);
+ 		if (!fg_wait() || (fg_rd(FG_STAT) & 1u)) {
+@@ -402,10 +404,17 @@
+ 	 * Exynos 7870 boards.  Ask every address a fuel gauge can have on every controller,
+ 	 * the bus Samsung documents first, and keep the first pair that ACKs. */
+ 	static const struct { uint32_t pa; int hsi2c; } buses[] = {
++		/* hsi2c0, 0x10510000: the PMIC bus, the only controller the bootloader is
++		 * known to have left clocked and pinmuxed, so the gauge is asked here first. */
++		{ 0x10510000u, 1 },
++		/* hsi2c1-hsi2c6. */
++		{ 0x138a0000u, 1 }, { 0x138b0000u, 1 }, { 0x138c0000u, 1 },
++		{ 0x138f0000u, 1 }, { 0x13950000u, 1 }, { 0x13960000u, 1 },
++		/* The S3C2440 controllers: i2c0-i2c5, i2c7, i2c8.  They need their pins
++		 * muxed before a transfer moves, which is the stat=0xf0 in the last log. */
+ 		{ 0x13830000u, 0 }, { 0x13840000u, 0 }, { 0x13850000u, 0 },
+-		{ 0x13860000u, 1 }, { 0x13870000u, 1 }, { 0x13880000u, 1 },
+-		{ 0x13890000u, 1 }, { 0x138a0000u, 1 }, { 0x138b0000u, 1 },
+-		{ 0x138c0000u, 1 },
++		{ 0x13860000u, 0 }, { 0x13870000u, 0 }, { 0x13880000u, 0 },
++		{ 0x13890000u, 0 }, { 0x138d0000u, 0 }, { 0x138e0000u, 0 },
+ 	};
+ 	static const uint8_t addrs[] = { 0x3bu, 0x36u, 0x33u };
+ 

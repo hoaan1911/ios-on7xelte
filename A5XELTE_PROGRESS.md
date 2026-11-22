@@ -1025,3 +1025,89 @@ building a 0394-only kernel to split that range - pack it with the same `iphone8
 Rule for the next dispatch: the ADT canvas and the `sweetfb_*` boot args are one setting. Either
 `-f iphone8=true` and no `sweetfb_*` in the `cmdline` input, or `-f iphone8=false` and no
 `sweetfb_*` tail at all. Never one without the other.
+
+## 2026-11-22 — it reaches the lock screen
+
+`j7-xnu-boot.img` (xnu run 44905960778 = patches 0394-0399, boot run 44994592514, `board=d21ap`,
+`iphone8=true`, `product_node=false`, ADT 9,864 bytes, canvas 750x1334, display-scale 2, 478-char
+cmdline with `j7clk=1 j7cpu=0 j7gpuclk=0`) was flashed and the phone booted: Apple logo on black
+with no purple, then a second logo, then the lock screen. The user reports the whole boot takes a
+long time but completes.
+
+This is the first image on this phone to draw iOS userspace, and it closes every question the
+2016-11 runs were opened with:
+
+- `A5XELTE CPU: 8/8 CPUs initialized`, all eight timer tests pass, `cpus=8` boot arg honoured.
+- `SWEET FB: AppleCLCD 1080x1920 stride 4320 at 0x67000000, default surface 1, presented as
+  750x1334`; `SWEET FB: canvas surface id 2 750x1334 stride 3008`; double buffering on
+  (`0x87ba8000` / `0x88518000`); `requested 30 Hz, effective 30 Hz`; `DECON` programmed
+  `VIDCON0=00000007 WINCON0=0001e001 WHOLE 1080x1920`. The ADT canvas and the `sweetfb_*` boot
+  args agree, so `AppleCLCD::start` no longer dies there.
+- `hfs: mounted IOSROOT`, `exec launchd`, `ignition_level=1`, the fleet spawns, `exec SpringBoard`,
+  `SWEET SURF: SpringBoard create id 4 184x124 fmt 0x42475241`, `SWEET SURF: SpringBoard trap 0`
+  and `1`, `exec Spotlight`, `SWEET FB: display off` / `display on` around the sleep, key and touch
+  events reach `SWEET HID`.
+- The only crash in the whole log is `CRASH driverkitd reason ns 1 code 0x7`. No `CRASH SpringBoard`
+  and no `CRASH backboardd`.
+
+### Why it is slow, in the log's own numbers
+
+| what | value |
+|---|---|
+| `A5XELTE FB: submits=..., cpu_mhz=` | 900 (bootloader operating point; `j7cpu=0`) |
+| `A5XELTE CLK: G3D PLL_CON0=a1570d01 M=343 P=13 S=1` | 343 MHz (`j7gpuclk=0` in the cmdline) |
+| `avg_copy_us` per 750x1334 frame | 13,700-14,700 |
+| `copy split build_us / src_us / store_us` | 5,900-36,200 / 3,000-19,400 / 1,900-12,200 |
+| `frames=N elapsed_ms=5,3xx fps=` | 0.1-1.8 |
+
+The 5.3 s perf window counts frames the client actually submitted, so `fps=0.3` means SpringBoard
+and backboardd are producing about one frame every three seconds during the boot, not that one
+frame takes three seconds. The per-frame cost underneath it is the copy: 14 ms of CPU memcpy per
+frame plus 6-36 ms of row building, at 900 MHz, with the GPU at 343 MHz.
+
+So the next image changes exactly one clock: `j7gpuclk=900` in the cmdline, the rate 0374 read back
+on this phone. 0399 already moved the CMU_G3D block out of the `j7clk` gate, so the value reaches
+the register on this cmdline, which the log above cannot prove because it asked for 0. The CPU
+clock stays at 0: 0395 and 0396 both stopped before the logo, and both of them ran the raise in
+`AppleCLCD::start`, before the ring is flushed, so neither left a log to explain itself.
+
+### The fuel gauge: the scan was asking the wrong controllers
+
+```
+A5XELTE FG: CMU_PERI gates 0x3fffffff -> 0x3fffffff -> 0x3fffffff
+A5XELTE FG: nothing on 0x13830000, stat=0xf0 con=0xe3
+A5XELTE FG: nothing on 0x13840000, stat=0xf0 con=0xe3
+A5XELTE FG: nothing on 0x13850000, stat=0xf0 con=0xe3
+A5XELTE FG: nothing on 0x13860000 (hsi2c), istat=0 ts=0 ctl=0x9
+...
+A5XELTE FG: nothing on 0x138c0000 (hsi2c), istat=0 ts=0x2000c ctl=0
+A5XELTE FG: no gauge answered on any I2C bus
+SWEET BATTERY: static fallback, 100% 4200mV external=1 charging=0
+```
+
+Three things are established by those lines and the Exynos 7870 device tree, and none of them were
+known when 0369-0393 were written:
+
+1. **The clock gates were never the problem.** `CMU_PERI` `0x0810` already reads `0x3fffffff`, every
+   bit set, before and after the patch writes it.
+2. **The S3C probe never moves a byte.** `0x13840000` is `i2c1`, and the touch controller that this
+   kernel already talks to is `syna,rmi4-i2c` at `0x70` on exactly that bus. The probe reports
+   `stat=0xf0` there. `0xf0` is the value it wrote to `IICSTAT` (master transmit, start); it never
+   advanced, which is what a controller whose pins are not muxed looks like. Every S3C result in
+   every log so far is therefore meaningless.
+3. **Half the bus table drives the wrong register map.** `0x13830000`-`0x13890000` are the S3C2440
+   controllers (`i2c0`-`i2c5`), `0x138a0000`-`0x138c0000` are `hsi2c1`-`hsi2c3`, `0x138d0000` and
+   `0x138e0000` are `i2c7`/`i2c8`, `0x138f0000`, `0x13950000` and `0x13960000` are `hsi2c4`-`hsi2c6`
+   - and `hsi2c0`, the bus the PMIC sits on, is `0x10510000`, in the MIF domain. The table marked
+   `0x13860000`-`0x13890000` (four S3C controllers) as high-speed and never asked `0x10510000` at
+   all. That is why those four read back the `ctl=0x9` the driver had just written to `IICCON`, and
+   why the three real high-speed ones read `ctl=0` - they are `hsi2c1`-`hsi2c3`, off, never used by
+   the bootloader.
+
+Patch 0400 fixes the table and the address form: `IICDS` gets `fg_addr << 1` (0393 left the 7-bit
+value there, so the S3C path has been addressing `0x3b` instead of `0x76`), `HSI2C_ADDR` keeps the
+7-bit value in bits 19:10, both controller kinds are listed with their own map, and `hsi2c0`
+(`0x10510000`) is asked first because it is the one bus the bootloader is known to have left
+clocked and pinmuxed.
+
+Next image: patches 0394-0400, same ADT and board, cmdline as above with `j7gpuclk=900`.

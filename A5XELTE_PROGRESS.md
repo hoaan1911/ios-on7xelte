@@ -1251,3 +1251,65 @@ test is: push this library over the reserved `/usr/lib/sweetgl.dylib` blocks fro
 `python tools\j7-push-lib.py sweetgl.dylib sweetgl-extents.txt`, boot the 0401 image, and read
 `store_us=` / `flush_us=` / `wait_us=` in the `A5XELTE FB:` line - they should be non-zero now - next
 to `frames=` and the frame rate.
+
+## 2026-11-23 — the client boots userspace and the render server stops on the second logo
+
+The 0401 image (`45044194430`) plus the pushed `sweetgl.dylib` (`d7c53437…d5346`) was flashed and
+booted; 107,854 bytes of console were recovered. It is not a boot failure:
+
+- `SWEET ENV: backboardd += DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib` and
+  `sweet_drm: heap BO of 131072 KiB is 32768 KiB`, `sweet_hw: Panfrost screen created`: the library
+  loaded and made a Panfrost screen.
+- The GPU path runs and completes: 12 submits, `J7 G3D: wait slot=1 rc=0 after 40 us`, `slot=0 …
+  960 us`, `10 us`, `20 us`, `100 us`, all with `mmu_irq=00000000`, and no fault line at all.
+- boot tasks, `exec backboardd`, `exec SpringBoard`, the whole daemon fleet, HID key and touch
+  events, `SWEET FB: display on/off`: the system is up and interactive behind the picture.
+- The picture is what stops: `frames=2 elapsed_ms=5998`, swaps 1-2, then `SpringBoard create id 4
+  184x124`, `SpringBoard trap 0`, `sel 35` and after that not one `SWEET SURF` line, no swap, no
+  present for the rest of the run — `frames=3 elapsed_ms=371147 fps=0.0` on the last window. No
+  `CRASH backboardd`, no `CRASH SpringBoard`, no panic.
+
+So the panel keeps the last frame backboardd did present: the second Apple logo. The one variable
+against the lock-screen boot (`44994592514`) is that the library now really loads — AMFI allows
+failed insertions on purpose (`sweet_amfi.c`: "a bad dylib must not kill backboardd"), so the
+placeholder in `/usr/lib/sweetgl.dylib` never did.
+
+Unchanged from the 0401 note: `wait_us=0 store_us=0 flush_us=0` in every window, so the 26 MHz
+timebase fallback did not make those counters real; the cache-pass cost is still unmeasured, and
+that is not what stalls the presents.
+
+**The gauge: 0400 applied, and the bus it names is dead.** The scan now asks the MIF-domain
+controller first, as designed, and gets nothing:
+
+    A5XELTE FG: nothing on 0x10510000 (hsi2c), istat=0 ts=0x2000c ctl=0
+    A5XELTE FG: nothing on 0x138a0000 (hsi2c), istat=0 ts=0x2000c ctl=0
+    ...
+    A5XELTE FG: nothing on 0x138d0000, stat=0xf0 con=0xe3
+    A5XELTE FG: nothing on 0x138e0000, stat=0xf0 con=0xe3
+    A5XELTE FG: no gauge answered on any I2C bus
+    SWEET BATTERY: static fallback, 100% 4200mV external=1 charging=0
+
+`ctl=0` after the driver wrote `0x2000c` is a controller with no clock, not a gauge that did not
+ACK; `hsi2c0` needs its gate and pinmux brought up before any address on it can answer. More
+addresses on the old table cannot fix this.
+
+### Two control images, one variable each
+
+Both from xnu run `45043321404` (0394-0401, same kernel as the flashed image), `board=d21ap`,
+`iphone8=true`, `product_node=false`, 9,864-byte ADT, canvas 750x1334, one `sweetfb_scale/lw/lh`
+tail:
+
+- `artifacts/j7-boot-45160938680/j7-xnu-boot.img` — 16,672,784 bytes, sha256
+  `341b96fdeada409d136db8fcd98c0935d01aeeb428f2ceafbd3ad4f8135a5506`, payload
+  `adc6eca3886f777b740e2db3163ffd9ce4c4dc69bdcde7e5c6c265e61eb9e9e2`: **no `sweetenv` at all**, so
+  the library is not inserted. If this reaches the lock screen, the kernel is innocent and the
+  client is the stall.
+- `artifacts/j7-boot-45160953910/j7-xnu-boot.img` — 16,672,784 bytes, sha256
+  `ab43e209ff698d471ecbc96d512072e24b1e93947247bd6a1c779edf3415cc5e`, payload
+  `3bcd35148d024c6702b2406cb71457fb1b24f7143d652f75e86354584d121a24`: same `sweetenv` as the
+  flashed image plus `SWEET_GPU=0`, so the library loads and `sweet_hw` keeps softpipe. If this
+  reaches the lock screen, the bridge is fine and the Panfrost/BO path in it is what hangs
+  backboardd; if it stops at the same place, the hang is in the EAGL bridge itself.
+
+Not yet flashed. Nothing about frames, the lock screen, the gallery or widgets is established by
+these two images.

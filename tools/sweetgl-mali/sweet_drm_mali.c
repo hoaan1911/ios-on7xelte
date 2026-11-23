@@ -45,6 +45,7 @@ struct sbo {
     void *mem;
     uint64_t gva, size;
     int used;
+    int cpu;        /* the CPU has mapped it (sweet_drm_bo_map): the kernel's cache passes must cover it */
 };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -135,6 +136,19 @@ bo_get(uint32_t handle)
     return handle >= 1 && handle <= MAX_BOS && bos[handle - 1].used ? &bos[handle - 1] : NULL;
 }
 
+/*
+ * Cache policy (kernel selector 20). Every GPU submit and wait makes the kernel walk the CPU cache of every
+ * mapped BO, tens of MiB of them. Mesa never maps most BOs on the CPU (the tiler heap, the polygon list,
+ * GPU-only targets: its INVISIBLE / delayed-mmap ones), so a BO starts out GPU-only and becomes ordinary
+ * the first time Mesa maps it. A kernel without selector 20 just refuses the call and nothing changes.
+ */
+static void
+set_gpu_only(uint64_t gva, uint64_t gpu_only)
+{
+    uint64_t in[2] = { gva, gpu_only };
+    IOConnectCallScalarMethod(conn, 20, in, 2, NULL, NULL);
+}
+
 #define MAX_BO_BYTES (64ull << 20)  /* what the kernel's map selector takes (0310, 0311) */
 
 /* How much memory the tiler heap gets (MiB, SWEET_HEAP_MB overrides). The S7 port's 32 works. */
@@ -195,6 +209,7 @@ bo_create(uint32_t size, uint32_t flags, uint32_t *handle, uint64_t *gva, uint64
         return -ENOMEM;
     }
     bos[h - 1] = (struct sbo){ .mem = mem, .gva = out[0], .size = len, .used = 1 };
+    set_gpu_only(out[0], 1);
     *handle = h;
     *gva = out[0];
     *out_size = len;
@@ -223,6 +238,10 @@ sweet_drm_bo_map(int fd, uint64_t offset)
     struct sbo *b = bo_get((uint32_t)(offset >> 32));
     if (b) {
         p = b->mem;
+        if (!b->cpu) {
+            b->cpu = 1;
+            set_gpu_only(b->gva, 0);        /* the CPU will touch it now: back into the cache passes */
+        }
     }
     pthread_mutex_unlock(&lock);
     return p;

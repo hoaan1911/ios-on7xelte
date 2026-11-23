@@ -7,8 +7,11 @@ strip = '@STRIP@'
 pkg-config = 'false'
 
 [built-in options]
-c_args = ['-I@INC@']
-cpp_args = ['-I@INC@']
+# arm64 iOS is little-endian: say so, because Mesa's flex-generated lexers include standard headers
+# before the source they came from, and on the iOS 18.5 SDK that leaves u_endian.h without the
+# __BYTE_ORDER__ it derives the endianness from ("UTIL_ARCH_... were unset").
+c_args = ['-I@INC@', '-DUTIL_ARCH_LITTLE_ENDIAN=1', '-DUTIL_ARCH_BIG_ENDIAN=0']
+cpp_args = ['-I@INC@', '-DUTIL_ARCH_LITTLE_ENDIAN=1', '-DUTIL_ARCH_BIG_ENDIAN=0']
 
 [host_machine]
 system = 'darwin'

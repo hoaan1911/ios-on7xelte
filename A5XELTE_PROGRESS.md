@@ -1225,3 +1225,29 @@ run 45044194430. Cmdline is the lock-screen string with `j7gpuclk=0`, `j7cpu=0`,
 display comes back and the only new kernel code is 0401; payload sha256
 `b0e8853b6409896b008371b6cc09f1d4326284fdbedc0c32c8f6649e5929b8a9` (the previous image's was
 `0370702...`).
+
+### The client side of 0401: every new BO starts GPU-only
+
+`tools/sweetgl-mali/sweet_drm_mali.c` now carries the version written against the kernel patch, as
+supplied and kept byte-for-byte (24,663 bytes): `bo_create()` calls selector 20 with `(gpu va, 1)`
+as soon as the kernel has mapped the BO, and `sweet_drm_bo_map()` calls it with 0 the first time Mesa
+maps that BO on the CPU - the same point at which 0401's map path flushes the descriptor once. A
+kernel without selector 20 answers `kIOReturnBadArgument` and the shim ignores the failure, so this
+library is safe to push on the image that has 0401 and a no-op on one that does not.
+
+mesa-build run 45121604916 succeeded and its `sweetgl-gpu-dylib` artifact holds a 17,043,568-byte
+`out/sweetgl.dylib` padded to 64 MiB, sha256 `d7c5343778310adc9354fbe5e59326ea91b7f9c11caa56a2fcb9de3e4d8d5346`;
+the shim's strings are in it (`sweet_drm: heap BO of`, `submit jc=%llx slot`), and the EAGL bridge
+step linked 1,296 exported `gl*` entry points. First attempt, run 45120133228, got through 956 of
+1,180 targets and failed only on Mesa's flex-generated `program/lex.yy.c`: on the iOS 18.5 SDK that
+one TU reached `util/u_endian.h` without the `__BYTE_ORDER__` branch it derives the endianness from
+("UTIL_ARCH_LITTLE_ENDIAN and/or UTIL_ARCH_BIG_ENDIAN were unset"), while every other file with the
+same flags compiled. `tools/sweetgl-mali/ios-cross.txt.in` now states the target's endianness
+(`-DUTIL_ARCH_LITTLE_ENDIAN=1 -DUTIL_ARCH_BIG_ENDIAN=0`) instead of relying on that header chain.
+
+Build result only, nothing observed on the phone yet. The kernel side is the image already recorded
+above (boot run 45044194430, selector 20 matching `(gpu va, 0/1)` by GPU address and owner), so the
+test is: push this library over the reserved `/usr/lib/sweetgl.dylib` blocks from TWRP with
+`python tools\j7-push-lib.py sweetgl.dylib sweetgl-extents.txt`, boot the 0401 image, and read
+`store_us=` / `flush_us=` / `wait_us=` in the `A5XELTE FB:` line - they should be non-zero now - next
+to `frames=` and the frame rate.

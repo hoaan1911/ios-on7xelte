@@ -1387,3 +1387,31 @@ is what stalls the presents):
 
 Neither image is flashed or booted here, so the CPU rate, the gauge answer and the responsiveness
 are all still expected results, not observations.
+
+### The 3.4 fps log is the pre-clock image, not the new one
+
+The boot log attached after the clock images were delivered carries the cmdline
+`... j7nospawn=bluetoothd,fairplayd.H2 j7clk=1 j7gpuclk=0 j7fb_flip=1 j7cpu=0 ...`, which is
+`artifacts/j7-boot-45160938680` (xnu run `45043321404`, no `sweetenv`) - not either image from
+`45184841888`. Three lines settle it without guessing:
+
+- `A5XELTE CLK: G3D PLL_CON0=a1570d01 M=343 P=13 S=1 en=1 -> 343000 kHz` and
+  `G3D MUX=00200000 DIV_BUS=00000000 DIV_APB=00000003 -> 343000 kHz`: the GPU is still at the
+  loader's 343 MHz, i.e. `j7gpuclk=0` was honoured and no 900 MHz write ran.
+- No `A5XELTE FG: gpc4 con ...` line at all. 0403 logs that unconditionally at gauge init, so the
+  kernel predates 0403 and the gauge pins were never muxed in this boot.
+- No `A5XELTE CPU: ... dividers ...` line, consistent with `j7cpu=0`: 0402 only runs inside
+  `j7_cpu_clock()`, which 0398 does not call unless `j7cpu` is nonzero. **0402 is inert in this
+  image; there is no clock change of mine in it to revert.**
+
+What that image did measure: perf windows at `frames=19 elapsed_ms=5550 fps=3.4
+avg_copy_us=14025` with `SWEET SURF: backboardd wrap sel 6 refused` still recurring, two long
+stretches where the panel presented almost nothing (`frames=2 elapsed_ms=471884`,
+`frames=3 elapsed_ms=953371`), and `no wallpaper at /var/mobile/j7wall.raw, keeping the plain
+background` - unlike the 16.7 fps boot of this same image, which ran the wallpaper pass. The copy
+cost is unchanged at ~14 ms/frame, so the per-frame work did not regress; the presents stopped.
+
+Both clock images from run `45184841888` are still unflashed: `45186947154`
+(`j7gpuclk=900 j7cpu=1586`) and `45186965326` (`j7gpuclk=900 j7cpu=0`). The second is the one to
+try first if the CPU divider step is to be kept out of the picture: it moves only the GPU (343 ->
+900 MHz) and carries the 0403 gauge pinmux.

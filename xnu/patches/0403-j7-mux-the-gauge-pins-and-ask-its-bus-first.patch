@@ -1,0 +1,94 @@
+From: j7
+Subject: j7: mux the gauge's own I2C pins and ask that bus first
+
+Samsung's on7xelte device tree answers where the fuel gauge is: `s2mu005-fuelgauge@34` with
+`reg = <0x3B>` on `i2c@13830000`, the controller the SoC calls I2C_4 (I2C_FUELGAUGE), whose
+pins are gpc4-0 and gpc4-1 at function 2.  It is not on hsi2c0: that is the PMIC bus, and it
+carries the charger, not the gauge.  The register map the driver already uses - RSOC 0x08,
+RVBAT 0x04, RCUR_CC 0x06, RBATCAP 0x0e - is exactly the s2mu005 header's.
+
+The scan reached 0x13830000 and logged `stat=0xf0 con=0xe3`: the controller took every value
+written and the transfer never left the block.  Its PCLK gate is already open (CMU_PERI +0x0810
+bit 21), so what is missing is the pinmux.  Pin-controller 6 (TOP) is at 0x139b0000, gpc4 is
+its bank at 0x060, and bank_type_4 puts CON at +0x00 and PUD at +0x08 there; set the two
+nibbles to function 2 and both pull-ups on, logging the words before and after.
+
+Ask 0x13830000 first, then hsi2c0 and the rest as before, so the bus the board file names is
+the one that gets the first ACK.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/bsd/dev/a5xelte_battery.c
++++ b/bsd/dev/a5xelte_battery.c
+@@ -392,6 +392,37 @@
+ 	printf("A5XELTE FG: CMU_PERI gates 0x%08x -> 0x%08x -> 0x%08x\n", before, want, after);
+ }
+ 
++/* i2c@13830000 is Samsung's I2C_4_FUELGAUGE controller, and its pins are gpc4-0 (SDA) and
++ * gpc4-1 (SCL), function 2 with the internal pull-ups on.  They live in pin-controller 6
++ * (TOP, 0x139b0000); gpc4 is the bank at 0x060, and bank_type_4 puts CON at +0x00 and PUD at
++ * +0x08 in that bank.  The bootloader muxes only the PMIC bus (hsi2c0), so without this the
++ * controller is clocked, its registers take the values written, and the transfer never leaves
++ * the block: exactly the stat=0xf0 the scan logged. */
++#define FG_PINCTRL_TOP  0x139b0000u
++#define FG_GPC4_CON     0x060u
++#define FG_GPC4_PUD     0x068u
++
++static void
++fg_pins(void)
++{
++	vm_offset_t p = ml_io_map(FG_PINCTRL_TOP, 0x1000);
++
++	if (!p) {
++		printf("A5XELTE FG: no pinctrl map\n");
++		return;
++	}
++	volatile uint32_t *con = (volatile uint32_t *)(p + FG_GPC4_CON);
++	volatile uint32_t *pud = (volatile uint32_t *)(p + FG_GPC4_PUD);
++	uint32_t conBefore = *con, pudBefore = *pud;
++	/* Four bits per pin: gpc4-0 in 3:0, gpc4-1 in 7:4.  PUD: two bits per pin. */
++	*con = (conBefore & ~0xffu) | 0x22u;
++	*pud = (pudBefore & ~0x0fu) | 0x0fu;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(100);
++	printf("A5XELTE FG: gpc4 con %08x -> %08x, pud %08x -> %08x\n",
++	    conBefore, *con, pudBefore, *pud);
++}
++
+ int
+ a5xelte_fg_init(void)
+ {
+@@ -402,20 +433,24 @@
+ 		return -1;
+ 	}
+ 	fg_clock_on();
+-	/* Samsung's tree puts the S2MU004 gauge on I2C4 at 0x3b; the MAX77854 part that the
+-	 * S7 uses keeps its gauge at 0x36 next to the PMIC at 0x66, and both parts appear on
+-	 * Exynos 7870 boards.  Ask every address a fuel gauge can have on every controller,
+-	 * the bus Samsung documents first, and keep the first pair that ACKs. */
++	fg_pins();
++	/* Samsung's on7xelte device tree puts the S2MU005 gauge on i2c@13830000 at 0x3b, on
++	 * the S3C controller whose pins are gpc4-0/1; its register map is RSOC 0x08, RVBAT
++	 * 0x04, RCUR_CC 0x06 and RBATCAP 0x0e, which is what this driver already reads.
++	 * The MAX77854 part keeps its gauge at 0x36 next to the PMIC at 0x66 and appears on
++	 * other Exynos 7870 boards, so the remaining buses are still asked, but the bus the
++	 * board file names is asked first. */
+ 	static const struct { uint32_t pa; int hsi2c; } buses[] = {
+-		/* hsi2c0, 0x10510000: the PMIC bus, the only controller the bootloader is
+-		 * known to have left clocked and pinmuxed, so the gauge is asked here first. */
++		/* i2c_4 / I2C_FUELGAUGE: the gauge's own bus, pins muxed just above. */
++		{ 0x13830000u, 0 },
++		/* hsi2c0, 0x10510000: the PMIC bus, clocked by the bootloader but not muxed
++		 * for a gauge. */
+ 		{ 0x10510000u, 1 },
+ 		/* hsi2c1-hsi2c6. */
+ 		{ 0x138a0000u, 1 }, { 0x138b0000u, 1 }, { 0x138c0000u, 1 },
+ 		{ 0x138f0000u, 1 }, { 0x13950000u, 1 }, { 0x13960000u, 1 },
+-		/* The S3C2440 controllers: i2c0-i2c5, i2c7, i2c8.  They need their pins
+-		 * muxed before a transfer moves, which is the stat=0xf0 in the last log. */
+-		{ 0x13830000u, 0 }, { 0x13840000u, 0 }, { 0x13850000u, 0 },
++		/* The rest of the S3C2440 controllers: i2c0-i2c3, i2c5, i2c7, i2c8. */
++		{ 0x13840000u, 0 }, { 0x13850000u, 0 },
+ 		{ 0x13860000u, 0 }, { 0x13870000u, 0 }, { 0x13880000u, 0 },
+ 		{ 0x13890000u, 0 }, { 0x138d0000u, 0 }, { 0x138e0000u, 0 },
+ 	};

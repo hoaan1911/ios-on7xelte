@@ -1,0 +1,59 @@
+From: j7
+Subject: j7: put the CPU dividers on the PLL step the cores are asked for
+
+The CPU clock code programs the cluster PLL to the asked rate and moves ARMCLK back onto it,
+but it never touches the two dividers between the PLL and the cores.  Samsung's clock tree
+registers them as a chain - CPUCL0_MUX_CLK_CPUCL0 -> DIV_CLK_CPUCL0_1 -> DIV_CLK_CPUCL0_2,
+three bits each at CMU_CPUCL0 +0x400 and +0x404, 0-based - and the bootloader leaves the PLL at
+1800 MHz with a divide-by-two, which is the 900 MHz every perf window measures.  Writing only
+M/P/S for 1586 MHz would therefore have produced 793 MHz, slower than the boot started, while
+the log printed the undivided PLL rate.
+
+Clear both divider fields while the cores are on the oscillator, in the same window as the PLL
+write, and only after the PLL has locked; a PLL that does not lock still gets its old CON0 back
+and its dividers are left alone.  The closing log line now divides the PLL by both read-back
+fields, so the reported rate is the rate the cores run at.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -369,6 +369,19 @@
+ 				IODelay(20);
+ 			}
+ 		}
++		if (locked) {
++			/* ARMCLK is PLL / (div1 + 1) / (div2 + 1); the bootloader leaves the PLL at
++			 * 1800 MHz and divides it by two, so writing M/P/S alone would have asked
++			 * for 1586 MHz and delivered 793.  Both dividers are three bits, 0-based,
++			 * and 0 puts the PLL output straight on ARMCLK.  They are changed while
++			 * the cores run from the oscillator, the same window the PLL write uses. */
++			const uint32_t d1old = c[0x400 / 4], d2old = c[0x404 / 4];
++			c[0x400 / 4] = d1old & ~7u;
++			c[0x404 / 4] = d2old & ~7u;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			IOLog("A5XELTE CPU: %s dividers %u/%u -> %u/%u\n", cpu[i].name,
++			    d1old & 7u, d2old & 7u, c[0x400 / 4] & 7u, c[0x404 / 4] & 7u);
++		}
+ 		/* ARMCLK back to the PLL: bit 12 clear, the status reads 1. */
+ 		c[0x208 / 4] = mux0 & ~(1u << 12);
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+@@ -382,11 +395,14 @@
+ 			const uint32_t run = c[0x100 / 4];
+ 			const uint32_t rm = (run >> 16) & 0x3ffu, rp = (run >> 8) & 0x3fu,
+ 			    rs = run & 7u;
+-			const uint64_t now = (rp != 0 && rs < 7)
++			const uint64_t pll = (rp != 0 && rs < 7)
+ 			    ? 26000ULL * rm / ((uint64_t)rp << rs) : 0;
+-			IOLog("A5XELTE CPU: %s on PLL_CON0=%08x, mux %u -> %llu kHz%s\n",
+-			    cpu[i].name, run, (c[0x608 / 4] >> 12) & 3u, now,
+-			    locked ? "" : " (old rate)");
++			/* What the cores actually get: the PLL through both dividers. */
++			const uint64_t now = pll / ((uint64_t)((c[0x400 / 4] & 7u) + 1u) *
++			    (uint64_t)((c[0x404 / 4] & 7u) + 1u));
++			IOLog("A5XELTE CPU: %s on PLL_CON0=%08x, mux %u, div %u/%u -> %llu kHz%s\n",
++			    cpu[i].name, run, (c[0x608 / 4] >> 12) & 3u, c[0x400 / 4] & 7u,
++			    c[0x404 / 4] & 7u, now, locked ? "" : " (old rate)");
+ 		}
+ 		OSSafeReleaseNULL(map);
+ 		OSSafeReleaseNULL(desc);

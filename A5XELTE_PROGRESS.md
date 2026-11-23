@@ -1313,3 +1313,77 @@ tail:
 
 Not yet flashed. Nothing about frames, the lock screen, the gallery or widgets is established by
 these two images.
+
+## 2026-11-23 — the boot without the client draws, and Samsung's tree names the gauge bus
+
+Image `artifacts/j7-boot-45160938680/j7-xnu-boot.img` (no `sweetenv`, so `/usr/lib/sweetgl.dylib`
+is not inserted) was flashed. It reaches userland with the panel alive: the log has
+`SWEET FB: AppleCLCD 1080x1920 … presented as 750x1334`, the wallpaper pass, swap lines, touch
+down/up events, and perf windows such as
+`frames=116 elapsed_ms=6917 fps=16.7 bytes=962150400 avg_copy_us=14043 max_copy_us=16638`,
+`swap_ends=777 swap_waits=225 avg_swapwait_us=15769`, later `frames=95 … fps=14.3` after a
+full-screen surface. Every window still says `cpu_mhz=900`, and the GPU is at the loader's rate
+(`A5XELTE CLK: G3D PLL_CON0=a1570d01 M=343`). Build success, kernel markers, physical screen and
+iOS runtime are now four separate claims that all hold for this image; the interface animates but
+is still slow enough to feel unresponsive, which matches a 902 MHz CPU doing a 14 ms CPU copy per
+frame.
+
+So the stall recorded in the previous section is the pushed client, not the kernel: with the
+library out of backboardd the same kernel presents for the whole run, while with the library
+loaded it stops presenting after three frames.
+
+**The GPU clock needs no kernel change on this image.** 0399 moved the CMU_G3D block out of the
+`j7clk` gate, and this log proves it runs (it printed the PLL and MUX words), so `j7gpuclk=900` in
+the cmdline is enough to move the T830 from 343 to 900 MHz.
+
+**The CPU clock code was dividing twice.** Samsung's clock tree in `drivers/soc/samsung/pwrcal/
+S5E7870` registers `CPUCL0_MUX_CLK_CPUCL0 -> CPUCL0_DIV_CLK_CPUCL0_1 -> CPUCL0_DIV_CLK_CPUCL0_2`,
+three bits each at `CMU_CPUCL0 +0x400` and `+0x404`, 0-based. The bootloader leaves the PLL at
+1800 MHz with a divide-by-two, which is the measured 900 MHz. 0396 only wrote M/P/S, so a request
+for 1586000 would have programmed a 1586 MHz PLL and delivered 793 MHz - slower than the boot -
+while the log printed the undivided PLL rate. Patch **0402** clears both divider fields in the
+same oscillator window as the PLL write, only after the lock bit reads back, and the closing line
+now reports the PLL divided by the read-back fields.
+
+**The fuel gauge is not on the PMIC bus.** The Linux source the user pointed at
+(`th1nhhdk/on7xelte-latest-kernel-source`, Samsung's own SM-G610F tree) settles it:
+
+- `arch/arm64/boot/dts/exynos7870-on7xelte_swa_open_battery_00.dtsi` (and `_01`) put
+  `s2mu005-fuelgauge@34` with `reg = <0x3B>` on `i2c@13830000`.
+- `exynos7870.dtsi` labels that node `i2c_4: i2c@13830000` with the comment `I2C_FUELGAUGE`, clock
+  id 114 and `pinctrl-0 = <&i2c4_bus>`; the pin group is `gpc4-0`/`gpc4-1`, function 2, pull-up.
+- `S5E7870-cmu.c` gates its PCLK with `CLK_ENABLE_CLK_PERI_BUS0` bit 21, i.e. CMU_PERI `+0x0810`
+  bit 21 - the register and bit the driver already sets, and the log shows it read back all ones.
+- `s2mu005_fuelgauge.h` has RSOC `0x08`, RVBAT `0x04`, RCUR_CC `0x06`, RBATCAP `0x0E`, exactly the
+  map `a5xelte_battery.c` reads.
+
+`i2c@13830000` logged `stat=0xf0 con=0xe3`: IICCON took the written value, so the block is clocked,
+and IICSTAT stayed at the master-TX start byte, so the transfer never left the controller. That is
+the pinmux, not the gate and not the address. Pin-controller 6 (TOP) is `0x139b0000`; `gpc4` is the
+bank at `0x060` and `bank_type_4` puts CON at bank `+0x00` and PUD at `+0x08`. Patch **0403** sets
+`gpc4-0`/`gpc4-1` to function 2 with pull-ups, logs both words, and asks `0x13830000` at `0x3b`
+first instead of last. hsi2c0 keeps its probe, but it is the PMIC bus and only carries the charger.
+
+### Two images from kernel run 45184841888 (0394-0403)
+
+xnu run `45184841888` succeeded; `skipped-patches.txt` lists only the four donor patches
+(`iobuffermemd_monterey`, `skywalk_sonoma`, `syntax_checker_sonoma`, `TrustCache`), and `xnu-peek`
+carries the divider log and `fg_pins()`. Both images are `board=d21ap`, `iphone8=true`,
+`product_node=false`, 9,864-byte ADT, one `sweetfb_scale/lw/lh` tail, no `sweetenv` (the library
+is what stalls the presents):
+
+- `artifacts/j7-boot-45186947154/j7-xnu-boot.img` — 16,672,784 bytes, sha256
+  `bfe118c74069a447cfb48c99039604447cf03fc798c0b8472368af5ae2ad24b4`, payload
+  `b83af3074def320e0af0fe451d62446361284f936d163d687c52c6df696e46ea`: `j7gpuclk=900 j7cpu=1586`.
+  Flash this first. Expected log: `A5XELTE CPU: CPUCL0 PLL_CON0=… asked for 1586000`, then
+  `dividers d1/d2 -> 0/0`, `on PLL_CON0=… div 0/0 -> 1586000 kHz`, `cpu_mhz=1586` in the perf
+  windows, `A5XELTE CLK: G3D 900 MHz … reads back … 900000 kHz`, and `A5XELTE FG: gpc4 con …` on
+  the way to a gauge line.
+- `artifacts/j7-boot-45186965326/j7-xnu-boot.img` — 16,672,784 bytes, sha256
+  `ad235df9f03690caff8a676c42417fc0265f1f9683d8062be30cf4b7a91053f4`, payload
+  `9a3bef1e86498349398ee912aa82520404507ee9ec3c2f97299306ca44124e18`: `j7gpuclk=900 j7cpu=0`.
+  Fallback: if the first image shows no logo and no new log, this one leaves ARMCLK at the
+  bootloader's 902 MHz and still carries the GPU clock and both battery changes.
+
+Neither image is flashed or booted here, so the CPU rate, the gauge answer and the responsiveness
+are all still expected results, not observations.

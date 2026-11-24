@@ -1588,3 +1588,19 @@ session keeps printing `wait slot=N rc=0` and nothing else.
 
 Not claimed: that the render server's composition left the CPU. The GPU path is still Mesa Panfrost
 through `sweetgl.dylib`; this patch keeps the bridge answering so that path can keep running.
+
+### The two images built from 0407 (kernel run 45396931948)
+
+Both are 16,672,784 bytes, one boot-args tail, `sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib,SWEET_TRACE=0`, `j7gpuclk=900`, `j7gpu=7`, new `a5fb_hz=60` (present on every 60 Hz tick instead of every second one).
+
+| artifact | j7cpu | sha256 |
+| --- | --- | --- |
+| `artifacts/j7-boot-45398506463/j7-xnu-boot.img` | 1586 | `52160cb4a789a55081892b0f8a4f369654d5613a98e48ef2d393761024784654` |
+| `artifacts/j7-boot-45398524028/j7-xnu-boot.img` | 0 | `67f41d0947f0df46b9565e4a76f535192187291559dabe008941c81acfcd6886` |
+
+The three 0407 format strings are in the kernel image (`submit refused after draining slot`,
+`recovery failed; the next submit retries it`, `AS0/MMU reprogrammed for a client submit`), so the
+patch is compiled in; nothing about it is device-verified yet.
+
+Both still need `sweetgl.dylib` pushed to `/usr/lib/sweetgl.dylib` on the device
+(`python tools/j7-push-lib.py sweetgl.dylib sweetgl-extents.txt`).

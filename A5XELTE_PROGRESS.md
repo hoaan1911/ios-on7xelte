@@ -1565,3 +1565,26 @@ insert failed.
 WHAT IS NOT CLAIMED: that the UI is GPU-rendered. Nothing here accelerates SpringBoard's own Metal
 output; the GPU work is the GL bridge's, and until the wedge is gone it does not survive the second
 logo. The only panel path that exists today is the CPU copy this tree does at 13.7 ms a frame.
+
+## 2026-11-24 - patch 0407: the GPU submit path can no longer go quiet
+
+Patch `0407-j7-never-refuse-a-gpu-submit-the-compositor-needs.patch` changes only the user-client end
+of the Panfrost bridge. The GPU-on boot (`ad235df9...`, `j7gpuclk=900`, 900 MHz read back, 12 submits
+all `rc=0`) stopped drawing the moment a chain was refused, and the three ways a refusal can become
+permanent are all removed:
+
+- in-flight is a bit per job slot (`inflightMask`) instead of one global flag, so a chain on slot 1 no
+  longer refuses slot 0; `j7m_wait` covers every slot with a chain, and a refused submit drains that
+  slot for up to 5 ms and retries once;
+- a `JS_COMMAND_NEXT` START the job manager never took is cleared and retried instead of refusing
+  that slot for the rest of the session;
+- a failed `j7m_recover()` no longer sets `gJ7MServing = false` (which returned `kIOReturnNotReady` to
+  every later submit); the next submit retries the reset, core power and AS0 program.
+
+New log lines to look for, in order: `AS0/MMU reprogrammed for a client submit` (only if the MMU had
+to be retried), `submit refused after draining slot` (only if a slot is still busy after the drain),
+`recovery failed; the next submit retries it` (only after four bad chains or an MMU fault). A healthy
+session keeps printing `wait slot=N rc=0` and nothing else.
+
+Not claimed: that the render server's composition left the CPU. The GPU path is still Mesa Panfrost
+through `sweetgl.dylib`; this patch keeps the bridge answering so that path can keep running.

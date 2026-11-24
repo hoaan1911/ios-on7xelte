@@ -1,0 +1,202 @@
+From: j7
+Subject: j7: never refuse a GPU submit the compositor needs
+
+The 900 MHz GPU-on boot ends at 12 submits, every one rc=0, and then the render server never draws
+again and nothing more reaches the log.  Three things in the client path can end a session exactly
+like that, and all three are here:
+
+ - `gJ7M.inflight` was one flag for the whole GPU, so a chain started on slot 1 made the next chain
+   on slot 0 a refusal, and Mesa turns a refused submit into a failed batch.  In-flight is tracked
+   per slot now, the wait covers every slot that has a chain, and a refused submit drains only that
+   slot and tries once more before answering the client.
+
+ - a START the job manager did not take stays latched in JS_COMMAND_NEXT, and every later submit to
+   that slot is refused forever with nothing in the log.  The latch is cleared and the submit goes
+   through.
+
+ - a failed `j7m_recover()` after four bad chains (or one MMU fault) set `gJ7MServing = false`, and
+   from then on every submit returned kIOReturnNotReady: a client that by design never draws again.
+   The service stays up and the next submit retries the reset, core power and AS0 program.
+
+What the GPU draws is unchanged: this is the client end of the Panfrost bridge, not a new renderer.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp	2026-11-24 12:43:46.357211529 +0000
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp	2026-11-24 12:44:52.504942871 +0000
+@@ -469,8 +469,10 @@
+      * again when one of these moved (or every so often, as a safety net). */
+     uint32_t mapGen;
+     uint32_t verifyGen;
+-    bool inflight;
+-    uint32_t inflightSlot;
++    uint32_t inflightMask;   /* one bit per job slot with a chain the GPU has not finished: the
++                              * three slots are independent, so a second chain must not be refused
++                              * because the first one has not been waited for yet */
++    uint32_t inflightSlot;   /* the slot started most recently: the fault report's status source */
+     struct J7MaliBo bos[J7M_MAX_BOS];
+     struct J7MEvent events[J7M_EVENTS];
+     uint32_t eventHead;
+@@ -1114,9 +1116,19 @@
+ j7m_submit(uint32_t slot, uint64_t jc_va, uint32_t *seq)
+ {
+     const uint32_t js = J7M_JS(slot);
+-    if (gJ7M.inflight || slot > 2 || (a5g3d_read32(gJ7M.gpu, js + 0x60) & 1)) {
++    if (slot > 2 || (gJ7M.inflightMask & (1u << slot))) {
+         return false;
+     }
++    /* A START the job manager never took stays latched in JS_COMMAND_NEXT, and every later submit
++     * to that slot is refused because of it.  Take the latch back instead of calling the slot busy. */
++    if (a5g3d_read32(gJ7M.gpu, js + 0x60) & 1) {
++        a5g3d_write32(gJ7M.gpu, js + 0x60, 0);
++        __sync_synchronize();
++        IODelay(20);
++        if (a5g3d_read32(gJ7M.gpu, js + 0x60) & 1) {
++            return false;
++        }
++    }
+     a5g3d_write32(gJ7M.gpu, J7M_JOB_IRQ_CLEAR, 0xffffffffu);
+     /* Everything the CPU wrote for this chain has to be in memory before the job manager reads it (the S7
+      * port saw ~4% of chains stop with JOB_READ_FAULT at their first job without this barrier). */
+@@ -1129,7 +1141,7 @@
+     a5g3d_write32(gJ7M.gpu, js + 0x58, (8u << 16) | (3u << 8) | (3u << 12));
+     __sync_synchronize();
+     a5g3d_write32(gJ7M.gpu, js + 0x60, 1);   /* JS_COMMAND_NEXT = START */
+-    gJ7M.inflight = true;
++    gJ7M.inflightMask |= 1u << slot;
+     gJ7M.inflightSlot = slot;
+     *seq = ++gJ7M.seq;
+     return true;
+@@ -1291,14 +1303,13 @@
+     return 0;
+ }
+ 
+-/* Poll for completion. 0 = done OK, -1 = timeout, -2 = job fault, -3 = MMU fault. */
++/* Poll one slot for completion. 0 = done OK, -1 = timeout, -2 = job fault, -3 = MMU fault. */
+ static int
+-j7m_wait(unsigned timeout_us)
++j7m_wait_slot(uint32_t slot, unsigned timeout_us)
+ {
+-    if (!gJ7M.inflight) {
++    if (!(gJ7M.inflightMask & (1u << slot))) {
+         return 0;
+     }
+-    const uint32_t slot = gJ7M.inflightSlot;
+     const uint32_t jsreg = J7M_JS(slot);
+     unsigned repairs = 0;
+     for (;;) {
+@@ -1353,7 +1364,7 @@
+         /* Clear everything: a stale slot-done bit would fake a completion for the next chain. */
+         a5g3d_write32(gJ7M.gpu, J7M_JOB_IRQ_CLEAR, 0xffffffffu);
+         a5g3d_write32(gJ7M.gpu, J7M_MMU_IRQ_CLEAR, 0xffffffffu);
+-        gJ7M.inflight = false;
++        gJ7M.inflightMask &= ~(1u << slot);
+         static unsigned loggedWait;
+         if (loggedWait++ < 8 || rc != 0) {
+             if (loggedWait <= 8) {
+@@ -1365,6 +1376,27 @@
+     }
+ }
+ 
++/* Wait for every chain that is in flight.  The client submits one chain per ioctl and waits for it
++ * straight away, but a second render thread can start another slot meanwhile: the wait has to cover
++ * each slot that has a chain, or the older one keeps its slot marked busy and the next submit to it
++ * is refused, which is a failed Mesa batch and a compositor that never draws again. */
++static int
++j7m_wait(unsigned timeout_us)
++{
++    int rc = 0;
++
++    for (unsigned slot = 0; slot < 3; slot++) {
++        if (!(gJ7M.inflightMask & (1u << slot))) {
++            continue;
++        }
++        const int r = j7m_wait_slot(slot, timeout_us);
++        if (r != 0 && rc == 0) {
++            rc = r;
++        }
++    }
++    return rc;
++}
++
+ /* GPU soft reset: stops everything, clears AS0 and the job slots. */
+ static bool
+ j7m_gpu_reset(void)
+@@ -1375,7 +1407,7 @@
+     for (unsigned us = 0; us < 100000; us += 10) {
+         if (a5g3d_read32(gJ7M.gpu, 0x20) & (1u << 8)) {
+             a5g3d_write32(gJ7M.gpu, 0x24, 0xffffffffu);
+-            gJ7M.inflight = false;
++            gJ7M.inflightMask = 0;
+             gJ7M.mmuLive = false;
+             return true;
+         }
+@@ -1882,11 +1914,18 @@
+                 break;
+             }
+             uint32_t seq = 0;
+-            if (!gJ7M.mmuReady) {
+-                IOLog("J7 G3D: client submit refused: AS0/MMU not ready yet (mmuReady=%u, poolTables=%u)\n",
+-                    gJ7M.mmuReady, gJ7M.poolTables);
+-                ret = kIOReturnNotReady;
+-                break;
++            if (!gJ7M.mmuReady || !gJ7M.mmuLive) {
++                /* A client that gets NotReady keeps running, so the AS0 bring-up is retried here
++                 * rather than refusing the frame for the rest of the session. */
++                if (!j7m_recover()) {
++                    IOLog("J7 G3D: client submit: AS0/MMU not ready (mmuReady=%u, poolTables=%u) and the "
++                        "retry failed\n", gJ7M.mmuReady, gJ7M.poolTables);
++                    ret = kIOReturnNotReady;
++                    break;
++                }
++                gJ7M.mmuReady = true;
++                IOLog("J7 G3D: AS0/MMU reprogrammed for a client submit (pool %u tables)\n",
++                    gJ7M.poolTables);
+             }
+             /* No page-table walk here any more: the map paths verify on change and the whole-AS
+              * audit still runs as a safety net, just not in front of every single submit. */
+@@ -1897,8 +1936,18 @@
+             }
+             j7mStatSubmits++;
+             if (!j7m_submit(static_cast<uint32_t>(slot), jc, &seq)) {
+-                ret = kIOReturnBusy;
+-                break;
++                /* Mesa turns a refused submit into a failed batch and the compositor then stops
++                 * drawing.  A chain still running on that slot is the one recoverable reason: drain
++                 * it and take the slot once more before telling the client no. */
++                (void)j7m_wait_slot(static_cast<uint32_t>(slot), 5000);
++                j7m_cache(kIOMemoryIncoherentIOStore);
++                if (!j7m_submit(static_cast<uint32_t>(slot), jc, &seq)) {
++                    IOLog("J7 G3D: submit refused after draining slot %u (js_cmd=%08x mask=%x)\n",
++                        (unsigned)slot, a5g3d_read32(gJ7M.gpu, J7M_JS((uint32_t)slot) + 0x60),
++                        gJ7M.inflightMask);
++                    ret = kIOReturnBusy;
++                    break;
++                }
+             }
+             args->scalarOutput[0] = seq;
+             args->scalarOutputCount = 1;
+@@ -1908,7 +1957,7 @@
+     case 3:     /* wait: in (timeout us) -> out (status 0/-1/-2/-3, js status) */
+         if (args->scalarInputCount == 1 && args->scalarOutputCount >= 2) {
+             const uint32_t slot = gJ7M.inflightSlot;
+-            const bool wasInflight = gJ7M.inflight;
++            const bool wasInflight = (gJ7M.inflightMask & (1u << slot)) != 0;
+             /* 600 us is a frame's worth of GPU work at any useful rate; a client asking for five
+              * seconds only ever waited out a job slot that was already dead. */
+             /* 20 ms: a tiled 1242x2208 chain can take longer than 2 ms to raise its interrupt
+@@ -1957,8 +2006,12 @@
+                 if (++consecutiveFailures >= 4 || rc == -3) {
+                     consecutiveFailures = 0;
+                     if (!j7m_recover()) {
+-                        gJ7MServing = false;
+-                        IOLog("J7 G3D: recovery failed; GPU service stopped\n");
++                        /* Never take the service away: a client that gets NotReady from every submit
++                         * stops drawing for good, while the next submit is the natural place to try
++                         * the recovery again. */
++                        IOLog("J7 G3D: recovery failed; the next submit retries it\n");
++                    } else {
++                        gJ7M.mmuReady = true;
+                     }
+                 }
+             }

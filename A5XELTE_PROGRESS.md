@@ -1466,3 +1466,28 @@ Patches `0404`, `0405`, `0406` were diffed against the post-0403 source that xnu
 built and dry-run applied in sequence with `patch -p1`; the result is byte-identical to the edited
 file. Nothing has been compiled, built, flashed or observed on the phone yet, and `avg_copy_us`
 after 0404 is an expectation, not a measurement.
+
+### Two images from xnu run 45342963879 (0394-0406)
+
+xnu run `45342963879` (commit `9480e2d`) succeeded with `0404`-`0406` applied; the kernel image
+carries `did not take the switch` and no longer carries `did not take the oscillator`, which is
+0406's own string. Both images are `board=d21ap`, `iphone8=true`, `product_node=false`, 9,864-byte
+ADT, no `sweetenv` (the client is what stalls the presents), and 16,672,784 bytes:
+
+- `artifacts/j7-boot-45343760504/j7-xnu-boot.img` — sha256
+  `5e0c9978ac0b6b7b3516daeeed9f49ed3e8e91d6cfa2db46c89aa91276bebb37`: `j7gpuclk=900 j7cpu=1586`.
+  The CPU raise on the switch clock. Expected: `A5XELTE CPU: CPUCL0 … asked for 1586000`, then
+  `on PLL_CON0=…, mux 1, div 0/0 -> 1586000 kHz`, `cpu_mhz=1586` in the perf windows, and a logo.
+  If the switch never reports, the same boot logs `did not take the switch` and stays at 902 MHz.
+- `artifacts/j7-boot-45343770522/j7-xnu-boot.img` — sha256
+  `c8596ccc84a6215caf38cbae971af384f9812737fb91ebbe0b0a15109d07a86c`: `j7gpuclk=900 j7cpu=0`.
+  Same kernel, CPU untouched: the fallback if the switch transition does not boot.
+
+The cmdline in both payloads repeats the `sweetfb_scale=1 sweetfb_lw=750 sweetfb_lh=1334` tail
+twice (the workflow appends it when `iphone8=true` and the dispatch string already had it); PE
+takes the first match, so the value is the same and the string is 468 of 608 bytes.
+
+What the log should settle, in this order: a logo at `j7cpu=1586`; `mux 1, div 0/0` and
+`cpu_mhz=1586`; `avg_copy_us` below 14,000 with `copy split build_us` lower (`0404`); and no perf
+window whose `elapsed_ms` is seconds per present, with `avg_swapwait_us` near 16 ms (`0405`).
+Neither image is flashed or booted here, so all four are expectations.

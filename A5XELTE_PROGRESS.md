@@ -1659,3 +1659,33 @@ runs the same retune from the first perf window instead - about five seconds in,
 already flowing - so the last line in the log names the step that stopped the phone: the switch
 mux, the PLL lock, or the dividers. `j7m_cpu_mhz_reset()` is added so the perf line reports the
 rate the cores ended up at instead of the cached boot rate.
+
+### The two images built from 0408 + 0409 (kernel run 45435896253)
+
+Both 16,672,784 bytes, one boot-args tail, `j7gpuclk=900 j7gpu=7 j7fb_flip=1 a5fb_hz=60`,
+`sweetfb_scale=1 sweetfb_lw=750 sweetfb_lh=1334`, `sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib,SWEET_TRACE=0`.
+The three new format strings are in the kernel image (`panel copy across %u cores`, `retuning both
+clusters to %u kHz now`, `will be asked for after the first frame window`), so both patches are
+compiled in.
+
+| artifact | j7cpu | sha256 |
+| --- | --- | --- |
+| `artifacts/j7-boot-45439583818/j7-xnu-boot.img` | 0 | `c0922c6902bd027866d6cb9acebcfcbb6b2f0654fa676de6fcfdc96d8b7ddeb1` |
+| `artifacts/j7-boot-45439609732/j7-xnu-boot.img` | 1248 | `a219a292ade3f2c5394c5adfa6491250d0d77cf19d93e046e28f241d7362d7bc` |
+
+Flash the `j7cpu=0` one first: it is the same CPU behaviour as the image that boots today, with the
+parallel panel copy and the duplicate-row fix. What the next log has to show:
+
+- `A5XELTE FB: panel copy across 4 cores` near the start (or `on this core only` if the helper
+  threads could not be started, which is the old behaviour).
+- `avg_copy_us` well below the 10-16 ms of the 900 MHz boot, with `build_us` down with it.
+- `submits=` still climbing and `wait slot=N rc=0` continuing: the GPU path must not regress.
+
+`j7cpu=1248` is the CPU experiment, and it is the same kernel: 1248 MHz is M 192 / P 4 / S 0, an
+exact step of this PLL, 39% above the 900 MHz both clusters boot at and a much smaller move than
+the 1586 that stopped three boots. The retune now runs about five seconds in, after the first perf
+window, so if it stops the phone the persistent log still names the step it died in
+(`retuning both clusters to 1248 kHz now`, then the per-cluster `PLL_CON0=... asked for 1248`, then
+`did not take the switch` / `PLL never locked` / `dividers a/b -> c/d`). If it boots, the next perf
+line's `cpu_mhz=` shows 1248 where it used to show 900, because `j7m_cpu_mhz_reset()` drops the
+cached measurement after the retune.

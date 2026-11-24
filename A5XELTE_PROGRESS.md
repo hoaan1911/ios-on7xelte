@@ -1604,3 +1604,58 @@ patch is compiled in; nothing about it is device-verified yet.
 
 Both still need `sweetgl.dylib` pushed to `/usr/lib/sweetgl.dylib` on the device
 (`python tools/j7-push-lib.py sweetgl.dylib sweetgl-extents.txt`).
+
+## 2026-11-24 - the 900 MHz boot log: what actually costs the frame
+
+The log from the 0407 kernel at `j7cpu=0` (the image that boots) is the first one with the GPU
+submitting and the panel presenting at the same time, and it says the panel copy is not the
+bottleneck people thought it was, and where it really goes:
+
+- `cpu_mhz=900` in every perf window. That number is measured, not read from a register
+  (`j7m_cpu_mhz()` times an add chain against `mach_absolute_time`), so both clusters really are
+  at the 900 MHz the bootloader leaves them on, against a rated 1586.
+- `copy split build_us=40381 src_us=13686 store_us=330` over seven frames: 5.8 ms a frame
+  **building** the 1920 panel rows from the column-index gather, 2.0 ms reading the client's row
+  out of its surface, and 0.05 ms storing. The old note about "34 ms of stores into
+  write-combined memory" no longer applies to this path: with the double buffer the destination
+  is cacheable and the cost is entirely the single-core build.
+- `avg_copy_us=10282 max_copy_us=17170`. The copy runs on the vsync timer's own thread, and the
+  timer is what paces `SwapWait`, so a 10-17 ms copy sits directly in the frame interval the
+  render server is waiting on.
+- The GPU is working: `submits=132` and `wrap=39` in a 5.4 s window, every `wait slot=N rc=0`.
+  Nothing in that window shows a refused submit. The GPU is not the thing that is slow here;
+  it is waiting for the same 1.5 fps the rest of the system is.
+- `frames=7 elapsed_ms=5414 fps=1.3` is a frame rate, not a copy rate: seven presents in five
+  seconds is the UI asking for seven frames, so the copy is 4-5% of wall time at idle. It
+  becomes the limiting cost exactly when the UI is moving, which is when the user sees it.
+
+### Two bugs the log exposed
+
+1. The copy is single-core with seven cores idle.
+2. 0404 wrote the scaled row straight into the back buffer but kept the duplicate-row skip from
+   the single-buffer path. 1334 logical rows into 1920 panel rows means 586 panel rows per frame
+   were never written at all, so the back buffer kept presenting what it held two frames earlier
+   in those rows - two-frame-old horizontal bands, most obvious while scrolling.
+
+## 2026-11-24 - patch 0408: one present across four cores
+
+`0408-j7-copy-the-panel-across-every-core.patch` splits the panel range into bands, one per core,
+with helper threads sleeping on a generation counter; band 0 is the vsync timer's own and it
+returns when the last band finishes. Each band gets its own staged source row (`srcrow[]` was one
+static, so two threads would have trampled each other) and copies the duplicate rows from the row
+it just wrote, which fixes both bugs above at once. `j7fb_bands=<n>` picks the band count (default
+4, `1` keeps the old single-core path).
+
+Expected in the next log: `avg_copy_us` well under 10 ms with `build_us` down with it. Not
+claimed: that this raises the frame rate on its own - it shortens the frame interval the render
+server waits on, and how much of the 1.3 fps that explains is what the next log measures.
+
+## 2026-11-24 - patch 0409: the CPU step now leaves a corpse to look at
+
+`j7cpu=1586` has stopped the phone before the logo three times (0395, 0396, 0406) and every one
+of those boots left no log at all, because the retune ran inside `AppleCLCD::start`, before the
+logo and before the kernel log reaches the persistent log. `0409-j7-ask-for-the-cpu-step-after-the-first-frame-window.patch`
+runs the same retune from the first perf window instead - about five seconds in, display up, log
+already flowing - so the last line in the log names the step that stopped the phone: the switch
+mux, the PLL lock, or the dividers. `j7m_cpu_mhz_reset()` is added so the perf line reports the
+rate the cores ended up at instead of the cached boot rate.

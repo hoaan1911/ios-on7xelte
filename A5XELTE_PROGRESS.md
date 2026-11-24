@@ -1528,3 +1528,40 @@ stalls: `fPerfWindowStart` is set in `start()`, so the first windows span boot w
 dirty. The multi-minute windows in the older 3.4 fps log are the same shape — they are boot-time
 windows, not presents that blocked for minutes. The honest steady-state figures are the 10.0 fps
 above and the 3.4 fps of `avg_copy_us=14025 frames=19 elapsed_ms=5550`.
+
+### 2026-11-24 — putting the GPU back in front of the render server
+
+The GPU on this port is only reachable through code we write: iOS's own renderer is Metal, the
+G3D is Midland/Midgard (product 0830), and there is no Metal driver for it, so `sweetgl.dylib`
+(Mesa's Panfrost on top of `J7MaliUserClient`) is the GPU path. It is not vapour: the 0401 boot
+showed `sweet_hw: Panfrost screen created`, then 12 completed submits
+(`J7 G3D: wait slot=1 rc=0 after 40 us`, `slot=0 … 960 us`, `10 us`, `20 us`, `100 us`, every one
+`mmu_irq=00000000`, no fault line), and then the presents stopped - `frames=3 elapsed_ms=371147`
+and not one `SWEET SURF` after `SpringBoard create id 4`. No crash, no panic, so the render server
+is wedged, not dead. That is the one open bug between "the GPU does work" and "the GPU draws the
+UI".
+
+The shim and the kernel agree on the protocol (`selectors 0/1/2/3/5/20`), the clock is at 900 MHz
+and reads back, and the CPU copy fix and the timer fix are in the same kernel, so the next step is
+one boot that separates the two candidates:
+
+- `artifacts/j7-boot-45386406511/j7-xnu-boot.img` — 16,672,784 bytes, sha256
+  `a2e8a3350e7070aa59e531388a854486b1542d9e33a8afa0941c3bf686f09893`: the current kernel
+  (0404-0406) with `sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib,SWEET_TRACE=0`.
+  The GPU really runs here. If it wedges the presents again, the last `J7 G3D:` line before the
+  silence is the answer, and `submits=` in the FB windows should finally be non-zero.
+- `artifacts/j7-boot-45386421933/j7-xnu-boot.img` — 16,672,784 bytes, sha256
+  `b5a775fde0a462b6511db4ce320452b5d65f5b53218aff191f204c80eb1c1a6a`: identical cmdline plus
+  `SWEET_GPU=0`, so the library loads and the EAGL bridge runs with softpipe. If this one reaches
+  the lock screen, the bridge is innocent and Panfrost's BO/submit path is the wedge; if it stops
+  in the same place, the bridge is the wedge.
+
+Both cmdlines are single-tail (480 and 492 bytes of the 608-byte field), `j7gpuclk=900 j7cpu=0`,
+no `j7cpu` raise, so the CPU-side risk of the earlier black boot is out of the picture. The library
+has to be on the root: `python tools/j7-push-lib.py sweetgl.dylib sweetgl-extents.txt` over
+`/usr/lib/sweetgl.dylib` (the root image reserves that block), otherwise `SWEET ENV` will say the
+insert failed.
+
+WHAT IS NOT CLAIMED: that the UI is GPU-rendered. Nothing here accelerates SpringBoard's own Metal
+output; the GPU work is the GL bridge's, and until the wedge is gone it does not survive the second
+logo. The only panel path that exists today is the CPU copy this tree does at 13.7 ms a frame.

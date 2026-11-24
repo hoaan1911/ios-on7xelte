@@ -1,0 +1,303 @@
+From: j7
+Subject: j7: copy the panel across every core instead of one
+
+The 900 MHz log puts one present at 8-16 ms, and `copy split build_us=40381
+src_us=13686 store_us=330` over seven frames says where it goes: 5.8 ms a frame
+building 1920 panel rows from a column-index gather, and 2 ms reading the
+client's row.  Every one of those rows is independent - the source surface is
+only read, a destination row belongs to exactly one band - and this panel is
+1920 of them, so the copy that paces the whole UI was running on one core while
+seven sat idle.
+
+Split it: helper threads sleep on a generation counter, take one band each, band
+0 is the vsync timer's own, and the timer returns when the last band is done.
+Each band gets its own staged source row (srcrow[] was a single static, so a
+second thread would have overwritten the row the first was still reading), and
+j7fb_bands=<n> picks the band count (default 4, 1 keeps this path off).
+
+This also fixes the row bug 0404 left behind.  0404 wrote the scaled row
+straight into the back buffer but kept the duplicate-row skip, and that skip only
+made sense when the destination was the panel itself: 1334 logical rows into
+1920 panel rows, so 586 panel rows were not written at all and the back buffer
+kept presenting whatever it held two frames earlier.  A band now copies those
+rows from the row it has just written, which is the same pixel data for
+4,320 bytes instead of a second gather.
+
+Expected in the next log: `avg_copy_us` well under the 10-16 ms of the 900 MHz
+boot, `build_us` down with it, `copy split` still summing to the present, and no
+change in what is on the panel.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 9a10826..bc41426 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -84,6 +84,9 @@ extern "C" uint64_t a5xelte_power_pressed_at;   /* bsd/dev/a5xelte_keys.c */
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ static void sweet_fb_copy_init(void);
+ #endif
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++static void sweet_fb_scale_init(void);
++#endif
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -729,6 +732,9 @@ AppleCLCD::start(IOService *provider)
+ 	fFadeStep = 0;
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 	sweet_fb_copy_init();
++#endif
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	sweet_fb_scale_init();
+ #endif
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+@@ -1452,6 +1458,193 @@ sweet_fb_row_copy(uint32_t *dst, const uint32_t *src, int32_t n)
+ 	}
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++/*
++ * The panel copy across the other cores.
++ *
++ * One present scales 750x1334 into 1080x1920: 1.44 million output pixels built from a
++ * column-index gather, then written.  Every perf window so far puts that at 8-16 ms of one
++ * core - build_us 5-6 ms per frame on its own - and the vsync timer runs it, so the tick
++ * that is supposed to arrive every 16.7 ms is late by that much on every frame the UI
++ * asks for.  Rows are independent: the source surface is only read, the destination row
++ * belongs to exactly one band, and nothing outside the band is touched.  Split the panel
++ * into bands, one per core, and the copy that paced the frame falls to a fraction of it.
++ *
++ * Helper threads sleep on a generation counter and take one band each; band 0 is the vsync
++ * timer's own.  j7fb_bands=<n> picks the band count (default 4, 1 disables this path).
++ *
++ * Two bugs go with it, both in the 900 MHz log: build_us was ~6 ms a frame because a single
++ * core built all 1920 panel rows, and 0404 wrote the scaled row straight into the back
++ * buffer but kept the duplicate-row skip, which only made sense when the destination was the
++ * panel itself - 586 of the 1920 panel rows were left holding what that buffer had two
++ * frames ago.  A band copies the duplicate row from the row it just wrote instead.
++ */
++#define SWEET_FB_SCALE_MAX_BANDS        8
++struct sweet_fb_scale_job {
++	uintptr_t       target;
++	uintptr_t       src;
++	uint32_t        srcRowBytes;
++	uint32_t        rowBytes;
++	int32_t         dx, dy, w, h;
++	int32_t         logicalH, height;
++	int32_t         px0, pw, py0, py1;
++	const uint16_t *column;
++};
++static IOLock  *sweet_fb_scale_lock;
++static struct sweet_fb_scale_job sweet_fb_scale_job_now;
++static uint64_t sweet_fb_scale_gen;
++static uint32_t sweet_fb_scale_pending;
++static uint32_t sweet_fb_scale_helpers;         /* bands - 1 */
++static uint64_t sweet_fb_scale_src_ns;          /* summed by the bands under the lock */
++static uint64_t sweet_fb_scale_build_ns;
++static uint32_t sweet_fb_scale_alpha0;
++/* One staged source row per band: srcrow[] in scaledCopy() is a single static and a second
++ * thread would overwrite the row the first one is still reading. */
++static uint32_t sweet_fb_scale_srcrow[SWEET_FB_SCALE_MAX_BANDS][2048]
++    __attribute__((aligned(64)));
++
++/* Scales rows [first, last) of the job's panel range into the destination. */
++static void
++sweet_fb_scale_band(const struct sweet_fb_scale_job *job, uint32_t band, uint32_t bands,
++    uint64_t *srcNS, uint64_t *buildNS, uint32_t *alpha0)
++{
++	uint32_t *srcrow = sweet_fb_scale_srcrow[band];
++	const int32_t rows = job->py1 - job->py0;
++	const int32_t first = job->py0 + (int32_t)((int64_t)rows * band / bands);
++	const int32_t last = job->py0 + (int32_t)((int64_t)rows * (band + 1) / bands);
++	int32_t previous = -1;
++
++	for (int32_t py = first; py < last; py++) {
++		int32_t r = py * job->logicalH / job->height - job->dy;
++		r = r < 0 ? 0 : (r >= job->h ? job->h - 1 : r);
++		uint32_t *out = (uint32_t *)(job->target + (uint64_t)py * job->rowBytes +
++		    (uint64_t)job->px0 * 4);
++		if (r == previous) {
++			/* 1334 logical rows into 1920 panel rows: 586 of these are the row above.  The
++			 * destination is the back buffer, which the panel is not scanning, so the panel
++			 * row above does not already hold it - the previous panel row in this same
++			 * buffer does, because it was written a moment ago.  Copy it: cheaper than a
++			 * second gather, and it stops the buffer keeping two-frame-old rows. */
++			const uint32_t *above = (const uint32_t *)(job->target +
++			    (uint64_t)(py - 1) * job->rowBytes + (uint64_t)job->px0 * 4);
++			memcpy(out, above, (size_t)job->pw * 4);
++			continue;
++		}
++		const uint32_t *in = (const uint32_t *)(job->src + (uint64_t)r * job->srcRowBytes);
++		{
++			const uint64_t t0 = mach_absolute_time();
++			sweet_fb_row_copy(srcrow, in, job->w);
++			uint64_t ns = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			*srcNS += ns;
++		}
++		{
++			const uint64_t t0 = mach_absolute_time();
++			/* The picture, when one is loaded: same rule as the serial path, decided once
++			 * per source pixel and written into this band's own staged row. */
++			const uint32_t *wrow = sweet_fb_wall_row(r, job->h);
++			if (sweet_fb_wall_ready && wrow != NULL) {
++				for (int32_t c = 0; c < job->w; c++) {
++					const uint32_t v = srcrow[c];
++					if (v == 0u) {
++						srcrow[c] = wrow[sweet_fb_wall_col(c, job->w)];
++						sweet_fb_wall_px++;
++						continue;
++					}
++					if ((v >> 24) != 0xffu) {
++						continue;
++					}
++					const uint32_t cr = (v >> 16) & 0xffu, cg = (v >> 8) & 0xffu;
++					const uint32_t cb = v & 0xffu;
++					uint32_t cmax = cr > cg ? (cr > cb ? cr : cb) : (cg > cb ? cg : cb);
++					bool isbg = cmax <= 0x28u;
++					if (!isbg && sweet_fb_bg != 0u) {
++						const int32_t dr = (int32_t)cr - (int32_t)((sweet_fb_bg >> 16) & 0xffu);
++						const int32_t dg = (int32_t)cg - (int32_t)((sweet_fb_bg >> 8) & 0xffu);
++						const int32_t db = (int32_t)cb - (int32_t)(sweet_fb_bg & 0xffu);
++						isbg = dr <= 12 && dr >= -12 && dg <= 12 && dg >= -12 &&
++						    db <= 12 && db >= -12;
++					}
++					if (isbg) {
++						srcrow[c] = wrow[sweet_fb_wall_col(c, job->w)];
++						sweet_fb_wall_px++;
++						(*alpha0)++;
++					}
++				}
++			}
++			/* One source pixel becomes one or two panel pixels: a table lookup and a store,
++			 * straight into the back buffer. */
++			for (int32_t x = 0; x < job->pw; x++) {
++				out[x] = srcrow[job->column[x]];
++			}
++			uint64_t ns = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			*buildNS += ns;
++		}
++		previous = r;
++	}
++}
++
++static void
++sweet_fb_scale_helper(void *arg, wait_result_t wr __unused)
++{
++	const uint32_t band = (uint32_t)(uintptr_t)arg;
++	uint64_t seen = 0;
++
++	for (;;) {
++		IOLockLock(sweet_fb_scale_lock);
++		while (sweet_fb_scale_gen == seen) {
++			IOLockSleep(sweet_fb_scale_lock, &sweet_fb_scale_gen, THREAD_UNINT);
++		}
++		seen = sweet_fb_scale_gen;
++		struct sweet_fb_scale_job job = sweet_fb_scale_job_now;
++		const uint32_t bands = sweet_fb_scale_helpers + 1;
++		IOLockUnlock(sweet_fb_scale_lock);
++
++		uint64_t srcNS = 0, buildNS = 0;
++		uint32_t alpha0 = 0;
++		sweet_fb_scale_band(&job, band, bands, &srcNS, &buildNS, &alpha0);
++
++		IOLockLock(sweet_fb_scale_lock);
++		sweet_fb_scale_src_ns += srcNS;
++		sweet_fb_scale_build_ns += buildNS;
++		sweet_fb_scale_alpha0 += alpha0;
++		if (--sweet_fb_scale_pending == 0) {
++			IOLockWakeup(sweet_fb_scale_lock, &sweet_fb_scale_pending, false);
++		}
++		IOLockUnlock(sweet_fb_scale_lock);
++	}
++}
++
++static void
++sweet_fb_scale_init(void)
++{
++	uint32_t bands = 4;
++	PE_parse_boot_argn("j7fb_bands", &bands, sizeof(bands));
++	if (bands < 2 || bands > SWEET_FB_SCALE_MAX_BANDS) {
++		IOLog("A5XELTE FB: panel copy on this core only (j7fb_bands=%u)\n", bands);
++		return;
++	}
++	sweet_fb_scale_lock = IOLockAlloc();
++	if (sweet_fb_scale_lock == NULL) {
++		return;
++	}
++	uint32_t started = 0;
++	for (uint32_t i = 0; i + 1 < bands; i++) {
++		thread_t thread;
++		/* Band 0 is the caller's; helper i takes band i + 1. */
++		if (kernel_thread_start(&sweet_fb_scale_helper,
++		    (void *)(uintptr_t)(i + 1), &thread) != KERN_SUCCESS) {
++			break;
++		}
++		thread_deallocate(thread);
++		started++;
++	}
++	sweet_fb_scale_helpers = started;
++	IOLog("A5XELTE FB: panel copy across %u cores\n", started + 1);
++}
++#endif
++
+ /*
+  * sweetfb_scale: the logical rect (dx,dy,w,h) at src goes to panel pixels
+  * x1.5, nearest neighbour (two source pixels become three). A panel row
+@@ -1533,6 +1726,53 @@ AppleCLCD::scaledCopy(uintptr_t src, uint32_t srcRowBytes, int32_t dx, int32_t d
+ 	 * Staging it in row[] and memcpy()ing it there added a 4,320-byte pass per panel row -
+ 	 * 5.7 MB of cached reads and writes per frame - and changed nothing else. */
+ 	const bool direct = fFlip != 0 && !banded;
++	/* Split the panel across the other cores: rows are independent, the source is only
++	 * read and every destination row belongs to exactly one band. */
++	if (direct && sweet_fb_scale_helpers > 0 && (py1 - py0) >= 64) {
++		struct sweet_fb_scale_job job;
++		job.target = target;
++		job.src = src;
++		job.srcRowBytes = srcRowBytes;
++		job.rowBytes = fRowBytes;
++		job.dx = dx;
++		job.dy = dy;
++		job.w = w;
++		job.h = h;
++		job.logicalH = (int32_t)fLogicalH;
++		job.height = (int32_t)fHeight;
++		job.px0 = px0;
++		job.pw = pw;
++		job.py0 = py0;
++		job.py1 = py1;
++		job.column = column;
++		IOLockLock(sweet_fb_scale_lock);
++		sweet_fb_scale_job_now = job;
++		sweet_fb_scale_pending = sweet_fb_scale_helpers;
++		sweet_fb_scale_src_ns = 0;
++		sweet_fb_scale_build_ns = 0;
++		sweet_fb_scale_alpha0 = 0;
++		sweet_fb_scale_gen++;
++		IOLockWakeup(sweet_fb_scale_lock, &sweet_fb_scale_gen, false);
++		IOLockUnlock(sweet_fb_scale_lock);
++
++		uint64_t srcNS = 0, buildNS = 0;
++		uint32_t alpha0 = 0;
++		sweet_fb_scale_band(&job, 0, sweet_fb_scale_helpers + 1, &srcNS, &buildNS, &alpha0);
++
++		IOLockLock(sweet_fb_scale_lock);
++		while (sweet_fb_scale_pending != 0) {
++			IOLockSleep(sweet_fb_scale_lock, &sweet_fb_scale_pending, THREAD_UNINT);
++		}
++		sweet_fb_src_ns += srcNS + sweet_fb_scale_src_ns;
++		sweet_fb_build_ns += buildNS + sweet_fb_scale_build_ns;
++		sweet_fb_alpha0 += alpha0 + sweet_fb_scale_alpha0;
++		IOLockUnlock(sweet_fb_scale_lock);
++		if (sweet_fb_alpha0 != 0 && !sweet_fb_alpha0_logged) {
++			sweet_fb_alpha0_logged = 1;
++			IOLog("A5XELTE FB: %u black pixels replaced with a background\n", sweet_fb_alpha0);
++		}
++		return (uint64_t)pw * (uint64_t)(py1 - py0) * 4;
++	}
+ #else
+ 	const bool direct = false;
+ #endif

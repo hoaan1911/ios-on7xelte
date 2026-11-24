@@ -1,0 +1,125 @@
+From: j7
+Subject: j7: ask for the CPU step after the first frame window, not at start
+
+j7cpu=1586 has now stopped the phone before the logo three times, and every one
+of those attempts left no log at all: the retune ran inside AppleCLCD::start,
+before the logo and before the kernel log reaches the persistent log, so a core
+that stopped in the ARMCLK switch took the whole boot with it and nothing
+survived to say whether it was the mux, the PLL or the dividers.
+
+Run it from the first perf window instead - about five seconds in, display up,
+log already flowing - and the last line in the log names the step that stopped
+the phone even if the machine hangs there.  The retune itself is unchanged, so a
+step that works behaves exactly as before.
+
+cpu_mhz is also measured once and cached, which would have kept reporting the
+boot rate after a successful retune: j7m_cpu_mhz_reset() lets the perf line show
+the rate the cores actually ended up at.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+index 5240a52..62cd39b 100644
+--- a/iokit/Kernel/arm/A5XELTEGPU.cpp
++++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
+@@ -72,13 +72,22 @@ j7m_now_us(void)
+  * Diagnostic only: no MMIO, no privileged register writes, no PMU. The result
+  * is cached after the first successful measurement.
+  */
++static unsigned j7m_cpu_mhz_cached;
++
++/* The CPU retune changes the clock a cached measurement describes, so the reader has to be
++ * able to forget it; otherwise every perf line after the retune keeps printing the rate
++ * the phone booted at. */
++extern "C" void
++j7m_cpu_mhz_reset(void)
++{
++    j7m_cpu_mhz_cached = 0;
++}
++
+ extern "C" unsigned
+ j7m_cpu_mhz(void)
+ {
+-    static unsigned cached;
+-
+-    if (cached) {
+-        return cached;
++    if (j7m_cpu_mhz_cached) {
++        return j7m_cpu_mhz_cached;
+     }
+ 
+     uint64_t window, t0, t1, n8 = 0, n16 = 0, ns = 0;
+@@ -125,9 +134,9 @@ j7m_cpu_mhz(void)
+         if (delta == 0) {
+             return 0;
+         }
+-        cached = (unsigned)(1000000ULL / delta);
++        j7m_cpu_mhz_cached = (unsigned)(1000000ULL / delta);
+     }
+-    return cached;
++    return j7m_cpu_mhz_cached;
+ }
+ 
+ extern "C" void
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bc41426..5fc02da 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -39,11 +39,18 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ /* iokit/Kernel/arm/A5XELTEGPU.cpp: per-window submit/cache/wait counters, cleared by the read. */
+ extern "C" unsigned j7m_cpu_mhz(void);
++extern "C" void j7m_cpu_mhz_reset(void);
+ 
+ /* scaledCopy(): row build (index, background) versus panel stores, nanoseconds */
+ static uint64_t sweet_fb_build_ns, sweet_fb_store_ns, sweet_fb_src_ns;
+ /* j7fb_band=0 stores one panel row at a time instead of four. */
+ static int sweet_fb_band = 1;
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++/* j7cpu=<kHz>: the rate to ask the CPU PLL for, and whether that has been tried yet.  The
++ * retune is not run from start(): see the comment at its call site in vsyncFired(). */
++static unsigned sweet_fb_cpu_khz;
++static int sweet_fb_cpu_tried;
++#endif
+ /* set by scaledCopy(): pixels the client left fully transparent in the last present */
+ static uint32_t sweet_fb_alpha0;
+ static uint32_t sweet_fb_alpha0_logged;
+@@ -797,7 +804,16 @@ AppleCLCD::start(IOService *provider)
+ 			cpu *= 1000;
+ 		}
+ 		if (cpu > 0) {
+-			j7_cpu_clock((unsigned)cpu);
++			/* Not here.  start() runs before the logo and before the kernel log reaches
++			 * the persistent log, so a core that stops in the ARMCLK switch takes the
++			 * whole boot down and writes nothing anywhere - which is exactly what
++			 * j7cpu=1586 produced twice: no logo, no new log, no way to tell the mux from
++			 * the PLL from the dividers.  Ask for it from the first perf window instead,
++			 * about five seconds in with the display up and the log already flowing, so
++			 * the last line in the log names the step that stopped the phone. */
++			sweet_fb_cpu_khz = (unsigned)cpu;
++			IOLog("A5XELTE CPU: %u kHz will be asked for after the first frame window\n",
++			    sweet_fb_cpu_khz);
+ 		}
+ 	}
+ 	{
+@@ -1003,6 +1019,19 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		(void)bytes;
+ #endif
+ 	}
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* The CPU retune, once, after the first perf window (300 ticks, about five seconds):
++	 * everything it needs is up by now and the log that says how far it got is already on
++	 * disk. */
++	if (fb->fPerfLog && count >= 300 && sweet_fb_cpu_khz != 0 && !sweet_fb_cpu_tried) {
++		sweet_fb_cpu_tried = 1;
++		IOLog("A5XELTE CPU: retuning both clusters to %u kHz now\n", sweet_fb_cpu_khz);
++		j7_cpu_clock(sweet_fb_cpu_khz);
++		IOLog("A5XELTE CPU: retune to %u kHz returned, restarting cpu_mhz measurement\n",
++		    sweet_fb_cpu_khz);
++		j7m_cpu_mhz_reset();
++	}
++#endif
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	/* Aggregate after 300 callbacks; measure wall time because expensive
+ 	 * copies can delay the timer and reduce the actual frame rate. */

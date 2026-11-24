@@ -1491,3 +1491,40 @@ What the log should settle, in this order: a logo at `j7cpu=1586`; `mux 1, div 0
 `cpu_mhz=1586`; `avg_copy_us` below 14,000 with `copy split build_us` lower (`0404`); and no perf
 window whose `elapsed_ms` is seconds per present, with `avg_swapwait_us` near 16 ms (`0405`).
 Neither image is flashed or booted here, so all four are expectations.
+
+### 2026-11-24 — the 900 MHz boot where "the GPU refused to work" (ad235df9)
+
+The boot log from `ad235df9…` (`j7gpuclk=900 j7cpu=0`, the image that draws the logo) has no
+GPU failure anywhere in it:
+
+- `J7 G3D: passive GPU_ID=08300010 product=0830`, every feature register reads a plausible value,
+  `cores on, AS0 up, page-table pool 16384 tables`.
+- `A5XELTE CLK: G3D 900 MHz -> … CON0 a1570d01 -> a3840d01 (VCO 1800000 kHz)`, then
+  `reads back a3840d01 -> 900000 kHz`. The PLL holds 900 the whole boot.
+- The kernel client runs three rounds at that clock: `round 0 (good)`, `round 1 (fault)` — the
+  deliberate unmapped-page test at `7ff00000`, answered by `faultstatus=7c2003c1` and
+  `wait rc=-3` — `round 2 (good)`, the unowned-VA submit answered `e00002c2`, and
+  `client selftest PASSED`.
+
+The only line that says "refused" is `GPU_STATUS refused ret=e00002c2`, and it is a negative test,
+not a failure: `A5XELTEGPU.cpp` asserts `refused == kIOReturnBadArgument` on purpose (selector 6
+is not allowed to return `GPU_STATUS`), which is why the selftest passes on the next line. It is
+in the 343 MHz boots as well.
+
+What is true is that the GPU does no work in this boot: every perf window reports `submits=0`
+while `cores on`, and there is not one `AGX` or Metal line in the log, so no userspace client ever
+hands the G3D a job. The display is scaled by the CPU (`sweetfb_scale=1`), which is why the GPU
+clock cannot move the frame rate either way — 343 and 900 measure the same.
+
+Steady state in this boot is `frames=62 elapsed_ms=6162 fps=10.0 avg_copy_us=13741` with
+`swap_waits=61 avg_swapwait_us=0`, i.e. 99 ms per presented frame against a 13.7 ms copy and a
+30 Hz request. The cadence is 60 Hz timer × `fFlushTicks=2` for 30 Hz, re-armed with
+`setTimeoutUS()` *after* the copy, so a present waits on two stretched ticks. That is the number
+0404 and 0405 are meant to move; `a5fb_hz=60` would also drop the ×2, at the cost of another
+cmdline variable.
+
+The early `frames=1 elapsed_ms=5309` and `frames=3 elapsed_ms=418980` windows are not per-present
+stalls: `fPerfWindowStart` is set in `start()`, so the first windows span boot with almost nothing
+dirty. The multi-minute windows in the older 3.4 fps log are the same shape — they are boot-time
+windows, not presents that blocked for minutes. The honest steady-state figures are the 10.0 fps
+above and the 3.4 fps of `avg_copy_us=14025 frames=19 elapsed_ms=5550`.

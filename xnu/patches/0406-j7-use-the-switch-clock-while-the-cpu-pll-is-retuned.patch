@@ -1,0 +1,168 @@
+From: j7
+Subject: j7: use the switch clock, not the oscillator, to retune the CPU PLL
+
+The CPU raise moves ARMCLK off its PLL before reprogramming it, and the code moved it to
+OSCCLK - 26 MHz - for the whole retune.  On the phone that is not survivable: the boot cluster
+drops to 26 MHz while the other three cores keep running XNU at 902 MHz, and the image with
+`j7cpu=1586` showed no logo at all, while the same kernel with `j7cpu=0` still drew one.
+
+Samsung's own clock code has a second input for exactly this window: the MIF switch, gated at
+CMU_MIF +0x858 (cluster 0) and +0x85c (cluster 1) bit 0, divided at +0x458/+0x45c, selected on the
+cluster's switch-source mux at +0x204 bit 12 with bit 27 out of hardware control.  Its parent is
+already the bus PLL divided by two and it feeds DRAM and the display, so it is a running clock,
+hundreds of MHz above the oscillator.  The transition becomes exactly the vendor DFS one: gate
+on, divider to ratio 1, ARMCLK to the switch and status 2, program the PLL and wait for lock,
+dividers to /1, ARMCLK back and status 1, then restore the switch gate, divider and source.
+
+0395 already did this, but it was flashed in the stretch where every image carried a truncated
+188-character cmdline (no `a5log`, no `rd=emmcroot0`), so its silence was the cmdline, not this
+sequence.  A cluster whose mux does not move is put back and left at the bootloader's rate, and a
+PLL that never locks gets its old CON0 back, so the worst case is still a boot at 902 MHz.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -256,20 +256,22 @@
+  * really were on the oscillator branch.  The PLL was never programmed, and every store and every
+  * timing loop then ran at standby clock.
+  *
+- * The transition runs the cores from OSCCLK, not from the MIF switch.  That is the one
+- * transition this phone has already survived: 0380 moved ARMCLK to the switch input without
+- * touching +0x204, so the input was OSCCLK, and the machine kept running (cpu_mhz=38) - it only
+- * failed because it waited for status 1 where the switch reads 2 and returned before the PLL was
+- * programmed.  0395 selected the MIF switch and wrote CMU_MIF +0x858/+0x458 first; the mux status
+- * only says the mux selected that input, not that the switch clock is running, and that boot
+- * hung before the logo and before any log flush.  OSCCLK is always running, so it is the safe
+- * stand-in for the transition, and no CMU_MIF register is written at all.
++ * The transition runs the cores from the MIF switch, which is the vendor's own path and the
++ * only other clock this SoC can give a CPU cluster.  The switch gate is CMU_MIF +0x858/+0x85c
++ * bit 0 and its divider is +0x458/+0x45c, two bits, 0-based: its parent is already the bus PLL
++ * divided by two, so the divider's ratio 1 is a clock that is running and far above the 26 MHz
++ * of OSCCLK.  The earlier attempt to use OSCCLK left the boot CPU cluster at 26 MHz while the
++ * other three cores kept running XNU at 902 MHz; that image (j7cpu=1586) showed no logo at all,
++ * while the same kernel at j7cpu=0 still drew.  0395 already used the switch but was flashed
++ * with a truncated cmdline, so its silence was the cmdline and not this sequence.
+  *
+- * Per cluster: ARMCLK to the switch input (+0x208 bit 12), poll +0x608 for 2, write the PLL lock
+- * time and CON0, poll lock 29, move back and poll 1.  The polls use IODelay, not IOSleep: at
+- * 26 MHz a scheduling sleep is an eternity.  A cluster whose mux does not move is left alone, and
+- * a PLL that never locks gets its old CON0 back with the cores returned to it, so the worst case
+- * is the 902 MHz operating point this boot started from.
++ * Per cluster: switch gate on and the switch selected on the source mux (+0x204 bit 12, bit 27
++ * clear), the divider at ratio 1, ARMCLK onto the switch (+0x208 bit 12), poll +0x608 for 2,
++ * write the PLL lock time and CON0, poll lock 29, put the dividers at /1, move back and poll 1,
++ * then restore the switch source, divider and gate.  The polls use IODelay, not IOSleep, because
++ * the cores are on the switch by then and IOSleep would need the scheduler.  A cluster whose mux
++ * does not move is left alone, and a PLL that never locks gets its old CON0 back with the cores
++ * returned to it, so the worst case is the 902 MHz operating point this boot started from.
+  */
+ static bool
+ j7_cpu_pll(unsigned khz, uint32_t *m_out)
+@@ -288,9 +290,13 @@
+ static void
+ j7_cpu_clock(unsigned khz)
+ {
+-	static const struct { uint64_t cmu; const char *name; } cpu[] = {
+-		{ 0x10900000ULL, "CPUCL0" },
+-		{ 0x10800000ULL, "CPUCL1" },
++	static const struct {
++		uint64_t cmu;
++		const char *name;
++		uint32_t gate, swdiv;
++	} cpu[] = {
++		{ 0x10900000ULL, "CPUCL0", 0x858u, 0x458u },
++		{ 0x10800000ULL, "CPUCL1", 0x85cu, 0x45cu },
+ 	};
+ 	uint32_t m;
+ 
+@@ -298,6 +304,16 @@
+ 		IOLog("A5XELTE CPU: %u kHz is not a step this PLL makes\n", khz);
+ 		return;
+ 	}
++	/* CMU_MIF holds the gate and divider of the clock the cores run from during the retune. */
++	IOMemoryDescriptor *mifDesc = IOMemoryDescriptor::withPhysicalAddress(
++	    0x10460000ULL, 0x1000, kIODirectionNone);
++	IOMemoryMap *mifMap = mifDesc != NULL ? mifDesc->map(kIOMapInhibitCache) : NULL;
++	if (mifMap == NULL) {
++		IOLog("A5XELTE CPU: no CMU_MIF map\n");
++		OSSafeReleaseNULL(mifDesc);
++		return;
++	}
++	volatile uint32_t *mif = (volatile uint32_t *)mifMap->getVirtualAddress();
+ 	for (unsigned i = 0; i < sizeof(cpu) / sizeof(cpu[0]); i++) {
+ 		IOMemoryDescriptor *desc = IOMemoryDescriptor::withPhysicalAddress(
+ 		    cpu[i].cmu, 0x1000, kIODirectionNone);
+@@ -313,9 +329,10 @@
+ 		const uint64_t pll = (cp != 0 && cs < 7) ? 26000ULL * cm / ((uint64_t)cp << cs) : 0;
+ 		const uint32_t d1 = c[0x400 / 4] & 7u, d2 = c[0x404 / 4] & 7u;
+ 		const uint64_t arm = pll / ((uint64_t)(d1 + 1) * (uint64_t)(d2 + 1));
+-		const uint32_t mux0 = c[0x208 / 4];
++		const uint32_t umux0 = c[0x204 / 4], mux0 = c[0x208 / 4];
++		const uint32_t gate0 = mif[cpu[i].gate / 4], swdiv0 = mif[cpu[i].swdiv / 4];
+ 		unsigned n;
+-		bool onOsc = false, locked = false;
++		bool switched = false, locked = false;
+ 
+ 		IOLog("A5XELTE CPU: %s PLL_CON0=%08x M=%u P=%u S=%u -> %llu kHz, div %u/%u -> %llu kHz, mux %u, asked for %u\n",
+ 		    cpu[i].name, con0, cm, cp, cs, pll, d1, d2, arm, (mux0 >> 12) & 3u, khz);
+@@ -325,22 +342,32 @@
+ 			OSSafeReleaseNULL(desc);
+ 			continue;
+ 		}
+-		/* ARMCLK to the switch input (+0x208 bit 12).  +0x204 is left alone, so that
+-		 * input is OSCCLK, the 26 MHz oscillator: the only clock that is always
+-		 * running, and the one the 0380 boot came up on instead of dying. */
++		/* The switch clock: gate on, its 400 MHz step, and the source mux out of hardware
++		 * control with bit 12 set.  Without +0x204 the "switch" input is OSCCLK at 26 MHz. */
++		mif[cpu[i].gate / 4] = gate0 | 1u;
++		c[0x204 / 4] = (umux0 | (1u << 12)) & ~(1u << 27);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		IODelay(20);
++		mif[cpu[i].swdiv / 4] = swdiv0 & ~3u;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		IODelay(20);
++		/* ARMCLK onto the switch input (+0x208 bit 12); the status reads 2. */
+ 		c[0x208 / 4] = (mux0 & ~(1u << 12)) | (1u << 12);
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 		for (n = 0; n < 250; n++) {
+ 			if (((c[0x608 / 4] >> 12) & 3u) == 2u) {
+-				onOsc = true;
++				switched = true;
+ 				break;
+ 			}
+ 			IODelay(20);
+ 		}
+-		if (!onOsc) {
+-			IOLog("A5XELTE CPU: %s did not take the oscillator (status %08x), left alone\n",
++		if (!switched) {
++			IOLog("A5XELTE CPU: %s did not take the switch (status %08x), left alone\n",
+ 			    cpu[i].name, c[0x608 / 4]);
+ 			c[0x208 / 4] = mux0;
++			c[0x204 / 4] = umux0;
++			mif[cpu[i].swdiv / 4] = swdiv0;
++			mif[cpu[i].gate / 4] = gate0;
+ 			__asm__ volatile ("dsb sy" ::: "memory");
+ 			OSSafeReleaseNULL(map);
+ 			OSSafeReleaseNULL(desc);
+@@ -392,6 +419,11 @@
+ 			}
+ 			IODelay(20);
+ 		}
++		/* Put the switch back the way the bootloader had it. */
++		c[0x204 / 4] = umux0;
++		mif[cpu[i].swdiv / 4] = swdiv0;
++		mif[cpu[i].gate / 4] = gate0;
++		__asm__ volatile ("dsb sy" ::: "memory");
+ 		{
+ 			const uint32_t run = c[0x100 / 4];
+ 			const uint32_t rm = (run >> 16) & 0x3ffu, rp = (run >> 8) & 0x3fu,
+@@ -408,6 +440,8 @@
+ 		OSSafeReleaseNULL(map);
+ 		OSSafeReleaseNULL(desc);
+ 	}
++	OSSafeReleaseNULL(mifMap);
++	OSSafeReleaseNULL(mifDesc);
+ }
+ #endif
+ 

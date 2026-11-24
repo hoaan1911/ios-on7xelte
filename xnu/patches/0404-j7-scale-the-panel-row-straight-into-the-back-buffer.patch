@@ -1,0 +1,72 @@
+From: j7
+Subject: j7: scale the panel row straight into the back buffer
+
+With the double buffer on, present() paints a cacheable back buffer, but scaledCopy() still
+built every panel row in a small staging array and then memcpy()ed it 4,320 bytes to where it
+belongs.  That is a second pass over 5.7 MB per frame - the whole panel read out of the cache and
+written back again - for a row that was already complete when the loop that builds it ended.
+
+When the destination is that back buffer (fFlip), scale straight into it, and leave the staging
+row and its copy to the cases that write the write-combined panel buffer, where a per-pixel store
+is still the wrong thing to do.  The duplicate-row skip is untouched: the row it would have
+reused was written into this same back buffer moments earlier, so it is still correct.
+
+Expected in the next log: `copy split build_us` down and `avg_copy_us` below the ~14 ms this
+panel copy has cost since the double buffer went in.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1477,6 +1477,14 @@
+ 	    && !fFlip
+ #endif
+ 	    ;
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* fFlip paints a cacheable back buffer, so the scaled row can be written where it goes.
++	 * Staging it in row[] and memcpy()ing it there added a 4,320-byte pass per panel row -
++	 * 5.7 MB of cached reads and writes per frame - and changed nothing else. */
++	const bool direct = fFlip != 0 && !banded;
++#else
++	const bool direct = false;
++#endif
+ 	int32_t bandRows = 0, bandFirst = 0;
+ 	for (int32_t py = py0; py < py1; py++) {
+ 		int32_t r = py * (int32_t)fLogicalH / (int32_t)fHeight - dy;
+@@ -1572,12 +1580,20 @@
+ 					}
+ 				}
+ 			}
+-			/* One source pixel becomes one or two output pixels.  The picture decision above
+-			 * is already made per source pixel, so the expansion is a lookup and a store:
+-			 * scanning for a run of equal neighbours first only added a second pass over
+-			 * every output pixel, and the row build measured 50 ms of a 58 ms present. */
+-			for (int32_t x = 0; x < pw; x++) {
+-				row[x] = in[column[x]];
++			if (direct) {
++				/* The destination is the cacheable back buffer: scale into it directly. */
++				for (int32_t x = 0; x < pw; x++) {
++					out[x] = in[column[x]];
++				}
++			} else {
++				/* One source pixel becomes one or two output pixels.  The picture decision
++				 * above is already made per source pixel, so the expansion is a lookup and a
++				 * store: scanning for a run of equal neighbours first only added a second
++				 * pass over every output pixel, and the row build measured 50 ms of a 58 ms
++				 * present. */
++				for (int32_t x = 0; x < pw; x++) {
++					row[x] = in[column[x]];
++				}
+ 			}
+ 			previous = r;
+ 			{
+@@ -1606,7 +1622,8 @@
+ #endif
+ 				bandRows = 0;
+ 			}
+-		} else {
++		} else if (!direct) {
++			/* Not a full-width cacheable destination: store the staged row. */
+ 			memcpy(out, row, (size_t)pw * 4);
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 			if (sweet_surface_panel_cacheable) {

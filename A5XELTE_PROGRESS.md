@@ -1415,3 +1415,54 @@ Both clock images from run `45184841888` are still unflashed: `45186947154`
 (`j7gpuclk=900 j7cpu=1586`) and `45186965326` (`j7gpuclk=900 j7cpu=0`). The second is the one to
 try first if the CPU divider step is to be kept out of the picture: it moves only the GPU (343 ->
 900 MHz) and carries the 0403 gauge pinmux.
+
+## 2026-11-24 — the logo is back at `j7cpu=0`, so the CPU raise is the thing that stops it
+
+The user flashed both clock images: `artifacts/j7-boot-45186965326` (`j7gpuclk=900 j7cpu=0`)
+draws the Apple logo, and the same kernel with `j7cpu=1586` (`45186947154`) shows nothing. Same
+ADT, same cmdline except that one word, so the ARMCLK move is the difference - not the GPU write
+at 900 MHz, which is now device-verified to boot. That also unburies the earlier "silent" images:
+0395, 0396 and 0398 were all flashed in the stretch where the cmdline was truncated to 188
+characters (no `a5log`, no `rd=emmcroot0`), so their silence says nothing about any clock code.
+The only valid clock observations are 0380's real 38 MHz boot and this one.
+
+The transition in the tree moves ARMCLK to **OSCCLK, 26 MHz**, for the whole PLL retune. The boot
+cluster's four cores drop to 26 MHz while the other four keep running XNU at 902 MHz, which is why
+nothing reaches the panel: the logo is drawn after `AppleCLCD::start`, where this runs. Samsung's
+own clock tree has a second input for exactly this window - the MIF switch - and it is not the
+dead end 0395's note assumed. Verified against `pwrcal/S5E7870` (`S5E7870-cmusfr.h`):
+
+- `CPUCL0_MUX_CLK_CPUCL0` = CMU_CPUCL0 + 0x208, bit 12, status CMU_CPUCL0 + 0x608 bits 13:12,
+  which reads `1 << src` (2 for the switch);
+- `CPUCL0_MUX_CLKCMU_CPUCL0_SWITCH_USER` = + 0x204, bit 12 selects the switch, bit 27 = 0 takes the
+  selection out of hardware control;
+- `CPUCL0_DIV_CLK_CPUCL0_1/_2` = + 0x400/+0x404, bits 0:2, ratio - 1;
+- `MIF_GATE_CLKCMU_CPUCL0_SWITCH` = CMU_MIF 0x10460000 + 0x858 bit 0 (CPUCL1 + 0x85c), and
+  `MIF_DIV_CLKCMU_CPUCL0_SWITCH` = + 0x458/+0x45c, two bits; its parent is `BUS_PLL / 2`, so
+  ratio 1 is a clock that is running and far above the oscillator. 0395 had these offsets right.
+
+So the retune now runs the cores on that switch instead of the oscillator, in the vendor's order,
+and puts the gate, divider and source mux back afterwards. A cluster whose mux never reports the
+switch is restored and left at the bootloader's rate; a PLL that never locks gets its old CON0
+back, so the worst case is still a boot at 902 MHz.
+
+### The 14 ms panel copy and the long present gaps
+
+Two more patches, both independent of the clock:
+
+- **0404** — with `j7fb_flip=1` the destination is the cacheable back buffer, but `scaledCopy()`
+  still staged every row in `row[]` and memcpy()ed 4,320 bytes to where it belongs: a second pass
+  over 5.7 MB per frame. Scale straight into the back buffer when `fFlip` is on; the staging row
+  stays for the write-combined panel path. The duplicate-row skip is unaffected - the row it
+  reuses was written into this same buffer moments earlier.
+- **0405** — the vsync callback allocated 1,132 bytes with `IOMallocData()` and freed them for
+  every present. That allocation may sleep in the VM, which is the shape of the two windows that
+  count two presents in 471 s and three in 953 s next to a normal 3.4 fps window: the timer
+  cannot tick while the presenter is inside the allocator. Allocate the record once in `start()`.
+  The same callback also reset its timeout *after* present(), so the tick period was 16.7 ms plus
+  the copy (~30 ms at 14 ms/frame); subtract the time already spent so SwapWait is paced at 60 Hz.
+
+Patches `0404`, `0405`, `0406` were diffed against the post-0403 source that xnu run 45184841888
+built and dry-run applied in sequence with `patch -p1`; the result is byte-identical to the edited
+file. Nothing has been compiled, built, flashed or observed on the phone yet, and `avg_copy_us`
+after 0404 is an expectation, not a measurement.

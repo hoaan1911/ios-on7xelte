@@ -1,0 +1,107 @@
+From: j7
+Subject: j7: stop allocating the presented record in the vsync timer
+
+The vsync callback allocated 1,132 bytes with IOMallocData() and freed them again for every
+present it made.  IOMallocData() may sleep in the VM, so a present under memory pressure can sit
+in the allocator for an unbounded time with the framebuffer lock released and no tick scheduled:
+that is the shape of the two windows in the last log that count two presents in 471 s and three
+in 953 s, each next to a normal window at 3.4 fps.
+
+Allocate the record once in start() and reuse it.  The timer is the only presenter, so one buffer
+is enough.
+
+The same callback also reset its timeout after present() returned.  setTimeoutUS() is relative to
+the moment of the call, so the tick period was 16.7 ms plus the copy - about 30 ms with a 14 ms
+frame - and the client's SwapWait, which is promised the next tick, waited twice as long as it
+should.  Subtract the time the callback already spent so the tick stays at 60 Hz.
+
+Expected in the next log: no perf window whose elapsed_ms is many seconds per present, and
+`avg_swapwait_us` near one tick instead of two.
+
+Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -168,6 +168,7 @@
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
++	uint8_t      *fRec;             /* presented copy: allocated once, never in the timer */
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+@@ -644,6 +645,16 @@
+ 		}
+ 	}
+ #endif
++	/*
++	 * One record buffer for the whole life of the object.  The vsync callback used to allocate
++	 * 1,132 bytes with IOMallocData() and free them again on every present; that allocation can
++	 * sleep in the VM, so a present under memory pressure could stall the timer for a long time.
++	 * That is what the perf windows with two presents in eight minutes look like.
++	 */
++	fRec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++	if (fRec != NULL) {
++		bzero(fRec, SWEET_FB_SWAP_REC_SIZE);
++	}
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+@@ -881,7 +892,8 @@
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+-	uint64_t now = mach_absolute_time();
++	const uint64_t tickStart = mach_absolute_time();
++	uint64_t now = tickStart;
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+@@ -925,16 +937,13 @@
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+-	uint8_t *rec = NULL;
+-	if (flush) {
+-		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+-		if (rec != NULL) {
+-			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+-			fb->fDirty = false;
+-		}
++	uint8_t *rec = fb->fRec;
++	if (flush && rec != NULL) {
++		memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++		fb->fDirty = false;
+ 	}
+ 	IOLockUnlock(fb->fLock);
+-	if (rec != NULL) {
++	if (flush && rec != NULL) {
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 		uint64_t before = fb->fPerfLog ? mach_absolute_time() : 0;
+ #endif
+@@ -953,7 +962,6 @@
+ #else
+ 		(void)bytes;
+ #endif
+-		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	/* Aggregate after 300 callbacks; measure wall time because expensive
+@@ -986,7 +994,16 @@
+ 		fb->fPerfWindowStart = finished;
+ 	}
+ #endif
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	{
++		/* setTimeoutUS() counts from now, so scheduling the next tick after present() made the
++		 * period 16.7 ms plus the copy - 30 ms or more with a 14 ms frame, half the tick rate
++		 * the client's SwapWait was promised.  Subtract what this callback already spent. */
++		uint64_t spentNS = 0;
++		uint32_t period = SWEET_FB_VSYNC_US;
++		absolutetime_to_nanoseconds(mach_absolute_time() - tickStart, &spentNS);
++		uint32_t spentUS = (uint32_t)(spentNS / 1000ULL);
++		sender->setTimeoutUS(spentUS < period ? period - spentUS : 1);
++	}
+ }
+ 
+ void
